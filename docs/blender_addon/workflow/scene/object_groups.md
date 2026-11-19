@@ -1,0 +1,428 @@
+# 📦 Object Groups
+
+The solver treats your scene as a collection of up to **32 object groups**.
+Each group carries a *type*, a *material model*, a set of *material
+parameters*, and a list of *assigned Blender mesh objects*. Only active
+groups (ones you've created) are sent to the solver.
+
+Which group an object is assigned to also matters to one contact setting:
+**Allow Inter-Group Intersections** lets an object pass through the objects of
+other groups while the objects of its own group still collide with it. See
+[Allow Intersections](../params/material.md#allow-intersections).
+
+## The Dynamics Groups Panel
+
+Everything you do with groups happens on the **Dynamics Groups** panel in
+the 3D viewport's N-panel. The panel is laid out top-to-bottom:
+
+- A **Create Group** button at the very top.
+- One **group box** per active group, stacked below.
+
+Each group box contains, in order:
+
+1. A **header row** with a collapse triangle, an icon representing the
+   group type, the group name, and a duplicate-group button.
+2. A **Name** / **Type** row, and below it an **Overlay Color** row.
+3. An **Assigned Objects** list of the Blender objects belonging to this
+   group, each with an **Include** checkbox, over an **Add Selected
+   Objects** / **Remove Object** row.
+4. A **Bake** row with per-group **Bake Animation** / **Bake Single Frame**
+   controls (see [Baking Animation](../sim/baking.md)).
+5. Two type-conditional entries. On a **Static** group, a **Capture
+   Deformation** / **Clear Deformation Cache** row with a status line
+   beneath it (see [Static Objects](static_objects.md)). On a **Sand**
+   group, a box holding **Convert To Solid Particle Mesh** (see
+   [Sand-Specific](../params/material.md#sand-specific)). Both always
+   draw for their type; the buttons gray out until their preconditions
+   are met.
+6. A full-width **Delete Group** button.
+7. A **Pins** section with the pin vertex groups attached to this group
+   (see [Pins and Operations](../constraints/pins.md)). The same region
+   reads **Transform** on a **Static** group and **Pins & Motion** on a
+   **PDRD** group.
+8. A **Stats** box listing the vertex and face count of each included
+   object.
+9. A **Material Params** box (see [Material Parameters](../params/material.md)).
+
+```{figure} ../../images/object_groups/panel_overview.png
+:alt: Dynamics Groups panel with one default group showing the Create Group button at top, the group header row with name/type/duplicate controls, the Assigned Objects list with Add/Remove buttons, the Bake row, and collapsed Pins, Stats, and Material Params sub-boxes
+:width: 500px
+
+The **Dynamics Groups** panel with one default group. The **Create
+Group** button sits at the top; below it, each group box follows the
+header, Assigned Objects, Bake, Delete Group, Pins, Stats, and Material
+Params layout.
+```
+
+## Creating a Group
+
+Click **Create Group** at the top of the panel. A new group box is
+inserted beneath the button with a default name (`Group 1`, `Group 2`,
+and so on), the default **Solid** type, an empty object list, and default material
+parameters. The group takes the lowest free slot, so once a group has been
+deleted the new box can appear above the existing ones rather than at the
+bottom.
+
+```{figure} ../../images/object_groups/panel_overview.png
+:alt: Dynamics Groups panel immediately after clicking Create Group. One Group 1 box with default Solid type, empty object list, and default material parameters
+:width: 500px
+
+The panel right after a fresh **Create Group** click: a single
+`Group 1` box with the default **Solid** type, an empty object list,
+and default material parameters.
+```
+
+## Group Types
+
+| Type       | Description                          | Default model    | Available models                           |
+| ---------- | ------------------------------------ | ---------------- | ------------------------------------------ |
+| **Shell**  | Thin surfaces (cloth, fabric)        | Baraff-Witkin    | Baraff-Witkin, ARAP                        |
+| **Solid**  | Volumetric bodies                    | ARAP             | Stable NeoHookean, ARAP                    |
+| **Rod**    | 1D structures (ropes, wires)         | ARAP             | ARAP only                                  |
+| **PDRD**   | Rigid bodies (props, rigid shells)      | n/a (rigid)   | n/a                                        |
+| **Sand**   | Granular bodies (sand, loose grains) | n/a (granular)   | n/a                                        |
+| **Static** | Non-deforming collision objects      | N/A              | N/A                                        |
+
+The type controls which material parameters are relevant and which material
+models are available. **Static** groups collapse to **Friction**, an
+**Apply Soft Constraints** box, the **Contact** rows, and the **Allow
+Intersections** box every type carries, and replace the pin region with a
+**Transform** sub-box that holds per-object **Move By** / **Spin** /
+**Scale** ops (an alternative to the object's own Blender animation). See
+[Static Objects](static_objects.md) for the full surface.
+
+**PDRD** (Painless Differentiable Rotation Dynamics) groups move a surface
+mesh as a single exactly-rigid transform: a translation plus a rotation,
+with no stretch at all. They are cheap and stable for stiff props and rigid
+panels that should hold their shape (furniture, plates, shells, hard parts
+of a rig). PDRD bodies still collide, take pins, and stitch to other
+groups, but they do not bend or stretch like cloth or soft solids. Instead
+of **Young's Modulus** and **Poisson's Ratio**, a PDRD group exposes just
+**Density**, so the only choice is how heavy the body is; its motion is
+exactly rigid, so there is no stiffness or rigidity to set.
+
+**Rod** groups accept both mesh objects and Blender curve objects.
+For a mesh, every edge becomes a rod element at transfer time
+(faces are ignored by the solver), and the add-on prepends a
+Wireframe modifier on assignment so the rod structure shows in the
+viewport instead of filled faces. For a Bezier curve, each control
+point becomes one rod vertex (1:1 mapping; edge length equals CP
+spacing), so simulation resolution is set by the user via CP count.
+NURBS curves are sampled per arc at four `t` values because NURBS
+CPs are off-curve. Each arc spans **Order** minus one points, so a NURBS
+spline's points have to fill whole arcs: **Transfer** refuses a spline
+that leaves points past its last whole arc, since those points would not
+be simulated. Blender's **NURBS Circle** (order 3, eight points, cyclic)
+fills whole arcs. See
+[Pins on a Curve Rod](../constraints/pins.md#pins-on-a-curve-rod) for
+which NURBS points can be pinned.
+
+```{figure} ../../images/object_groups/group_type_matrix.svg
+:alt: Reference matrix with six type columns: Shell (green swatch), Solid (red), Rod (yellow), PDRD (magenta), Sand (tan), Static (blue). Rows: accepted object types (Shell, Solid, PDRD, Sand and Static take a mesh, Sand's annotated "converted to grains"; Rod takes a mesh or a Bezier curve); default material model (Baraff-Witkin for Shell, ARAP for Solid and Rod, n/a for PDRD, Sand and Static); available material models (Shell offers Baraff-Witkin and ARAP; Solid offers Stable NeoHookean and ARAP; Rod offers ARAP as the only option; n/a for PDRD, Sand and Static); density (shell_density in kg/m² areal, solid_density in kg/m³ volumetric, rod_density in kg/m line, pdrd_density in kg/m³ volumetric, sand_particle_mass annotated "g per grain, not a density", n/a for Static); Young's Modulus in Pa per density (check for Shell, Solid and Rod, n/a for PDRD, Sand and Static); Poisson's Ratio (check for Shell and Solid, n/a for the rest); Bend Stiffness (check for Shell and Rod, annotated "shared bend property", n/a for Solid, PDRD, Sand and Static); Shrink (check for Shell reading "Shrink X / Y (anisotropic)" and for Solid reading "Shrink (uniform)", with the Rod, PDRD, Sand and Static cells marked n/a); Strain Limit (check for Shell and Rod, n/a for the rest); Inflate face pressure (check for Shell only); Friction, annotated "shared contact param", and Contact Gap / Offset, annotated "absolute or ratio", both checked in all six columns, with Contact Gap annotated "grain radius is the offset" under Sand; pin vertex storage (a Blender vertex group for Shell, Solid, PDRD and Sand; a custom property named _pin_ followed by the pin name for Rod, because curves have no vertex groups; n/a for Static, which uses a Transform sub-box instead); default overlay color, given as RGB triples (0, 0.75, 0) green, (0.75, 0, 0) red, (0.75, 0.75, 0) yellow, (0.75, 0, 0.75) magenta, (0.75, 0.375, 0) tan, (0, 0, 0.75) blue.
+:width: 960px
+
+What each type accepts, models, and exposes. Green check marks mark
+features available in that column; a gray "n/a" marks features that
+are not applicable. **PDRD** is a rigid column: it keeps
+**Density**, **Friction**, and **Contact Gap**, but
+drops the deformation parameters (no **Young's Modulus**,
+**Poisson's Ratio**, **Bend Stiffness**, **Shrink**, **Strain
+Limit**, or **Inflate**) and has no stiffness control because the
+body is exactly rigid. **Static** is the thinnest column because
+the solver only uses it for collision: no material model and no
+parameters beyond **Friction**, the **Contact** rows, and the **Apply
+Soft Constraints** and **Allow Intersections** boxes. The **Material
+Params** box in the sidebar reshapes itself automatically to match
+the column you are in.
+
+Two things the matrix does not show. A **Rod** group has a **Shrink**
+row of its own (`length_factor`, drawn just under **Friction**), which
+scales the rest length of every segment of the strand; the matrix marks
+that cell "n/a". And **Rod** and **Shell** write the same `bend`
+property but scale it on their own terms, so the number is shared and
+the stiffness it produces is not: a rod draws the field in a separate
+**Bend** box and starts at `1.0` where a shell starts at `10.0`. Both
+are covered in [Material Parameters](../params/material.md).
+
+**Sand** is the fifth column. It exposes grain radius, particle mass,
+friction, and the contact rows; see
+[Sand-Specific](../params/material.md#sand-specific).
+```
+
+:::{warning}
+You can have at most 32 active groups in a scene. If you need more, fold
+objects with similar materials into a shared group; there's no cost to
+many objects sharing one group.
+:::
+
+## Assigning Objects
+
+To put objects into a group:
+
+1. Select one or more objects in the viewport.
+2. In the target group's box, click **Add Selected Objects**.
+
+The button only accepts mesh objects, plus curve objects for **Rod**
+groups. Anything else in your current selection is skipped silently.
+
+Five further situations put a message at the bottom of the Blender
+window. In each of them that one object is skipped and the rest of the
+selection is still processed:
+
+- **Library-linked**. The object is a library-linked datablock. These
+  cannot be assigned; an explicit warning is raised. Make the object local
+  first.
+- **Not a particle mesh**. A **Sand** group takes only a committed
+  particle mesh, so a raw solid mesh is refused with an error. Run
+  **Convert To Solid Particle Mesh** on it first.
+- **Linked duplicate**. The object shares its mesh datablock with another
+  object (an `Alt`-`D` copy). Refused with an error; make it single-user
+  through *Object > Relations > Make Single User > Object & Data*.
+- **Duplicate faces**. Two faces share the same vertex set, usually left
+  behind by doubled geometry. Refused with an error; run **Merge by
+  Distance** or **Delete Duplicate Faces** (see
+  [Mesh Cleaning](mesh_cleaning.md)) before assigning.
+- **Already in another group**. The object is assigned to a different
+  active group. A warning is raised; remove it from the first group before
+  re-assigning. An object already in *this* group is skipped silently
+  instead.
+
+When an assignment succeeds, the add-on enables the object's
+**Wireframe** and **All Edges** viewport overlays and, if the group has
+overlay color enabled, tints its viewport color to the group's color.
+
+:::{important}
+**The solver simulates the mesh's own vertices and faces, posed by the
+deformers in front of its first topology-changing modifier.** A
+**Subdivision Surface**, **Mirror**, **Bevel**, **Remesh**,
+**Solidify**, or any other modifier that changes the vertex count adds
+no geometry to the simulation. If the subdivided or beveled topology is
+what you actually want to simulate, **Apply** those modifiers first
+(`Ctrl`-`A` → *Visual Geometry to Mesh*, or modifier header → *Apply*)
+and then **Transfer**.
+
+The pose is honored, though. For a simulated object, **Transfer** sends
+each vertex where the modifier stack puts it at the solve's **Starting
+Frame**. When the stack changes the vertex count, it is evaluated cut
+at the first modifier that does so: an
+**Armature**, **Lattice**, or Shape Key in front of a **Subdivision
+Surface** reaches the solve, while a deformer after it applies on
+display only, on top of the simulated result. In a stack that changes
+the vertex count, a **Geometry Nodes** modifier counts as a cut point
+even when it only moves vertices. **Capture Deformation** on a pin
+reads the same cut stack.
+
+The **ContactSolverCache** MESH_CACHE modifier the add-on installs after
+**Fetch** sits at that cut: on a simulated object, in the first slot
+when the object has no deforming modifier, otherwise after the
+deformers and before the first topology-changing modifier (always the
+latter on a **Static** collider). Modifiers after it (a Subdivision Surface
+for smooth render, for example) stack on top of the simulated result
+without interfering with it.
+:::
+
+### Assigned Objects List
+
+Each entry in the **Assigned Objects** list shows the object name and a
+small **Include** checkbox column. Unchecking the checkbox keeps the object
+in the list for later re-use but excludes it from the next transfer to the
+solver. This is handy for A/B-testing scenes without dismantling the
+group.
+
+To remove an object from a group, select it in the **Assigned Objects**
+list and click **Remove Object**. Removing an object resets its viewport
+color to white and removes the pins registered on it, its entries in the
+group's **Allow Intersections** object lists, and every
+[merge pair](../constraints/snap_merge.md) that names it.
+
+```{figure} ../../images/object_groups/assigned_objects.png
+:alt: Assigned Objects list showing one entry
+:width: 500px
+
+The **Assigned Objects** list for a **Shell** group with one `Cloth`
+mesh assigned. The left checkbox is the **Include** flag; unchecking
+excludes the object from the next transfer without removing it from the
+group.
+```
+
+## Active Collision Windows
+
+For **Solid**, **Shell**, **Rod**, and **PDRD** groups, contact detection
+on each assigned object can be restricted to specific frame ranges. The
+control lives inside the **Material Params** box (just below the **Contact
+Gap** rows) as the **Collision Active Duration Windows** toggle.
+
+When the toggle is off (the default), every assigned object collides for
+the full timeline. Switching it on reveals a per-object editor:
+
+- An **Object** dropdown picks which of the group's assigned objects to
+  edit.
+- Below it sits a list of **Active Windows** for that object: frame
+  ranges during which contact is enabled. Up to **8 windows per object**.
+- The **+** / **−** buttons add and remove entries; new windows default
+  to frames **1 to 60**, or to the same 60 frames beginning at the
+  solve's **Starting Frame** when that is later.
+- Selecting a window exposes **Start** and **End** spinners that edit
+  its bounds. **Transfer** refuses a window whose **End** is not after
+  its **Start**, or whose **Start** is before the **Starting Frame**,
+  naming the object and both frames. Nothing is clipped: move the
+  window or the **Starting Frame**.
+
+Outside every window listed for an object, that object's contact is
+muted. A few rules worth knowing:
+
+- **No windows on an object means contact is always active.** Flipping
+  the toggle on by itself does not disable anything; you must add at
+  least one window on a given object for the cutoff to apply to it.
+- **Invisible colliders are not affected.** Walls and spheres always
+  collide, even when surrounding deformables have collision windows set.
+  Invisible colliders have their own per-collider **Active Duration**
+  field; see [Invisible Colliders](../constraints/colliders.md).
+- **Static groups have no collision windows.** Static objects collide for
+  the full timeline; if you need them to come and go mid-shot, animate
+  their visibility or use their **Transform** ops (see
+  [Static Objects](./static_objects.md)).
+
+Typical uses are timed catch-and-release setups (a hand grabs a piece
+of cloth, then lets go without re-engaging) and sequential drops where a
+stack of objects should only start interacting once each lower piece has
+settled.
+
+## Overlay Colors
+
+In the group header there's a small color-swatch control. Clicking it
+opens Blender's standard color picker; picking a color immediately tints
+every assigned object's viewport outline to that color, so you can see at
+a glance which objects belong to which group in the viewport.
+
+:::{note}
+The overlay color is **not a material**. It is only a viewport
+preview tint used to distinguish groups at a glance, making it easier
+to track which objects are assigned and what types they are. It is
+not sent to the solver and has no effect on the simulation.
+:::
+
+An **Overlay Color** checkbox sits to the left of the swatch, and the
+swatch is drawn only while it is ticked. Unticking it resets every
+assigned object's viewport color to white rather than restoring whatever
+color the object carried before it joined the group; ticking it again
+re-tints them to whatever the swatch currently holds.
+
+```{figure} ../../images/object_groups/group_header_row.png
+:alt: Group header row showing the group name, type dropdown, Overlay Color checkbox, and the color swatch next to it
+:width: 500px
+
+Top rows of a Shell group box. The **Overlay Color** checkbox on the
+left and the **color swatch** on the right control the viewport tint;
+clicking the swatch opens Blender's color picker. The duplicate icon
+sits in the top-right of the header row (covered below).
+```
+
+```{figure} ../../images/object_groups/overlay_color_preview.png
+:alt: Blender viewport with a cube assigned to a Shell group whose overlay color is set to green. The cube's viewport shading is tinted green, and the sidebar on the right shows the Dynamics Groups panel with the green color swatch beside the Overlay Color toggle
+:width: 720px
+
+Overlay colors in action. The **Cloth** object is assigned to a Shell
+group whose swatch is set to green (visible on the right of the
+**Overlay Color** row in the sidebar). With solid shading's color mode
+set to **Object** (which the add-on flips on for you when an
+assignment succeeds), the cube itself reads green in the viewport.
+Multiple groups picking distinct swatches lets you spot which object
+belongs where without clicking each one.
+```
+
+Each group gets a default overlay color based on its type:
+
+| Type       | Default RGB           |
+| ---------- | --------------------- |
+| **Solid**  | red `(0.75, 0, 0)`    |
+| **Shell**  | green `(0, 0.75, 0)`  |
+| **Rod**    | yellow `(0.75, 0.75, 0)` |
+| **PDRD**   | magenta `(0.75, 0, 0.75)` |
+| **Sand**   | tan `(0.75, 0.375, 0)` |
+| **Static** | blue `(0, 0, 0.75)`   |
+
+## Duplicating a Group
+
+The duplicate icon in the group header spawns a new group with the
+*same material parameters* as the source. Objects, pins, and pin
+operations are **not** copied; the new group is empty. The name
+auto-increments: `Silk` → `Silk-1`, `Silk-1` → `Silk-2`.
+
+```{figure} ../../images/object_groups/duplicate_icon.png
+:alt: Dynamics Groups panel with the small duplicate icon in the group header highlighted
+:width: 500px
+
+The **Duplicate** icon lives in the top-right of each group's header row
+(right of the group name). Clicking it clones only the material
+parameters into a fresh group slot; the new group has no assigned
+objects, no pins, and no pin operations.
+```
+
+## Deleting Groups
+
+- **Delete Group** (the trash icon in the group's own box, below the
+  Bake row) resets a single group slot. Assigned object colors are
+  restored to white, any pin vertex groups are cleaned up, and every
+  [merge pair](../constraints/snap_merge.md) naming one of the group's
+  objects is removed.
+- **Delete All Groups** (top row of the panel, next to **Create Group**)
+  iterates all 32 slots and resets each active one. The UI confirms
+  before proceeding.
+
+```{figure} ../../images/object_groups/delete_all_groups.png
+:alt: Dynamics Groups panel with the Delete All Groups button at the top highlighted
+:width: 500px
+
+**Delete All Groups** sits in the panel's header row, paired with
+**Create Group**. The per-group **Delete Group** button is visible below
+inside each group box (with the same trash icon, at full width).
+```
+
+## Blender Python API
+
+The same workflow is available from Python. The API mirrors the UI
+one-for-one: groups are created through `solver.create_group`, objects
+are assigned with `group.add`, and every operation on a group returns
+the group itself for easy chaining.
+
+```python
+from bl_ext.user_default.ppf_contact_solver.ops.api import solver
+
+# Create groups of each type.
+cloth = solver.create_group("Cloth", "SHELL")
+body  = solver.create_group("Body",  "STATIC")
+
+# Assign Blender objects by name.
+cloth.add("Shirt")
+cloth.add("Skirt")
+body.add("Character")
+
+# Override the overlay color (RGBA, 0 to 1).
+cloth.set_overlay_color(0.2, 0.8, 1.0, 0.75)
+
+# Delete one group, or wipe them all.
+cloth.delete()
+solver.delete_all_groups()
+```
+
+:::{admonition} Under the hood
+:class: toggle
+
+**32-slot model**
+
+The 32 slots are fixed properties on the scene (`object_group_0` through
+`object_group_31`), not a dynamic collection. Creating a group takes the
+first inactive slot; deleting one frees the slot. This means:
+
+- Groups survive file save / load without reassignment.
+- The underlying slot index is **not** the same as the display number:
+  the UI renumbers visible groups sequentially (1, 2, 3, and so on) even if the
+  underlying slots are 0, 3, 7.
+
+**Library-linked rejection**
+
+Library-linked objects are rejected because the add-on stamps a
+persistent UUID on each assigned object, and library overrides are not
+writable at the level the UUID lives on.
+:::

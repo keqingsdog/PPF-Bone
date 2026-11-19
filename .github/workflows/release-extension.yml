@@ -1,0 +1,26 @@
+# Build-only public extension artifacts; publication remains a separate action.
+name: Build Blender extension
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install Blender 5.1
+        run: |
+          curl -fL --retry 3 -o blender.tar.xz https://download.blender.org/release/Blender5.1/blender-5.1.0-linux-x64.tar.xz
+          mkdir blender
+          tar -xf blender.tar.xz --strip-components=1 -C blender
+      - name: Build and validate
+        run: |
+          python blender_addon/wheels/build_package.py --abi universal --blender ./blender/blender --output "packages/ppf-universal.zip"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ppf-blender-universal
+          path: packages/ppf-universal.zip

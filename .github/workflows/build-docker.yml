@@ -1,0 +1,75 @@
+# Fork modification: changed from the upstream baseline.
+# Docker build dispatch: no cloud use or publish without explicit opt-in.
+name: Docker Build
+on:
+  workflow_dispatch:
+    inputs:
+      allow_aws:
+        description: Authorize AWS (repository opt-in required)
+        type: boolean
+        required: true
+        default: false
+      dry_run:
+        description: Build and smoke-test without publishing
+        type: boolean
+        required: true
+        default: true
+      publish_image:
+        description: Authorize image publish (repository opt-in required)
+        type: boolean
+        required: true
+        default: false
+      allow_private_publish:
+        description: Explicitly authorize publishing from a private repository
+        type: boolean
+        required: true
+        default: false
+      instance_type:
+        description: EC2 instance type
+        required: true
+        default: g6e.2xlarge
+        type: choice
+        options: [g6.2xlarge, g6e.2xlarge]
+      region:
+        description: AWS region
+        required: true
+        default: ap-northeast-1
+        type: choice
+        options: [us-east-1, us-east-2, ap-northeast-1]
+permissions:
+  contents: read
+jobs:
+  publish-approval:
+    if: ${{ github.ref_type == 'branch' && github.ref_name == github.event.repository.default_branch && inputs.allow_aws == true && vars.PPF_ENABLE_AWS == 'true' && inputs.publish_image == true && vars.PPF_ENABLE_PACKAGES == 'true' && inputs.dry_run == false && (github.event.repository.private == false || inputs.allow_private_publish == true) }}
+    environment: ppf-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - run: echo "Explicit publication authorization accepted."
+  build-only:
+    if: ${{ github.ref_type == 'branch' && github.ref_name == github.event.repository.default_branch && inputs.allow_aws == true && vars.PPF_ENABLE_AWS == 'true' && (inputs.dry_run == true || inputs.publish_image == false || vars.PPF_ENABLE_PACKAGES != 'true' || (github.event.repository.private == true && inputs.allow_private_publish == false)) }}
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/docker-core.yml
+    with:
+      region: ${{ inputs.region }}
+      instance_type: ${{ inputs.instance_type }}
+      dry_run: ${{ inputs.dry_run }}
+      publish: false
+    secrets: inherit
+  publish:
+    needs: publish-approval
+    if: ${{ needs.publish-approval.result == 'success' }}
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    uses: ./.github/workflows/docker-core.yml
+    with:
+      region: ${{ inputs.region }}
+      instance_type: ${{ inputs.instance_type }}
+      dry_run: ${{ inputs.dry_run }}
+      publish: true
+    secrets: inherit

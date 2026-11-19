@@ -1,0 +1,816 @@
+# Fork modification: changed from the upstream baseline.
+# File: roller-win.yml
+# Code: Claude Code
+# Review: Ryoichi Ando (ryoichi.ando@zozo.com)
+# License: Apache v2.0
+
+name: roller.ipynb (Windows Native)
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      allow_aws:
+        description: 'Authorize AWS use (repository opt-in also required)'
+        required: true
+        type: boolean
+        default: false
+      instance_type:
+        description: 'EC2 instance type'
+        required: true
+        default: 'g6e.2xlarge'
+        type: choice
+        options:
+          - g6.2xlarge
+          - g6e.2xlarge
+      region:
+        description: 'AWS Region'
+        required: true
+        default: 'ap-northeast-1'
+        type: choice
+        options:
+          - us-east-1
+          - us-east-2
+          - ap-northeast-1
+
+jobs:
+  run-example:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref_type == 'branch' && github.ref_name == github.event.repository.default_branch && inputs.allow_aws == true && vars.PPF_ENABLE_AWS == 'true' }}
+    environment: ppf-cloud
+    name: Run roller (Windows)
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      AWS_REGION: ${{ github.event.inputs.region }}
+      INSTANCE_TYPE: ${{ github.event.inputs.instance_type }}
+      BRANCH: ${{ github.ref_name }}
+      EXAMPLE: roller
+      WORKDIR: C:\ppf-contact-solver
+      USER: Administrator
+
+    steps:
+      - name: Show input parameters
+        run: |
+          echo "## Input Parameters"
+          echo "Example: roller"
+          echo "Branch: ${{ github.ref_name }}"
+          echo "Instance Type: ${{ github.event.inputs.instance_type }}"
+          echo "Region: ${{ github.event.inputs.region }}"
+
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 21600
+
+      - name: Verify AWS authentication
+        run: |
+          echo "Testing AWS authentication..."
+          aws sts get-caller-identity
+          echo "AWS Region: $AWS_REGION"
+          echo "Instance Type: $INSTANCE_TYPE"
+          echo "Branch: $BRANCH"
+          echo "Example: $EXAMPLE"
+
+      - name: Find Windows Server AMI and network resources
+        id: setup
+        run: |
+          echo "Finding latest Windows Server 2025 AMI..."
+          AMI_ID=$(aws ec2 describe-images \
+            --owners amazon \
+            --filters \
+              "Name=name,Values=Windows_Server-2025-English-Full-Base-*" \
+              "Name=state,Values=available" \
+            --query 'sort_by(Images, &CreationDate)[-1].ImageId' \
+            --region "$AWS_REGION" \
+            --output text)
+
+          if [ "$AMI_ID" = "None" ] || [ -z "$AMI_ID" ]; then
+            echo "ERROR: Windows Server 2025 AMI not found in region $AWS_REGION"
+            exit 1
+          fi
+          echo "AMI_ID=$AMI_ID" >> $GITHUB_OUTPUT
+          echo "Found AMI: $AMI_ID"
+
+          # Get GitHub Actions dedicated VPC, subnet, and security group
+          VPC_ID=$(aws ec2 describe-vpcs --filters "Name=tag:Name,Values=github-actions-vpc" --query 'Vpcs[0].VpcId' --output text)
+          if [ "$VPC_ID" = "None" ] || [ -z "$VPC_ID" ]; then
+            echo "ERROR: github-actions-vpc not found in region $AWS_REGION"
+            exit 1
+          fi
+
+          SUBNET_ID=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --query 'Subnets[0].SubnetId' --output text)
+          if [ "$SUBNET_ID" = "None" ] || [ -z "$SUBNET_ID" ]; then
+            echo "ERROR: no subnet found in github-actions-vpc ($VPC_ID) in region $AWS_REGION"
+            exit 1
+          fi
+
+          SG_ID=$(aws ec2 describe-security-groups --filters "Name=vpc-id,Values=$VPC_ID" "Name=group-name,Values=github-actions-sg" --query 'SecurityGroups[0].GroupId' --output text)
+          if [ "$SG_ID" = "None" ] || [ -z "$SG_ID" ]; then
+            echo "ERROR: github-actions-sg not found in github-actions-vpc ($VPC_ID) in region $AWS_REGION"
+            exit 1
+          fi
+
+          echo "::add-mask::$VPC_ID"
+          echo "::add-mask::$SUBNET_ID"
+          echo "::add-mask::$SG_ID"
+          echo "SUBNET_ID=$SUBNET_ID" >> $GITHUB_OUTPUT
+          echo "SG_ID=$SG_ID" >> $GITHUB_OUTPUT
+          echo "VPC: $VPC_ID, Subnet: $SUBNET_ID, SG: $SG_ID"
+
+      - name: Generate unique identifiers
+        id: ids
+        run: |
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+          RANDOM_SUFFIX=$(head /dev/urandom | tr -dc a-z0-9 | head -c 6)
+          TEMP_INSTANCE_ID="temp-${TIMESTAMP}-${RANDOM_SUFFIX}"
+          echo "TIMESTAMP=$TIMESTAMP" >> $GITHUB_OUTPUT
+          echo "TEMP_INSTANCE_ID=$TEMP_INSTANCE_ID" >> $GITHUB_OUTPUT
+          echo "Temporary Instance ID: $TEMP_INSTANCE_ID"
+
+      - name: Create EC2 key pair
+        id: keypair
+        run: |
+          KEY_NAME="win-roller-${{ steps.ids.outputs.TIMESTAMP }}-${{ github.run_id }}"
+          echo "::add-mask::$KEY_NAME"
+          echo "KEY_NAME=$KEY_NAME" >> $GITHUB_OUTPUT
+
+          aws ec2 create-key-pair \
+            --key-name "$KEY_NAME" \
+            --query 'KeyMaterial' \
+            --output text > /tmp/ec2key.pem
+          chmod 600 /tmp/ec2key.pem
+          echo "Created key pair: $KEY_NAME"
+
+      - name: Create Windows user data script
+        run: |
+          # Use standard SSH port 22 for EC2 Instance Connect
+          sed "s/SSH_PORT_PLACEHOLDER/22/g" .github/workflows/scripts/win/user-data.ps1 > /tmp/user-data.ps1
+          echo "User data script created with SSH port 22"
+
+      - name: Launch EC2 instance
+        id: instance
+        run: |
+          echo "Launching Windows EC2 instance..."
+          INSTANCE_ID=$(aws ec2 run-instances \
+            --image-id "${{ steps.setup.outputs.AMI_ID }}" \
+            --instance-type "$INSTANCE_TYPE" \
+            --key-name "${{ steps.keypair.outputs.KEY_NAME }}" \
+            --subnet-id "${{ steps.setup.outputs.SUBNET_ID }}" \
+            --security-group-ids "${{ steps.setup.outputs.SG_ID }}" \
+            --associate-public-ip-address \
+            --user-data file:///tmp/user-data.ps1 \
+            --block-device-mappings "DeviceName=/dev/sda1,Ebs={VolumeSize=100,VolumeType=gp3,DeleteOnTermination=true}" \
+            --tag-specifications \
+              "ResourceType=instance,Tags=[{Key=Name,Value=gpu-runner-win-roller-${{ steps.ids.outputs.TIMESTAMP }}},{Key=ManagedBy,Value=GitHubActions},{Key=Purpose,Value=WindowsGPURunner},{Key=Workflow,Value=${{ github.workflow }}},{Key=RunId,Value=${{ github.run_id }}},{Key=Branch,Value=${{ env.BRANCH }}},{Key=Example,Value=roller}]" \
+              "ResourceType=volume,Tags=[{Key=Name,Value=gpu-runner-win-roller-${{ steps.ids.outputs.TIMESTAMP }}-volume},{Key=ManagedBy,Value=GitHubActions},{Key=Purpose,Value=WindowsGPURunner}]" \
+            --instance-initiated-shutdown-behavior terminate \
+            --query 'Instances[0].InstanceId' \
+            --region "$AWS_REGION" \
+            --output text)
+          echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_OUTPUT
+          echo "Instance launched: $INSTANCE_ID"
+
+      - name: Wait for instance and establish tunnel
+        run: |
+          INSTANCE_ID="${{ steps.instance.outputs.INSTANCE_ID }}"
+          echo "Waiting for instance status checks..."
+          aws ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID"
+
+          echo "Waiting for OpenSSH to be ready via EC2 Instance Connect..."
+          for i in {1..30}; do
+            timeout 15 aws ec2-instance-connect open-tunnel \
+              --instance-id "$INSTANCE_ID" \
+              --remote-port 22 \
+              --local-port 2222 &
+            TUNNEL_PID=$!
+            sleep 5
+
+            if nc -z localhost 2222 2>/dev/null; then
+              echo "SSH is responding on attempt $i"
+              kill $TUNNEL_PID 2>/dev/null || true
+              break
+            fi
+
+            kill $TUNNEL_PID 2>/dev/null || true
+            if [ $i -eq 30 ]; then
+              echo "ERROR: SSH not ready after 30 attempts"
+              exit 1
+            fi
+            echo "Attempt $i/30: SSH not ready, waiting 10s..."
+            sleep 10
+          done
+
+          # Save instance ID for subsequent steps
+          echo "$INSTANCE_ID" > /tmp/instance_id.txt
+
+      - name: Install NVIDIA driver only (no CUDA toolkit)
+        run: |
+          echo "Installing NVIDIA driver (this will take a few minutes)..."
+          INSTANCE_ID=$(cat /tmp/instance_id.txt)
+
+          aws ec2-instance-connect open-tunnel \
+            --instance-id "$INSTANCE_ID" \
+            --remote-port 22 \
+            --local-port 2222 &
+          TUNNEL_PID=$!
+          sleep 5
+
+          scp -P 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=60 -o ServerAliveCountMax=10 \
+            -i /tmp/ec2key.pem .github/workflows/scripts/win/install-nvidia-driver.ps1 Administrator@localhost:C:/install_driver.ps1
+
+          ssh -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=60 -o ServerAliveCountMax=10 \
+            -i /tmp/ec2key.pem Administrator@localhost \
+            "powershell -ExecutionPolicy Bypass -File C:/install_driver.ps1"
+
+          kill $TUNNEL_PID 2>/dev/null || true
+
+      - name: Create archive of repository
+        run: |
+          echo "Creating repository archive..."
+          git archive --format=zip --output=/tmp/repo.zip HEAD
+
+      - name: Transfer repository to instance
+        run: |
+          echo "Transferring repository to instance..."
+          INSTANCE_ID=$(cat /tmp/instance_id.txt)
+
+          aws ec2-instance-connect open-tunnel \
+            --instance-id "$INSTANCE_ID" \
+            --remote-port 22 \
+            --local-port 2222 &
+          TUNNEL_PID=$!
+          sleep 5
+
+          scp -P 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=60 -o ServerAliveCountMax=10 \
+            -i /tmp/ec2key.pem /tmp/repo.zip Administrator@localhost:C:/source.zip
+
+          ssh -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=60 -o ServerAliveCountMax=10 \
+            -i /tmp/ec2key.pem Administrator@localhost \
+            "powershell -Command \"if (Test-Path 'C:\\ppf-contact-solver') { Remove-Item -Recurse -Force 'C:\\ppf-contact-solver' }; New-Item -ItemType Directory -Path 'C:\\ppf-contact-solver' -Force; Expand-Archive -Path 'C:\\source.zip' -DestinationPath 'C:\\ppf-contact-solver' -Force; Remove-Item 'C:\\source.zip'\""
+
+          kill $TUNNEL_PID 2>/dev/null || true
+
+      - name: Run warmup.bat
+        run: |
+          echo "Running warmup.bat..."
+          INSTANCE_ID=$(cat /tmp/instance_id.txt)
+
+          aws ec2-instance-connect open-tunnel \
+            --instance-id "$INSTANCE_ID" \
+            --remote-port 22 \
+            --local-port 2222 &
+          TUNNEL_PID=$!
+          sleep 5
+
+          ssh -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=60 -o ServerAliveCountMax=10 \
+            -i /tmp/ec2key.pem Administrator@localhost \
+            "cmd /c 'cd C:\\ppf-contact-solver\\build-win-native && call warmup.bat /nopause'"
+
+          kill $TUNNEL_PID 2>/dev/null || true
+
+      # THE OIDC CREDENTIAL LASTS ONE HOUR AND THE REMOTE WORK BELOW FILLS IT,
+      # SO EVERY STEP THAT OPENS A TUNNEL FROM HERE ON REFRESHES FIRST. `aws
+      # ec2-instance-connect open-tunnel` authenticates when it opens, runs in
+      # the BACKGROUND, and its exit status is never checked, so an expired
+      # credential does not report itself as one: the tunnel never binds port
+      # 2222 and the ssh that follows reports `connect to host localhost port
+      # 2222: Connection refused`, which reads as the instance being down.
+      # Measured on run 35069498252 (RequestExpired at 60m17s) against run
+      # 35056934927 (passed at 59m32s). build.bat builds every backend the
+      # toolchain supports, each into its own target\<backend>, so the build
+      # alone can occupy most of an hour, and each iteration after it opens a
+      # tunnel of its own. A refresh costs about one second.
+      - name: Re-authenticate AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 21600
+
+      # ONE BUILD PRODUCES EVERY BACKEND AND ITS SERVER. build.bat builds each
+      # backend into its own target\<backend>\release with ppf-cts-server.exe
+      # and the cdylib beside the solver, writes the .ppf-backend marker there,
+      # and fails when any of the three is missing. The addon launcher
+      # (blender_addon/core/connection.py) and frontend/_backends_.py read
+      # those markers, so no separate server build into target\release is run
+      # here: one would leave an unmarked directory holding a server with no
+      # solver beside it.
+      - name: Run build.bat
+        run: |
+          echo "Running build.bat..."
+          INSTANCE_ID=$(cat /tmp/instance_id.txt)
+
+          aws ec2-instance-connect open-tunnel \
+            --instance-id "$INSTANCE_ID" \
+            --remote-port 22 \
+            --local-port 2222 &
+          TUNNEL_PID=$!
+          sleep 5
+
+          ssh -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=60 -o ServerAliveCountMax=10 \
+            -i /tmp/ec2key.pem Administrator@localhost \
+            "cmd /c 'cd C:\\ppf-contact-solver\\build-win-native && call build.bat /nopause'"
+
+          kill $TUNNEL_PID 2>/dev/null || true
+
+      - name: Re-authenticate AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 21600
+
+      - name: Convert assertion notebook to Python script
+        run: |
+          echo "Converting assertion notebook: examples/fail-examples/assertion.ipynb"
+          INSTANCE_ID=$(cat /tmp/instance_id.txt)
+
+          # Use the same conversion pattern as main examples
+          cat > /tmp/convert_assertion.ps1 << 'EOFPS1'
+          $ErrorActionPreference = "Stop"
+          Set-Location C:\ppf-contact-solver
+          $env:PATH = "C:\ppf-contact-solver\build-win-native\python;C:\ppf-contact-solver\build-win-native\python\Scripts;" + $env:PATH
+          New-Item -ItemType Directory -Path "C:\ci" -Force | Out-Null
+          Write-Host "Converting assertion.ipynb to Python script..."
+          & C:\ppf-contact-solver\build-win-native\python\python.exe -m jupyter nbconvert --to python "examples/fail-examples/assertion.ipynb" --output "C:\ci\assertion_base.py"
+          $header = "import sys`nimport os`nsys.path.insert(0, r'C:\ppf-contact-solver')`nsys.path.insert(0, r'C:\ppf-contact-solver\frontend')`nos.environ['PYTHONPATH'] = r'C:\ppf-contact-solver;C:\ppf-contact-solver\frontend;' + os.environ.get('PYTHONPATH', '')"
+          $baseContent = Get-Content "C:\ci\assertion_base.py" -Raw
+          $header + "`n" + $baseContent | Set-Content "C:\ci\assertion.py"
+          Write-Host "Assertion script prepared at C:\ci\assertion.py"
+          EOFPS1
+
+          aws ec2-instance-connect open-tunnel \
+            --instance-id "$INSTANCE_ID" \
+            --remote-port 22 \
+            --local-port 2222 &
+          TUNNEL_PID=$!
+          sleep 5
+
+          scp -P 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=60 -o ServerAliveCountMax=10 \
+            -i /tmp/ec2key.pem /tmp/convert_assertion.ps1 Administrator@localhost:C:/convert_assertion.ps1
+
+          ssh -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=60 -o ServerAliveCountMax=10 \
+            -i /tmp/ec2key.pem Administrator@localhost \
+            "powershell -ExecutionPolicy Bypass -File C:/convert_assertion.ps1"
+
+          kill $TUNNEL_PID 2>/dev/null || true
+
+      - name: Re-authenticate AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 21600
+
+      - name: Run assertion test (expect failure)
+        run: |
+          echo "Running assertion test to verify error propagation via SSH..."
+          echo "This test uses the same execution pattern as main examples"
+          echo "Expected result: FAILURE (AssertionError)"
+          INSTANCE_ID=$(cat /tmp/instance_id.txt)
+
+          # Create script that runs the same way as main examples
+          cat > /tmp/run_assertion.ps1 << 'EOFPS1'
+          Set-Location C:\ppf-contact-solver
+          "assertion" | Set-Content "frontend\.CI"
+          & C:\ppf-contact-solver\build-win-native\python\python.exe C:\ci\assertion.py 2>&1 | Tee-Object -FilePath "C:\ci\assertion.log"
+          exit $LASTEXITCODE
+          EOFPS1
+
+          aws ec2-instance-connect open-tunnel \
+            --instance-id "$INSTANCE_ID" \
+            --remote-port 22 \
+            --local-port 2222 &
+          TUNNEL_PID=$!
+          sleep 5
+
+          scp -P 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=60 -o ServerAliveCountMax=10 \
+            -i /tmp/ec2key.pem /tmp/run_assertion.ps1 Administrator@localhost:C:/run_assertion.ps1
+
+          # Run and expect failure
+          if ssh -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=60 -o ServerAliveCountMax=10 \
+            -i /tmp/ec2key.pem Administrator@localhost \
+            "powershell -ExecutionPolicy Bypass -File C:/run_assertion.ps1"; then
+            kill $TUNNEL_PID 2>/dev/null || true
+            echo "ERROR: Assertion test should have failed but succeeded"
+            echo "This means errors are NOT being propagated correctly!"
+            exit 1
+          else
+            kill $TUNNEL_PID 2>/dev/null || true
+            echo "SUCCESS: Assertion test failed as expected"
+            echo "Error propagation via SSH is working correctly"
+            echo "Main example tests can now proceed with confidence"
+          fi
+
+      - name: Re-authenticate AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 21600
+
+      - name: Convert notebook to Python script
+        run: |
+          echo "Converting roller.ipynb to Python script..."
+          INSTANCE_ID=$(cat /tmp/instance_id.txt)
+
+          sed "s/EXAMPLE_PLACEHOLDER/roller/g" .github/workflows/scripts/win/convert-notebook.ps1 > /tmp/convert_notebook.ps1
+
+          aws ec2-instance-connect open-tunnel --instance-id "$INSTANCE_ID" --remote-port 22 --local-port 2222 &
+          TUNNEL_PID=$!
+          sleep 5
+
+          scp -P 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=60 -o ServerAliveCountMax=10 \
+            -i /tmp/ec2key.pem /tmp/convert_notebook.ps1 Administrator@localhost:C:/convert_notebook.ps1
+
+          ssh -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=60 -o ServerAliveCountMax=10 \
+            -i /tmp/ec2key.pem Administrator@localhost \
+            "powershell -ExecutionPolicy Bypass -File C:/convert_notebook.ps1"
+
+          kill $TUNNEL_PID 2>/dev/null || true
+
+      - name: Re-authenticate AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 21600
+
+      - name: Run 1st iteration
+        run: |
+          echo "Running 1st iteration of roller"
+          INSTANCE_ID=$(cat /tmp/instance_id.txt)
+          sed -e "s/EXAMPLE_PLACEHOLDER/roller/g" -e "s/ITERATION_PLACEHOLDER/1st/g" -e "s/ITERATION_NUM_PLACEHOLDER/1/g" \
+            .github/workflows/scripts/win/run-iteration.ps1 > /tmp/run_iteration.ps1
+          aws ec2-instance-connect open-tunnel --instance-id "$INSTANCE_ID" --remote-port 22 --local-port 2222 &
+          TUNNEL_PID=$!
+          sleep 5
+          scp -P 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=60 -o ServerAliveCountMax=10 \
+            -i /tmp/ec2key.pem /tmp/run_iteration.ps1 Administrator@localhost:C:/run_iteration.ps1
+          ssh -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=60 -o ServerAliveCountMax=10 \
+            -i /tmp/ec2key.pem Administrator@localhost \
+            "powershell -ExecutionPolicy Bypass -File C:/run_iteration.ps1"
+          kill $TUNNEL_PID 2>/dev/null || true
+
+      - name: Re-authenticate AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 21600
+
+      - name: Run 2nd iteration
+        run: |
+          echo "Running 2nd iteration of roller"
+          INSTANCE_ID=$(cat /tmp/instance_id.txt)
+          sed -e "s/EXAMPLE_PLACEHOLDER/roller/g" -e "s/ITERATION_PLACEHOLDER/2nd/g" -e "s/ITERATION_NUM_PLACEHOLDER/2/g" \
+            .github/workflows/scripts/win/run-iteration.ps1 > /tmp/run_iteration.ps1
+          aws ec2-instance-connect open-tunnel --instance-id "$INSTANCE_ID" --remote-port 22 --local-port 2222 &
+          TUNNEL_PID=$!
+          sleep 5
+          scp -P 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=60 -o ServerAliveCountMax=10 \
+            -i /tmp/ec2key.pem /tmp/run_iteration.ps1 Administrator@localhost:C:/run_iteration.ps1
+          ssh -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=60 -o ServerAliveCountMax=10 \
+            -i /tmp/ec2key.pem Administrator@localhost \
+            "powershell -ExecutionPolicy Bypass -File C:/run_iteration.ps1"
+          kill $TUNNEL_PID 2>/dev/null || true
+
+      - name: Re-authenticate AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 21600
+
+      - name: Run 3rd iteration
+        run: |
+          echo "Running 3rd iteration of roller"
+          INSTANCE_ID=$(cat /tmp/instance_id.txt)
+          sed -e "s/EXAMPLE_PLACEHOLDER/roller/g" -e "s/ITERATION_PLACEHOLDER/3rd/g" -e "s/ITERATION_NUM_PLACEHOLDER/3/g" \
+            .github/workflows/scripts/win/run-iteration.ps1 > /tmp/run_iteration.ps1
+          aws ec2-instance-connect open-tunnel --instance-id "$INSTANCE_ID" --remote-port 22 --local-port 2222 &
+          TUNNEL_PID=$!
+          sleep 5
+          scp -P 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=60 -o ServerAliveCountMax=10 \
+            -i /tmp/ec2key.pem /tmp/run_iteration.ps1 Administrator@localhost:C:/run_iteration.ps1
+          ssh -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=60 -o ServerAliveCountMax=10 \
+            -i /tmp/ec2key.pem Administrator@localhost \
+            "powershell -ExecutionPolicy Bypass -File C:/run_iteration.ps1"
+          kill $TUNNEL_PID 2>/dev/null || true
+
+      - name: Re-authenticate AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 21600
+
+      - name: Run 4th iteration
+        run: |
+          echo "Running 4th iteration of roller"
+          INSTANCE_ID=$(cat /tmp/instance_id.txt)
+          sed -e "s/EXAMPLE_PLACEHOLDER/roller/g" -e "s/ITERATION_PLACEHOLDER/4th/g" -e "s/ITERATION_NUM_PLACEHOLDER/4/g" \
+            .github/workflows/scripts/win/run-iteration.ps1 > /tmp/run_iteration.ps1
+          aws ec2-instance-connect open-tunnel --instance-id "$INSTANCE_ID" --remote-port 22 --local-port 2222 &
+          TUNNEL_PID=$!
+          sleep 5
+          scp -P 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=60 -o ServerAliveCountMax=10 \
+            -i /tmp/ec2key.pem /tmp/run_iteration.ps1 Administrator@localhost:C:/run_iteration.ps1
+          ssh -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=60 -o ServerAliveCountMax=10 \
+            -i /tmp/ec2key.pem Administrator@localhost \
+            "powershell -ExecutionPolicy Bypass -File C:/run_iteration.ps1"
+          kill $TUNNEL_PID 2>/dev/null || true
+
+      - name: Re-authenticate AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 21600
+
+      - name: Run 5th iteration
+        run: |
+          echo "Running 5th iteration of roller"
+          INSTANCE_ID=$(cat /tmp/instance_id.txt)
+          sed -e "s/EXAMPLE_PLACEHOLDER/roller/g" -e "s/ITERATION_PLACEHOLDER/5th/g" -e "s/ITERATION_NUM_PLACEHOLDER/5/g" \
+            .github/workflows/scripts/win/run-iteration.ps1 > /tmp/run_iteration.ps1
+          aws ec2-instance-connect open-tunnel --instance-id "$INSTANCE_ID" --remote-port 22 --local-port 2222 &
+          TUNNEL_PID=$!
+          sleep 5
+          scp -P 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=60 -o ServerAliveCountMax=10 \
+            -i /tmp/ec2key.pem /tmp/run_iteration.ps1 Administrator@localhost:C:/run_iteration.ps1
+          ssh -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=60 -o ServerAliveCountMax=10 \
+            -i /tmp/ec2key.pem Administrator@localhost \
+            "powershell -ExecutionPolicy Bypass -File C:/run_iteration.ps1"
+          kill $TUNNEL_PID 2>/dev/null || true
+
+      - name: Re-authenticate AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 21600
+
+      - name: Run 6th iteration
+        run: |
+          echo "Running 6th iteration of roller"
+          INSTANCE_ID=$(cat /tmp/instance_id.txt)
+          sed -e "s/EXAMPLE_PLACEHOLDER/roller/g" -e "s/ITERATION_PLACEHOLDER/6th/g" -e "s/ITERATION_NUM_PLACEHOLDER/6/g" \
+            .github/workflows/scripts/win/run-iteration.ps1 > /tmp/run_iteration.ps1
+          aws ec2-instance-connect open-tunnel --instance-id "$INSTANCE_ID" --remote-port 22 --local-port 2222 &
+          TUNNEL_PID=$!
+          sleep 5
+          scp -P 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=60 -o ServerAliveCountMax=10 \
+            -i /tmp/ec2key.pem /tmp/run_iteration.ps1 Administrator@localhost:C:/run_iteration.ps1
+          ssh -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=60 -o ServerAliveCountMax=10 \
+            -i /tmp/ec2key.pem Administrator@localhost \
+            "powershell -ExecutionPolicy Bypass -File C:/run_iteration.ps1"
+          kill $TUNNEL_PID 2>/dev/null || true
+
+      - name: Re-authenticate AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 21600
+
+      - name: Run 7th iteration
+        run: |
+          echo "Running 7th iteration of roller"
+          INSTANCE_ID=$(cat /tmp/instance_id.txt)
+          sed -e "s/EXAMPLE_PLACEHOLDER/roller/g" -e "s/ITERATION_PLACEHOLDER/7th/g" -e "s/ITERATION_NUM_PLACEHOLDER/7/g" \
+            .github/workflows/scripts/win/run-iteration.ps1 > /tmp/run_iteration.ps1
+          aws ec2-instance-connect open-tunnel --instance-id "$INSTANCE_ID" --remote-port 22 --local-port 2222 &
+          TUNNEL_PID=$!
+          sleep 5
+          scp -P 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=60 -o ServerAliveCountMax=10 \
+            -i /tmp/ec2key.pem /tmp/run_iteration.ps1 Administrator@localhost:C:/run_iteration.ps1
+          ssh -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=60 -o ServerAliveCountMax=10 \
+            -i /tmp/ec2key.pem Administrator@localhost \
+            "powershell -ExecutionPolicy Bypass -File C:/run_iteration.ps1"
+          kill $TUNNEL_PID 2>/dev/null || true
+
+      - name: Re-authenticate AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 21600
+
+      - name: Run 8th iteration
+        run: |
+          echo "Running 8th iteration of roller"
+          INSTANCE_ID=$(cat /tmp/instance_id.txt)
+          sed -e "s/EXAMPLE_PLACEHOLDER/roller/g" -e "s/ITERATION_PLACEHOLDER/8th/g" -e "s/ITERATION_NUM_PLACEHOLDER/8/g" \
+            .github/workflows/scripts/win/run-iteration.ps1 > /tmp/run_iteration.ps1
+          aws ec2-instance-connect open-tunnel --instance-id "$INSTANCE_ID" --remote-port 22 --local-port 2222 &
+          TUNNEL_PID=$!
+          sleep 5
+          scp -P 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=60 -o ServerAliveCountMax=10 \
+            -i /tmp/ec2key.pem /tmp/run_iteration.ps1 Administrator@localhost:C:/run_iteration.ps1
+          ssh -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=60 -o ServerAliveCountMax=10 \
+            -i /tmp/ec2key.pem Administrator@localhost \
+            "powershell -ExecutionPolicy Bypass -File C:/run_iteration.ps1"
+          kill $TUNNEL_PID 2>/dev/null || true
+
+      - name: Re-authenticate AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 21600
+
+      - name: Run 9th iteration
+        run: |
+          echo "Running 9th iteration of roller"
+          INSTANCE_ID=$(cat /tmp/instance_id.txt)
+          sed -e "s/EXAMPLE_PLACEHOLDER/roller/g" -e "s/ITERATION_PLACEHOLDER/9th/g" -e "s/ITERATION_NUM_PLACEHOLDER/9/g" \
+            .github/workflows/scripts/win/run-iteration.ps1 > /tmp/run_iteration.ps1
+          aws ec2-instance-connect open-tunnel --instance-id "$INSTANCE_ID" --remote-port 22 --local-port 2222 &
+          TUNNEL_PID=$!
+          sleep 5
+          scp -P 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=60 -o ServerAliveCountMax=10 \
+            -i /tmp/ec2key.pem /tmp/run_iteration.ps1 Administrator@localhost:C:/run_iteration.ps1
+          ssh -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=60 -o ServerAliveCountMax=10 \
+            -i /tmp/ec2key.pem Administrator@localhost \
+            "powershell -ExecutionPolicy Bypass -File C:/run_iteration.ps1"
+          kill $TUNNEL_PID 2>/dev/null || true
+
+      - name: Re-authenticate AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 21600
+
+      - name: Run 10th iteration
+        run: |
+          echo "Running 10th iteration of roller"
+          INSTANCE_ID=$(cat /tmp/instance_id.txt)
+          sed -e "s/EXAMPLE_PLACEHOLDER/roller/g" -e "s/ITERATION_PLACEHOLDER/10th/g" -e "s/ITERATION_NUM_PLACEHOLDER/10/g" \
+            .github/workflows/scripts/win/run-iteration.ps1 > /tmp/run_iteration.ps1
+          aws ec2-instance-connect open-tunnel --instance-id "$INSTANCE_ID" --remote-port 22 --local-port 2222 &
+          TUNNEL_PID=$!
+          sleep 5
+          scp -P 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=60 -o ServerAliveCountMax=10 \
+            -i /tmp/ec2key.pem /tmp/run_iteration.ps1 Administrator@localhost:C:/run_iteration.ps1
+          ssh -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=60 -o ServerAliveCountMax=10 \
+            -i /tmp/ec2key.pem Administrator@localhost \
+            "powershell -ExecutionPolicy Bypass -File C:/run_iteration.ps1"
+          kill $TUNNEL_PID 2>/dev/null || true
+
+      - name: Re-authenticate AWS credentials
+        if: success() || failure()
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 21600
+
+      - name: Collect results
+        if: success() || failure()
+        run: |
+          echo "Collecting results..."
+          mkdir -p ci
+          INSTANCE_ID=$(cat /tmp/instance_id.txt)
+
+          aws ec2-instance-connect open-tunnel --instance-id "$INSTANCE_ID" --remote-port 22 --local-port 2222 &
+          TUNNEL_PID=$!
+          sleep 5
+
+          # Delete large binary files on remote before copying to save bandwidth
+          ssh -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=60 -o ServerAliveCountMax=10 \
+            -i /tmp/ec2key.pem Administrator@localhost \
+            "powershell -Command \"Get-ChildItem -Path C:\\ppf-contact-solver\\cache\\ppf-cts\\ci -Recurse -Include '*.bin','*.pickle','*.ply','*.gz' -ErrorAction SilentlyContinue | Remove-Item -Force\"" || true
+
+          # Copy CI output from ppf-cts cache directory
+          scp -P 2222 -r -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=60 -o ServerAliveCountMax=10 \
+            -i /tmp/ec2key.pem "Administrator@localhost:C:/ppf-contact-solver/cache/ppf-cts/ci/*" ./ci/ || echo "No ppf-cts CI files found"
+
+          # Also copy logs and scripts from C:\ci
+          scp -P 2222 -r -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=60 -o ServerAliveCountMax=10 \
+            -i /tmp/ec2key.pem "Administrator@localhost:C:/ci/*" ./ci/ || echo "No script/log files found"
+
+          kill $TUNNEL_PID 2>/dev/null || true
+
+          echo "## Collected Files:"
+          ls -laR ci/ || echo "No files collected"
+
+      - name: Upload artifact
+        if: success() || failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: ci-win-roller
+          path: ci
+          retention-days: 3
+
+      - name: Re-authenticate AWS credentials
+        if: success() || failure()
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 21600
+
+      - name: GPU information
+        if: success() || failure()
+        run: |
+          INSTANCE_ID=$(cat /tmp/instance_id.txt)
+          aws ec2-instance-connect open-tunnel --instance-id "$INSTANCE_ID" --remote-port 22 --local-port 2222 &
+          TUNNEL_PID=$!
+          sleep 5
+          ssh -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=60 -o ServerAliveCountMax=10 \
+            -i /tmp/ec2key.pem Administrator@localhost "nvidia-smi" || echo "Failed to get GPU info"
+          kill $TUNNEL_PID 2>/dev/null || true
+
+      - name: Cleanup - temp files
+        if: always()
+        continue-on-error: true
+        run: |
+          rm -f /tmp/instance_id.txt
+
+      - name: Re-authenticate for cleanup
+        if: always()
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 21600
+
+      - name: Cleanup - Terminate Instance
+        if: always()
+        continue-on-error: true
+        run: |
+          if [ -n "${{ steps.instance.outputs.INSTANCE_ID }}" ]; then
+            echo "Terminating instance: ${{ steps.instance.outputs.INSTANCE_ID }}"
+            aws ec2 terminate-instances \
+              --instance-ids "${{ steps.instance.outputs.INSTANCE_ID }}" \
+              --region "$AWS_REGION" || true
+          fi
+
+      - name: Cleanup - Delete Key Pair
+        if: always()
+        continue-on-error: true
+        run: |
+          if [ -n "${{ steps.keypair.outputs.KEY_NAME }}" ]; then
+            echo "Deleting key pair: ${{ steps.keypair.outputs.KEY_NAME }}"
+            aws ec2 delete-key-pair --key-name "${{ steps.keypair.outputs.KEY_NAME }}" || true
+          fi
+          rm -f /tmp/ec2key.pem
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Workflow Summary"
+          echo "- Example: roller"
+          echo "- Region: $AWS_REGION"
+          echo "- Instance Type: $INSTANCE_TYPE"
+          echo "- Branch: $BRANCH"
+          echo "- Instance ID: ${{ steps.instance.outputs.INSTANCE_ID || 'Not launched' }}"

@@ -1,0 +1,16 @@
+# Optional direct-runtime dependency constraints, observed 2026-10-28.
+# Windows x64 CPython 3.11.9 runtime only: not a full environment lock,
+# not a Windows wheel list, not a Linux/macOS compatibility claim.
+# Constraint files restrict versions; they do not install packages.
+# See docs/build_dependency_scope.md before using on a new machine.
+numpy==2.4.4; sys_platform == "win32" and python_version == "3.11"
+scipy==1.17.1; sys_platform == "win32" and python_version == "3.11"
+cbor2==6.0.1; sys_platform == "win32" and python_version == "3.11"
+psutil==7.2.2; sys_platform == "win32" and python_version == "3.11"
+pytetwild==0.4.2; sys_platform == "win32" and python_version == "3.11"
+tetgen==0.8.4; sys_platform == "win32" and python_version == "3.11"
+pyvista==0.48.4; sys_platform == "win32" and python_version == "3.11"
+numba==0.65.1; sys_platform == "win32" and python_version == "3.11"
+pillow==12.3.0; sys_platform == "win32" and python_version == "3.11"
+trimesh==4.12.2; sys_platform == "win32" and python_version == "3.11"
+requests==2.34.2; sys_platform == "win32" and python_version == "3.11"

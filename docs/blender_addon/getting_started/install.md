@@ -1,0 +1,161 @@
+# 🛠️ Install
+
+## Prerequisites
+
+- **Blender 5.0 or newer.** The extension manifest pins `blender_version_min =
+  "5.0.0"`; older builds will refuse to enable it.
+- **A solver backend.** Download a self-contained distribution from
+  [GitHub Releases](https://github.com/st-tech/ppf-contact-solver/releases),
+  or build the engine from
+  [st-tech/ppf-contact-solver](https://github.com/st-tech/ppf-contact-solver).
+  It can sit on the same machine as Blender -- a Windows, macOS, or Linux
+  workstation, which the three **Native** connection types drive directly --
+  or on an SSH-reachable Linux host or in a Docker container. Which
+  build runs there depends on the hardware: CUDA on an NVIDIA GPU (the
+  project builds against CUDA 12.8), ROCm on an AMD GPU (x86-64 Linux and
+  x64 Windows), Metal on Apple silicon, and a CPU build that needs no GPU at
+  all and is substantially slower than any of them. A solver binary reports
+  which one it is: `ppf-contact-solver --backend` prints `cuda`, `rocm`,
+  `metal`, or `cpu`. The x64 Windows and x86_64 Linux distributions carry
+  the CUDA, ROCm, and CPU builds together, and the panel is where you pick
+  between them; see
+  {ref}`Choosing the build <choosing-the-build>`. See
+  [Connections](../connections/index.md) for the
+  transport that matches where the solver runs. The add-on is just a client
+  and runs fine anywhere Blender runs on one of the platforms its manifest
+  declares: Apple-silicon macOS, x86-64 and arm64 Linux, and x64 and arm64
+  Windows.
+- **(Optional) paramiko / docker-py.** Needed only for SSH and Docker
+  connections. You do not need to install them yourself. When you pick an SSH
+  or Docker server type without the module present, the main panel surfaces an
+  **Install Paramiko to Add-on Directory** / **Install Docker-Py to Add-on
+  Directory** button that installs into Blender's user
+  `scripts/addons/modules` directory.
+- **cbor2 (bundled).** Every Transfer is encoded with cbor2, so the add-on
+  needs it. It ships as a bundled wheel that is installed for you when you
+  install the extension, so there is normally nothing to do. If the bundled
+  wheel is missing (for example after a manual file copy of the add-on, or a
+  Blender version migration that did not reinstall the wheels), an **Install
+  cbor2 to Add-on Directory** button appears in the **Backend Communicator**
+  panel. Clicking it installs cbor2 into Blender's user
+  `scripts/addons/modules` directory.
+
+:::{note}
+The solver binary itself is not shipped with the add-on. You download or
+build it separately at the path you point the connection at. The add-on
+only looks for the `ppf-cts-server` binary (`ppf-cts-server.exe` on
+Windows Native) under that path, in the build layouts listed in
+{ref}`Choosing the build <choosing-the-build>`.
+:::
+
+## Install the Add-on
+
+The add-on is packaged as a Blender 5.x extension (`blender_manifest.toml`,
+schema `1.0.0`, id `ppf_contact_solver`). The recommended path is to register
+our static extensions repository so Blender can install and auto-update the
+add-on for you. A manual zip install is also documented below for offline or
+development use.
+
+<figure style="text-align: center; margin: 1.5rem 0;">
+
+[![Windows Setup](../images/tutorials/windows-opt.jpg)](https://zozo.box.com/s/jhs75ddc3oihrl4bw4fa00hpi2dsjdrs){target="_blank" rel="noopener"}
+
+<figcaption>Windows Setup: an end-to-end install walkthrough on Windows.</figcaption>
+</figure>
+
+<figure style="text-align: center; margin: 1.5rem 0;">
+
+[![ZoZos Contact Solver - The ultimate Blender cloth simulator](https://img.youtube.com/vi/D0k6evTvJDg/maxresdefault.jpg)](https://www.youtube.com/watch?v=D0k6evTvJDg){target="_blank" rel="noopener"}
+
+<figcaption>Video tutorial by <a href="https://www.youtube.com/@CGMatter" target="_blank" rel="noopener">CGMatter</a>: a full setup and workflow walkthrough.</figcaption>
+</figure>
+
+### Option A: Add as a Remote Repository (recommended)
+
+This route gets you auto-updates: when a new add-on release is published,
+Blender's Get Extensions panel shows it, and one click upgrades.
+
+1. In Blender, open **Edit → Preferences → Get Extensions**.
+2. Click the dropdown menu (top-right of the panel) and pick
+   **Repositories → + → Add Remote Repository**.
+3. Paste this URL into the **URL** field and confirm:
+
+   ```
+   https://github.com/st-tech/ppf-contact-solver/releases/download/addon-latest/index.json
+   ```
+
+4. Make sure the new repository is enabled, then back in **Get Extensions**
+   search for `ZOZO`. The **ZOZO's Contact Solver** add-on should appear;
+   click **Install**.
+5. Verify by opening the 3D viewport sidebar (`N`). A new tab labeled
+   **ZOZO's Contact Solver** should appear.
+
+The URL is permanent. Each new release replaces the `index.json` asset on
+the `addon-latest` GitHub Release in place, and the per-version zip lives
+on an immutable `addon-YYYY-MM-DD-HHMM` release that the index references
+by absolute URL.
+
+### Option B: Install from a Local Checkout (script)
+
+Useful when you are working from a checkout or want to install a build that
+has not been published as a release yet. The scripts link the repository's
+`blender_addon/` directory into Blender's `extensions/user_default` so edits
+in the checkout are picked up after a Blender restart, with no re-zipping.
+
+The first run needs Python and network access. Before linking anything the
+script runs `blender_addon/wheels/fetch.py`, which downloads the cbor2 wheels
+named in `blender_manifest.toml`; those wheels are gitignored, so a fresh
+clone has none, and the script aborts rather than linking an add-on that
+cannot encode a Transfer. It also needs a working `python3`/`python` on
+`PATH`, or `PPF_PYTHON_BIN` (`PPF_BUILD_PYTHON` on Windows) pointing at one.
+Once the wheels are on disk the fetch is a no-op, so later re-runs are
+offline-safe.
+
+1. Clone the repository and `cd` into it.
+2. Run the script for your platform from the repository root:
+
+   On macOS or Linux:
+
+   ```bash
+   ./install-blender-addon.sh
+   ```
+
+   On Windows PowerShell:
+
+   ```powershell
+   .\install-blender-addon.ps1
+   ```
+
+   The script auto-detects your installed Blender version. On a fresh machine
+   where Blender has not been launched yet, point it at the binary so it can
+   create the prefs directory itself:
+
+   ```bash
+   PPF_BLENDER_BIN=/path/to/blender ./install-blender-addon.sh
+   ```
+
+   ```powershell
+   $env:PPF_BLENDER_BIN = "C:\Program Files\Blender Foundation\Blender 5.0\blender.exe"
+   .\install-blender-addon.ps1
+   ```
+
+3. Start Blender and enable **ZOZO's Contact Solver** under
+   **Edit → Preferences → Add-ons** (search for `ZOZO`), or pass
+   `--addons bl_ext.user_default.ppf_contact_solver` on the command line.
+4. Verify the sidebar tab as in Option A.
+
+To remove the link later, re-run the script with the uninstall flag:
+
+```bash
+./install-blender-addon.sh --uninstall
+```
+
+```powershell
+.\install-blender-addon.ps1 -Uninstall
+```
+
+:::{tip}
+If the sidebar tab is missing after install, the add-on probably crashed
+while enabling. Open **Window → Toggle System Console** and re-enable the
+extension from Preferences to see the traceback.
+:::

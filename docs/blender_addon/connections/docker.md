@@ -1,0 +1,114 @@
+# 🐳 Docker (Local)
+
+The solver runs inside a Docker container on the **same machine** as
+Blender, managed by the local Docker daemon. For a remote container
+reached over SSH, see [Docker over SSH](docker_over_ssh.md).
+
+```{figure} ../images/connections/docker_local_topology.svg
+:alt: Block diagram showing the Blender add-on, the Docker daemon, and the container running ppf-cts-server all inside a single Blender workstation box. Lifecycle commands travel add-on -> docker-py -> daemon -> exec -> container; server traffic goes add-on -> socket to localhost:port -> container.
+:width: 760px
+
+Where each piece lives, and how the add-on reaches it, in local Docker
+mode. Blue solid arrows carry lifecycle commands (container
+start/stop, `exec`). Purple dashed arrows carry the TCP connection to
+`ppf-cts-server`. The container must publish the server port: that is
+what lets the socket reach `ppf-cts-server`. For the remote variant where
+the daemon and container live on a different host, see
+[Docker over SSH](docker_over_ssh.md).
+```
+
+## When to Use It
+
+- The solver depends on CUDA/driver versions you do not want to install
+  on the host.
+- You want each project isolated on the workstation.
+
+## Setup
+
+1. Set **Type** to `Docker`.
+2. Fill **Container** with the Docker container name (default
+   `ppf-contact-solver`, the name the README's `docker run` creates).
+   The container must already exist on the daemon; the add-on will
+   start it if it is stopped, but it will not create one.
+3. Fill **Container Path** with the working directory **inside** the
+   container (for example `/root/ppf-contact-solver`). This is the
+   directory containing the `ppf-cts-server` binary, *not* a path on the Blender host.
+4. Set **Docker Port** to the TCP port `ppf-cts-server` listens on inside
+   the container (default `9090`).
+5. Click **Connect**. If the container exists but is stopped, the
+   add-on starts it for you. A missing container is reported as an
+   error, and so is a container that does not publish the server port.
+
+```{figure} ../images/connections/docker.png
+:alt: Backend Communicator panel in Docker mode
+:width: 500px
+
+Backend Communicator with **Type** set to `Docker`.
+**Container**, **Container Path**, and **Docker Port** replace the SSH
+fields. The **Install Docker-Py** banner appears when the `docker`
+module is not installed. **Connect** is highlighted.
+```
+
+### Fields
+
+| Field | Description |
+| ----- | ----------- |
+| Container | Docker container name (default `ppf-contact-solver`). Must already exist on the daemon. |
+| Container Path | Working directory **inside** the container that holds `ppf-cts-server`, under `target/release/`, `target/cuda/release/`, `target/rocm/release/`, or `target/cpu/release/` (e.g. `/root/ppf-contact-solver`). Not a host path. |
+| Docker Port | TCP port inside the container where `ppf-cts-server` listens (default `9090`). Must be published with `-p` when the container was created. |
+
+Two more rows appear in the Connection box **once you are connected**:
+**Compute Device** (`GPU` or `CPU`) and, where the container holds more
+than one GPU build, **GPU Backend** (`Automatic`, `CUDA`, or `ROCm`).
+The builds are inside the container, so the add-on lists them with one
+command at **Connect** and caches the answer; the choice is applied at
+**Start Server on Remote**. See
+{ref}`Choosing the build <choosing-the-build>`.
+
+## Installing docker-py
+
+The Docker backend requires the `docker` Python package (sometimes
+called `docker-py`). When it is missing the main panel shows an
+**Install Docker-Py to Add-on Directory** button that installs the package into
+Blender's user `scripts/addons/modules` directory on a background thread.
+
+## Troubleshooting
+
+- **`Container 'X' does not exist.`** - the name is wrong or the
+  container was removed. Run `docker ps -a` to see what is actually
+  there.
+- **`Error starting container 'X'`** - the daemon returned a non-zero
+  exit or the user lacks `docker` group membership.
+- **`Container 'X' does not publish port N to this machine ...`** - the
+  container was created without `-p N:N`, so nothing forwards the
+  server port to the host. Recreate it with the flag; the add-on cannot
+  publish a port on a container that already exists.
+- **Server startup timed out.** - the container started but
+  `ppf-cts-server` did not become ready within 16 seconds. Check
+  `server.log` inside the directory set in **Container Path**; the
+  panel prints the last 20 lines automatically.
+- **`docker-py` not found** - click **Install Docker-Py to Add-on Directory** on the main
+  panel and wait for the background installer to finish.
+
+:::{admonition} Under the hood
+:class: toggle
+
+**Transport**
+
+The local backend talks to the Docker daemon through the standard
+`docker` Python client and looks up the container by name. A stopped
+container is started automatically; a missing container aborts connect
+with `Container 'X' does not exist.`
+
+**Server startup path**
+
+Local Docker uses the same Unix server-launch path as the SSH backends
+(see {ref}`Connections - Under the hood <connections-under-the-hood>`):
+a small script inside the container launches the `ppf-cts-server` that
+**Compute Device** and **GPU Backend** resolve to, on the configured
+port, and the UI waits up to 16 s for readiness. Local Docker checks the
+published port as well, but at **Connect** rather than before Start
+Server, and it reads the container's own port map through docker-py
+instead of shelling out to `docker port`. A container on
+`--network host` publishes nothing and is accepted as is.
+:::

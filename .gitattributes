@@ -1,0 +1,10 @@
+# The original identity protocol reads these exact bytes. Preserve them across
+# Git clones without changing the protocol or the checked-in identity outputs.
+crates/ppf-cts-solver/src/kernels/zz_joint_ext/restoring_curve.hpp -text
+crates/ppf-cts-solver/src/kernels/zz_joint_ext/restoring_context.hpp -text
+crates/ppf-cts-solver/src/kernels/energy/model/restoring_stitch.hpp -text
+crates/ppf-cts-solver/src/kernels/zzzzzzzzz_restoring/restoring_apply.kernel.cpp -text
+
+# Shell entrypoints must work on Unix; the identity header preserves raw bytes.
+*.sh text eol=lf
+crates/ppf-cts-solver/src/kernels/zz_joint_ext/restoring_observation.hpp -text

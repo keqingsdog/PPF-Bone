@@ -1,0 +1,2 @@
+Applies to adjacent cache_migration_recovery.py.
+Based on the upstream PPF Contact Solver project, distributed under Apache License 2.0; see the project LICENSE and original upstream notices. Fork addition: this file extends the upstream baseline.

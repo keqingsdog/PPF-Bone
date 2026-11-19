@@ -1,0 +1,8 @@
+floor 61
+cubin 61
+cubin 75
+cubin 86
+cubin 89
+cubin 90
+cubin 100
+cubin 120

@@ -1,0 +1,436 @@
+# 🐍 Blender Python API
+
+Everything the add-on does from the UI (creating groups, pinning
+vertex groups, keyframing spins, dropping invisible colliders, snapping
+meshes) can be driven from Python inside Blender's scripting editor.
+This is the right tool for procedural scene setup, batch variant
+generation, regression tests, and anything you do not want to click
+through three hundred times.
+
+:::{tip}
+This page is a tutorial-style walkthrough. For the full method-by-method
+list, generated directly from the source, see the
+[Blender Python API Reference](python_api_reference.rst).
+:::
+
+## Import
+
+```python
+from bl_ext.user_default.ppf_contact_solver.ops.api import solver
+```
+
+The add-on registers under Blender's extension namespace, so this
+import works regardless of where the add-on lives on disk. Every
+example below assumes it is already imported.
+
+## Scene Parameters
+
+`solver.param` is a whitelisted proxy over the scene-level state. Set
+any exposed property by attribute:
+
+```python
+solver.param.project_name = "shirt_drape"
+solver.param.frame_count  = 180
+solver.param.frame_rate   = 60
+solver.param.step_size    = 0.001
+solver.param.gravity      = (0, 0, -9.8)   # alias for gravity_3d
+solver.param.air_density  = 0.001225
+```
+
+`gravity` is an alias for `gravity_3d`; reads and writes go through it
+transparently. See [Scene Parameters](../workflow/params/scene.md) for
+the full list.
+
+### Connection Settings
+
+The same proxy reaches the **Backend Communicator**'s own properties, so
+a script can set up a connection and open it without touching the panel.
+`solver.connect()` falls through to the operator and starts the
+connection with whatever these hold:
+
+```python
+solver.param.server_type       = "LINUX_NATIVE"   # or WIN_NATIVE, MAC_NATIVE,
+                                                  # CUSTOM, COMMAND, DOCKER,
+                                                  # DOCKER_SSH, DOCKER_SSH_COMMAND
+solver.param.linux_native_path = "~/ppf-contact-solver"
+solver.param.native_device     = "CPU"            # or "GPU"
+solver.param.native_gpu_backend = "AUTO"          # or "CUDA", "ROCM"
+solver.param.docker_port       = 9090
+solver.connect()
+```
+
+`native_device` and `native_gpu_backend` name which **build** of the
+solver runs, and are read when the server is spawned rather than at
+connect; see {ref}`Choosing the build <choosing-the-build>`. The
+identifiers above are the enum values stored in the `.blend`, not the
+labels the panel shows, and `docker_port` is the server port for every
+connection type despite its name.
+
+MCP exposes the same thing as one tool per type -- `connect_ssh`,
+`connect_docker`, `connect_win_native`, `connect_mac_native`,
+`connect_linux_native` -- which set these properties and then connect.
+
+### Dynamic Parameters
+
+:::{note}
+`dyn()` is the legacy path. It writes the add-on's own keyframe list,
+which is converted into ordinary F-curves and emptied the next time the
+`.blend` is loaded — the animation survives, the list does not, so a
+script that reads `state.dyn_params` back after a reload finds it empty.
+New scripts should keyframe the scene property directly, e.g.
+`state.keyframe_insert(data_path="gravity_3d", frame=60)`. Note the
+property name: `gravity` is a `solver.param` alias, not a data path. See
+[Dynamic Parameters](../workflow/params/dynamic.md).
+:::
+
+The builder is kept for existing scripts. The API mirrors the frontend's
+`session.param.dyn()` but takes **frames**, not seconds:
+
+```python
+# Flip gravity at frame 60: hold the initial value through 60,
+# then snap to the new value at 61.
+solver.param.dyn("gravity").time(60).hold().time(61).change((0, 0, 9.8))
+
+# Start a wind gust at frame 30.
+solver.param.dyn("wind").time(30).hold().time(31).change((0, 1, 0), strength=5.0)
+
+# Scalars like air_density just take a float.
+solver.param.dyn("air_density").time(100).change(0.005)
+
+# Nuke a dynamic param entirely.
+solver.param.dyn("gravity").clear()
+```
+
+`clear()` empties the legacy list only, so once a file has been reloaded
+and converted it removes nothing; deleting the F-curve is a Blender
+operation.
+
+Valid keys: `"gravity"`, `"wind"`, `"air_density"`, `"air_friction"`,
+`"vertex_air_damp"`. Frames must be strictly increasing within a chain;
+`time(30).time(30)` raises.
+
+See [Dynamic Parameters](../workflow/params/dynamic.md) for the
+semantics of `hold()` vs. `change()`.
+
+## Groups
+
+```python
+# type is one of: SOLID | SHELL | ROD | STATIC | PDRD | SAND
+cloth = solver.create_group("Cloth", type="SHELL")
+cloth.add("Shirt", "Pants")
+cloth.param.shell_density       = 0.5
+cloth.param.shell_young_modulus = 50.0
+cloth.param.friction            = 0.3
+cloth.param.bend                = 0.5
+cloth.set_overlay_color(0.0, 0.75, 0.0, 0.75)         # rgba in [0, 1]
+
+body = solver.create_group("Body", type="STATIC")
+body.add("Mannequin")
+```
+
+`create_group` returns a group proxy. Look one up later by UUID with
+`solver.get_group(uuid)`, or walk every active group:
+
+```python
+for g in solver.get_groups():
+    print(g.uuid, g.param.friction)
+```
+
+### Group Surface
+
+| Method                                | Purpose                                                       |
+| ------------------------------------- | ------------------------------------------------------------- |
+| `add(*object_names)`                  | Add one or more mesh objects by name                          |
+| `remove(object_name)`                 | Remove one object                                             |
+| `set_overlay_color(r, g, b, a=1.0)`   | Set and enable the viewport overlay color                     |
+| `create_pin(obj, vg)`                 | Pin a vertex group; returns a pin proxy (see below)           |
+| `get_pins()`                          | List every pin in this group as pin proxies                   |
+| `delete()`                            | Remove this group                                             |
+| `.param.<name>`                       | Whitelisted material/contact parameter access                 |
+| `.uuid`                               | UUID string, stable across renames                            |
+
+Material parameters on `.param` are validated: assigning a name outside
+the whitelist raises `AttributeError`. See
+[Material Parameters](../workflow/params/material.md) for the full
+list.
+
+Bulk lifecycle operations live on the solver:
+
+```python
+solver.delete_all_groups()
+solver.clear()   # full reset: groups, scene params, merge pairs,
+                 #             colliders, dyn params, fetched animation
+```
+
+## Pins and Operations
+
+`group.create_pin(object_name, vertex_group_name)` returns a pin proxy.
+Every mutating method returns `self`, so chaining works:
+
+```python
+pin = cloth.create_pin("Shirt", "ShoulderPins")
+pin.spin(axis=(0, 0, 1), angular_velocity=360, frame_start=1, frame_end=60)
+pin.unpin(frame=90)
+
+# Soft pin instead of a hard constraint.
+cloth.create_pin("Shirt", "HemPins").pull(strength=2.0)
+
+# Chain a scale and a spin on the same pin.
+(cloth.create_pin("Shirt", "HemPins")
+      .scale(factor=0.5, center_direction=(0, 0, -1), frame_start=1, frame_end=60)
+      .spin(axis=(0, 1, 0), angular_velocity=180, center_vertex=42))
+```
+
+### Pin Surface
+
+| Method                                                          | Purpose                                                   |
+| --------------------------------------------------------------- | --------------------------------------------------------- |
+| `pull(strength=1.0)`                                            | Switch to a soft pull force                               |
+| `move_by(delta, frame_start, frame_end, transition="LINEAR")`   | Ramp a translation over a frame range                     |
+| `spin(axis, angular_velocity, flip, center*, frame_start, frame_end, transition)` | Rotate about a derived pivot          |
+| `scale(factor, center*, frame_start, frame_end, transition)`    | Scale from a derived pivot                                |
+| `torque(magnitude, axis_component="PC3", flip, frame_start, frame_end)` | PCA-axis torque                                   |
+| `set_animation(positions)`                                      | Drive the pin through per-frame vertex positions, as **Capture Deformation** does |
+| `unpin(frame)`                                                  | Release the pin after `frame` frames, counted from the solve's Starting Frame (the argument is a frame count, not a frame number) |
+| `delete()`                                                      | Remove this pin from its group                            |
+
+`transition` is `"LINEAR"` or `"SMOOTH"`. `torque`'s `axis_component`
+is `"PC1"` / `"PC2"` / `"PC3"`. `frame_start` and `frame_end` are
+Blender frames, kept as given: Transfer refuses an operation whose
+`frame_end` is not after its `frame_start`, or whose `frame_start` is
+before the solve's Starting Frame.
+
+A pin proxy outlives what it names: after `solver.clear()`, deleting the
+group, or removing the pin, every method in the table raises
+`ValueError` saying whether the group or the pin is gone, rather than
+returning `self` as though the change landed.
+
+### `set_animation` from Per-Frame Positions
+
+`set_animation(positions)` writes the same per-pin cache **Capture
+Deformation** writes, straight from an array, so no deformer is needed
+and it works in a `--background` Blender. `positions` is
+`(n_frames, n_verts, 3)`: every vertex of the pin's mesh on each frame,
+in the mesh's own coordinates, with at least two frames. Row `k` is the
+pose `k` frames after the solve's Starting Frame, so row 0 is the mesh
+as it is now. The pinned vertices follow the sequence and the rest of
+the mesh is simulated.
+
+```python
+import numpy as np
+
+pin = cloth.create_pin("Shirt", "BandPins")
+pin.set_animation(np.stack(frames))   # frames: list of (n_verts, 3) arrays
+```
+
+It raises `ValueError` when the pin's object is not a mesh, its group is
+Static, the pin carries a torque or manual vertex keyframes, or
+`positions` has the wrong shape, too few frames, or a non-finite value.
+
+### `move_by` over a Frame Range
+
+`move_by` ramps a translation of the pinned vertices by `delta` over the
+`frame_start`–`frame_end` range, with a `"LINEAR"` or `"SMOOTH"`
+transition. Pair it with `unpin` to release the pin once the move
+completes.
+
+```python
+pin = cloth.create_pin("Shirt", "SleevePins")
+pin.move_by(delta=(0, 0, 0.5), frame_start=10, frame_end=30, transition="SMOOTH")
+pin.unpin(frame=40)   # release after the move finishes
+```
+
+### Center-Mode Inference for `spin` and `scale`
+
+Pass whichever argument names your pivot, and the API picks the matching
+mode for you:
+
+| Argument you pass    | Inferred `center_mode` |
+| -------------------- | ---------------------- |
+| `center=(x, y, z)`   | `ABSOLUTE` (a world position) |
+| `center_direction=v` | `MAX_TOWARDS`          |
+| `center_vertex=idx`  | `VERTEX`               |
+| none of the above    | `CENTROID`             |
+
+Passing `center_mode="..."` explicitly overrides the inference. See
+[Pins and Operations](../workflow/constraints/pins.md) for what each
+mode actually computes.
+
+```python
+pin.spin(axis=(0, 0, 1), angular_velocity=360)                        # CENTROID
+pin.spin(axis=(0, 0, 1), angular_velocity=360, center=(0, 0, 1))      # ABSOLUTE
+pin.spin(axis=(0, 0, 1), angular_velocity=360, center_direction=(0, 0, -1))  # MAX_TOWARDS
+pin.spin(axis=(0, 0, 1), angular_velocity=360, center_vertex=42)      # VERTEX
+```
+
+## Snap and Merge
+
+```python
+solver.snap("Shirt", "Mannequin")               # translate Shirt onto nearest vertex on Mannequin
+
+solver.add_merge_pair("Shirt", "Mannequin")
+solver.remove_merge_pair("Shirt", "Mannequin")
+solver.get_merge_pairs()                        # → [("Shirt", "Mannequin"), ...]
+solver.clear_merge_pairs()
+```
+
+All of these share the same validation layer as the MCP interface and
+the UI, so you get identical errors. Bad names raise `ValueError`.
+
+## Invisible Colliders
+
+Walls and spheres return a chainable builder. Parameters on `.param`
+cover `friction`, `contact_gap`, `thickness`, and `enable_active_duration`
+/ `active_duration`.
+
+```python
+# A ground plane with extra friction.
+solver.add_wall(position=(0, 0, 0), normal=(0, 0, 1)).param.friction = 0.5
+
+# An inverted hemispherical container (keeps the cloth inside a bowl).
+(solver.add_sphere(position=(0, 0, 0), radius=0.98)
+       .invert()
+       .hemisphere())
+
+# A sphere that shrinks at frame 61.
+(solver.add_sphere(position=(0, 0, 0), radius=1.0)
+       .time(60).hold()
+       .time(61).radius(0.5))
+
+# A wall that slides to a new position.
+(solver.add_wall(position=(0, 0, 0), normal=(0, 1, 0))
+       .time(60).hold()
+       .time(61).move_to((0, 1, 0)))
+
+solver.get_invisible_colliders()   # → [("WALL", "Wall"), ("SPHERE", "Sphere"), ...]
+solver.clear_invisible_colliders()
+```
+
+### Builder Surface
+
+| Method             | Wall | Sphere | Purpose                                              |
+| ------------------ | :--: | :----: | ---------------------------------------------------- |
+| `.time(frame)`     |  yes |  yes   | Advance the keyframe cursor (must be increasing)     |
+| `.hold()`          |  yes |  yes   | Hold the previous value at the cursor                |
+| `.move_to(pos)`    |  yes |  yes   | Keyframe a new position                              |
+| `.move_by(delta)`  |  yes |        | Keyframe a position offset from the previous         |
+| `.radius(r)`       |      |  yes   | Keyframe a new radius                                |
+| `.transform_to(p, r)` |   |  yes   | Keyframe position + radius together                  |
+| `.invert()`        |      |  yes   | Flip inside-out (contact on the inside)              |
+| `.hemisphere()`    |      |  yes   | Treat as a hemisphere                                |
+| `.param.*`         |  yes |  yes   | `friction`, `contact_gap`, `thickness`, `active_duration`, `enable_active_duration` |
+| `.delete()`        |  yes |  yes   | Remove this collider                                 |
+
+See [Invisible Colliders](../workflow/constraints/colliders.md) for how
+the keyframe timeline is evaluated.
+
+## Force Fields
+
+The **Force Fields** box is reached through the same `solver.param`
+proxy. Collections, objects and texts can be given directly or by name,
+and `None` clears them.
+
+```python
+import bpy
+
+solver.param.force_field_padding      = 0.5    # m past the pushed objects
+solver.param.force_field_spacing      = 0.05   # m between sample points
+solver.param.force_field_time_samples = 8
+solver.param.force_field_visualize    = True
+
+text = bpy.data.texts.new("swirl.py")
+text.from_string(
+    "def eval(x, y, z, t):\n"
+    "    return curl_noise(x, y, z, octaves=2, seed=1, time=t, frequency=0.5)\n"
+)
+solver.param.force_field_script = text
+
+# Every function and constant a script may use, as the Built-in Functions
+# button lists them: [{"section", "name", "signature", "description"}, ...]
+print([row["signature"] for row in solver.get_force_field_builtins()])
+
+# Compile the script on the running server, as Compile and Check does.
+print(solver.check_force_field_script())
+# {'ok': True, 'summary': '...'} or {'ok': False, 'error': ..., 'line': n}
+```
+
+A field object (by name) or the script (`"SCRIPT"`) can be limited to
+some groups; `None` restores every group:
+
+```python
+solver.set_force_field_targets("Turbulence", [cloth])
+solver.set_force_field_targets("SCRIPT", None)
+print(solver.get_force_field_targets("Turbulence"))   # [cloth.uuid]
+```
+
+Each group scales the fields on its objects with `force_field_weight`:
+
+```python
+cloth.param.force_field_weight = 0.0   # this group ignores every field
+```
+
+See [Force Fields](../workflow/params/force_fields.md) for what each field
+type does and what the script may contain.
+
+## Reset
+
+```python
+solver.clear()
+```
+
+Wipes every active group, resets scene parameters to their property
+defaults, clears merge pairs, invisible colliders, dynamic parameters,
+fetched frames, and residual `MESH_CACHE` modifiers. Run it at
+the top of any script that needs a clean slate.
+
+## Fallback: Raw Operator Dispatch
+
+Anything not yet on the fluent API is reachable by attribute lookup.
+Unknown attributes on `solver` fall through to
+`bpy.ops.zozo_contact_solver.<name>`:
+
+```python
+# Equivalent to bpy.ops.zozo_contact_solver.transfer_data()
+solver.transfer_data()
+
+# Keyword args are forwarded as the operator's properties.
+solver.set(key="project_name", value="hero_shot")
+```
+
+Every MCP handler name (see [MCP Server](./mcp.md)) has a matching
+operator, so whatever you can call over MCP you can also call here.
+
+## See Also
+
+- [Pins and Operations](../workflow/constraints/pins.md): the full
+  semantics of `spin`, `scale`, `torque`, and the center modes.
+- [Dynamic Parameters](../workflow/params/dynamic.md): `.dyn()`
+  keys, `hold()` / `change()`, and how they interpolate.
+- [Object Groups](../workflow/scene/object_groups.md): what each group type
+  actually does in the solver.
+- [MCP Server](./mcp.md): the same surface over JSON-RPC for agents.
+
+:::{admonition} Under the hood
+:class: toggle
+
+The fluent API is a thin layer of proxy objects over the add-on's
+operators and scene state:
+
+- `solver.param` exposes a whitelisted attribute surface over
+  scene-level properties. Reading an unknown name raises
+  `AttributeError`; assigning one goes through the
+  `zozo_contact_solver.set` operator, which reports an error and
+  surfaces as `RuntimeError`. `solver.param.dyn(name)` returns a
+  dynamic-parameter builder.
+- `solver.create_group(...)` returns a group handle. Its `.param`
+  exposes that group's material/contact whitelist.
+- `group.create_pin(...)` returns a pin handle; every mutating method
+  returns `self` so calls chain.
+- `solver.add_wall(...)` and `solver.add_sphere(...)` return builder
+  handles. The `.time()` cursor is tracked on the builder itself;
+  frames must be strictly increasing.
+
+The underlying proxy types are not part of the public contract. Pin
+your scripts to the attribute and method names shown above, not to
+`isinstance` checks.
+:::

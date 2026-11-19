@@ -1,0 +1,70 @@
+name: Bug Report
+description: Report a problem with the solver, add-on, or documentation.
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report. Please fill out the sections below.
+        Pull requests are not accepted. See https://github.com/st-tech/ppf-contact-solver/blob/main/CONTRIBUTING.md for details.
+
+        **How issues are handled:** This project has a single maintainer who cannot work on it full time, so issues are triaged with labels: `queued` once the author has seen it, `in-progress` once work begins, and `worked` after it has been answered at least once. Issues are handled in batches, so please be patient if a response takes a while.
+
+        **Reproduction file:** If possible, attach a `.blend` file that reproduces the issue. Remove any copyrightable materials from the scene or replace them with openly licensed alternatives. GitHub does not support direct `.blend` uploads, so compress the file into a ZIP archive (for example, `scene.blend.zip`) before attaching it.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: A clear and concise description of the bug.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to Reproduce
+      description: Minimal steps, scene, or command needed to reproduce the issue. If possible, attach a ZIP archive containing a reproducible `.blend` file.
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behavior
+      description: Include logs, stack traces, or screenshots if available.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, GPU/driver, Blender version, solver version or commit hash, etc.
+    validations:
+      required: true
+  - type: checkboxes
+    id: contribution-agreement
+    attributes:
+      label: Contribution Agreement
+      description: Required before submission.
+      options:
+        - label: "I confirm that any code, patches, scripts, attachments, or other copyrightable material I include in this issue may be used, reproduced, modified, and distributed by this project under the Apache License 2.0 or as otherwise described in CONTRIBUTING.md."
+          required: true
+        - label: "This is a bug report from the community (please provide a reference below)."
+          required: false
+  - type: input
+    id: community-reference
+    attributes:
+      label: Community Reference
+      description: If this is a community-sourced report, provide a URL or other reference (forum post, chat link, etc.).
+      placeholder: https://...
+    validations:
+      required: false
