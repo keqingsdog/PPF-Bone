@@ -17,14 +17,14 @@ For the latest highlights, see the [README](../README.md).
 ### 2025
 
 - **(2025.12.18)** Added native Windows standalone executable build support [(Video)](https://zozo.box.com/s/9rthkw122fyss5qxuf5mie9xywg7jzdz).
-- **(2025.11.26)** Added [large-woven.ipynb](../examples/large-woven.ipynb) [(Video)](https://zozo.box.com/s/kc81msjfo4yw9eozn8i8bean0gbph0pj) to [large scale examples](../README.md#️-large-scale-examples).
-- **(2025.11.12)** Added [five-twist.ipynb](../examples/five-twist.ipynb) [(Video)](https://zozo.box.com/s/36h8jpu5vcgc5t4xln2l68afj7izsx4h) and [large-five-twist.ipynb](../examples/large-five-twist.ipynb) [(Video)](https://zozo.box.com/s/v62q7cbfnpl3hufwwy2nmewyes2w1iw6) showcasing over 180M count. See [large scale examples](../README.md#️-large-scale-examples).
+- **(2025.11.26)** Added [large-woven.ipynb](../examples/large-woven.ipynb) [(Video)](https://zozo.box.com/s/kc81msjfo4yw9eozn8i8bean0gbph0pj) to [large scale examples](https://github.com/st-tech/ppf-contact-solver#️-large-scale-examples).
+- **(2025.11.12)** Added [five-twist.ipynb](../examples/five-twist.ipynb) [(Video)](https://zozo.box.com/s/36h8jpu5vcgc5t4xln2l68afj7izsx4h) and [large-five-twist.ipynb](../examples/large-five-twist.ipynb) [(Video)](https://zozo.box.com/s/v62q7cbfnpl3hufwwy2nmewyes2w1iw6) showcasing over 180M count. See [large scale examples](https://github.com/st-tech/ppf-contact-solver#️-large-scale-examples).
 - **(2025.10.03)** Massive refactor of the codebase [(Markdown)](./refactor_202510.md). Note that this change includes breaking changes to our Python APIs.
 - **(2025.08.09)** Added a hindsight note in [eigensystem analysis](./eigensys.md) to acknowledge prior work by [Poya et al. (2023)](https://romeric.github.io/).
 - **(2025.05.01)** Simulation states now can be saved and loaded [(Video)](https://zozo.box.com/s/7v0exrbptvfli4o4z91pqtmz0tehdn62).
-- **(2025.04.02)** Added 9 examples. See the [catalogue](../README.md#️-catalogue).
-- **(2025.03.03)** Added a [budget table on AWS](../README.md#-budget-table-on-aws).
-- **(2025.02.28)** Added a [reference branch and a Docker image of our TOG paper](../README.md#-technical-materials).
+- **(2025.04.02)** Added 9 examples. See the [catalogue](https://github.com/st-tech/ppf-contact-solver#️-catalogue).
+- **(2025.03.03)** Added a [budget table on AWS](https://github.com/st-tech/ppf-contact-solver#-budget-table-on-aws).
+- **(2025.02.28)** Added a [reference branch and a Docker image of our TOG paper](https://github.com/st-tech/ppf-contact-solver#-technical-materials).
 - **(2025.02.26)** Added Floating Point-Rounding Errors in ACCD in [hindsight](./hindsight.md).
 - **(2025.02.07)** Updated the [trapped example](../examples/trapped.ipynb) [(Video)](https://zozo.box.com/s/lnnyeqrvm86rxnwyjxhojfj0jgm5nphn) with squishy balls.
 - **(2025.01.08)** Added a [domino example](../examples/domino.ipynb) [(Video)](https://zozo.box.com/s/p5ksfqja1ew3c6vntco5zq6g0kgf7xoo).

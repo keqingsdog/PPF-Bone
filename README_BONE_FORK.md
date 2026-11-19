@@ -4,7 +4,7 @@
 
 **历史交接版本 1.0.27：** 见[预设、Pin、恢复与传输修复](docs/RELEASE_NOTES_1_0_27.md)。本轮整合 1017 候选并修复 Python 插件已知问题；[1.0.26 完整烘焙修复](docs/RELEASE_NOTES_1_0_26.md)及[1.0.25 原生与其他功能证据](docs/RELEASE_NOTES_1_0_25.md)继续按原范围保留，下方历史日期结论不扩大为本轮新增验收。
 
-这是基于 `st-tech/ppf-contact-solver` 的骨骼物理开发分支。保留 PPF 的场景传输、构建、计算、实时回传和获取动画流程，并增加骨骼代理、关节、软体骨骼映射及相关 Blender 操作。上游介绍保留在 [README.md](README.md)；上游的发布状态和跨后端支持不能直接视为本分支新增骨骼功能的验证结果。
+这是基于 `st-tech/ppf-contact-solver` 的骨骼物理开发分支。保留 PPF 的场景传输、构建、计算、实时回传和获取动画流程，并增加骨骼代理、关节、软体骨骼映射及相关 Blender 操作。上游介绍见 [上游仓库](https://github.com/st-tech/ppf-contact-solver)；上游的发布状态和跨后端支持不能直接视为本分支新增骨骼功能的验证结果。
 
 ## 源码和运行产物
 

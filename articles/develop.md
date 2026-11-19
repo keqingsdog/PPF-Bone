@@ -5,7 +5,7 @@ In fact, this is how we develop.
 
 ### 🖥️ Complete Installation
 
-First, complete the entire [installation process](../README.md#-getting-started) and keep the Docker container running.
+First, complete the entire [installation process](https://github.com/st-tech/ppf-contact-solver#-getting-started) and keep the Docker container running.
 Make sure that your terminal is attached to the container, with the current directory pointing to `ppf-contact-solver` directory.
 
 ### 🛠️ [clangd](https://clangd.llvm.org/) Setup
