@@ -1157,12 +1157,15 @@ def _build_param_dict(context) -> dict:
         ordered_pair_ids = []
         cross_stitch = _encode_cross_stitch(context, groups, ordered_pair_ids)
         from .bones import encode_bones
-        bone_data = encode_bones(context, state, fps, start_frame)
+        cone_restoring_joint_ids = set()
+        bone_data = encode_bones(context, state, fps, start_frame,
+                                 cone_restoring_joint_ids=cone_restoring_joint_ids)
         joint_curve_owners = _active_restoring_joint_owners(bone_data)
         from ...models.restoring_curves import export_scene
         restoring_curves = export_scene(
             scene, ordered_pair_ids=ordered_pair_ids,
             active_joint_ids=joint_curve_owners,
+            cone_restoring_joint_ids=cone_restoring_joint_ids,
         )
         # Scene settings the artist keyframed, sampled from their own
         # F-curves. This is the authoring path; `_encode_dyn_params` reads the

@@ -11,6 +11,8 @@ MAX_FACES=40000
 CHANNELS=('twist_x','swing_y','swing_z','anchor')
 BONE_FIELDS=('enabled','physical_model','shape','proxy_quality','proxy_face_mode','radius','length_ratio','box_width','box_depth','density','mass_mode','target_mass_kg','material_preset','solid_model','solid_young_modulus','solid_poisson_ratio','solid_deformation_damping','fem_scale_enabled','anchor_stiffness','angular_stiffness','angular_damping','soft_limits_enabled','soft_lower','soft_upper','soft_stiffness','soft_limit_mode','swing_cone_half_angle','swing_cone_stiffness','soft_limit_policy','soft_limit_frequency_hz','soft_limit_strength','collide_connected','collision_filter_enabled','collision_group_layers','collision_mask_layers','root_mode','root_motion_source','auto_follow_parent','joint_mode','hinge_twist_mode','hinge_lower','hinge_upper','use_auto_frames','joint_axis_euler')
 CONE_FIELDS={'soft_limit_mode','swing_cone_half_angle','swing_cone_stiffness'}
+RESTORING_DEFAULTS={'angular_restoring_mode':'AXES','swing_restoring_stiffness':.04,'swing_restoring_damping':.001}
+BONE_FIELDS += tuple(RESTORING_DEFAULTS)
 GROUP_FIELDS=('friction','shrink','enable_plasticity','plasticity','plasticity_threshold','use_group_bounding_box_diagonal','contact_gap_rat','contact_offset_rat','contact_gap','contact_offset')
 EVENT_FIELDS=('frame','mode','pose_binding')
 DRIVE_FIELDS=('enabled','gain','max_effort')
@@ -70,6 +72,8 @@ def _validate_preset(document):
     if isinstance(value['source_bone_length'],bool) or not isinstance(value['source_bone_length'],(int,float)) or value['source_bone_length']<=0:raise ValueError('原骨长无效')
     settings=value['settings']
     if not isinstance(settings,dict) or set(settings)!={'bone','events','drives','d6'}:raise ValueError('作者设置格式不支持')
+    if isinstance(settings['bone'],dict) and RESTORING_DEFAULTS.keys().isdisjoint(settings['bone']):
+        settings['bone'].update(RESTORING_DEFAULTS)  # Version-1 presets saved before circular restoring.
     if isinstance(settings['bone'],dict) and set(settings['bone']) in (set(BONE_FIELDS)-{'proxy_face_mode'},set(BONE_FIELDS)-CONE_FIELDS-{'proxy_face_mode'}):
         settings['bone']['proxy_face_mode']='TRI'  # Version-1 libraries authored before topology choice.
     if not isinstance(settings['bone'],dict) or set(settings['bone']) not in (set(BONE_FIELDS),set(BONE_FIELDS)-CONE_FIELDS):raise ValueError('作者字段不完整或包含工程引用')

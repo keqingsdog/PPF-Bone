@@ -459,6 +459,33 @@ def _set_cone_stiffness_degree(self,value):
     self.swing_cone_stiffness=value
 
 
+def _restoring_degree_accessors(field):
+    scale = 1000. * math.pi / 180.
+
+    def get(self):
+        return float(getattr(self, field)) * scale
+
+    def set(self, value):
+        value = float(value) / scale
+        if not math.isfinite(value) or value < 0.:
+            raise ValueError('圆锥回正参数必须为有限非负值')
+        setattr(self, field, value)
+
+    return dict(get=get, set=set)
+
+
+def _angular_control(settings):
+    stiffness = dict(zip(AXES, settings.angular_stiffness))
+    damping = dict(zip(AXES, settings.angular_damping))
+    if settings.angular_restoring_mode == 'CONE':
+        # Equal weights in the swing chart give a radial spring and damping.
+        for axis in AXES[1:]:
+            stiffness[axis] = float(settings.swing_restoring_stiffness)
+            damping[axis] = float(settings.swing_restoring_damping)
+    return dict(coordinate_model=MODEL, stiffness_Nm_per_rad=stiffness,
+                damping_Nms_per_rad=damping)
+
+
 def _cancel_recreate_geometry_intent(self, _context):
     # A deliberate edit after Delete cancels the one-shot reconstruction
     # request immediately, even if the author later enters the old value.
@@ -518,6 +545,11 @@ class PPF_BonePhysics(PropertyGroup):
     anchor_stiffness: FloatProperty(name="Anchor Stiffness (N/m)", default=200000., min=0., options=NOT_ANIMATED)
     angular_stiffness: FloatVectorProperty(name="Angular Stiffness (Nm/rad)", size=3, default=(.02, .04, .04), min=0., precision=5, options=NOT_ANIMATED)
     angular_damping: FloatVectorProperty(name="Angular Damping (Nms/rad)", size=3, default=(.001, .001, .001), min=0., precision=5, options=NOT_ANIMATED)
+    angular_restoring_mode: EnumProperty(name='摆动回正', items=[('AXES','分轴','分别设置 Y/Z 摆动回正'),('CONE','圆锥','各个摆动方向共用回正刚度和阻尼，从中立姿态起生效，X 扭转独立')], default='AXES', options=NOT_ANIMATED)
+    swing_restoring_stiffness: FloatProperty(name='圆锥回正刚度（N·m/rad）', default=.04, min=0., precision=5, options=NOT_ANIMATED)
+    swing_restoring_damping: FloatProperty(name='圆锥回正阻尼（N·m·s/rad）', default=.001, min=0., precision=5, options=NOT_ANIMATED)
+    swing_restoring_stiffness_degree: FloatProperty(name='圆锥回正刚度 N·mm/°', min=0., precision=6, options={'SKIP_SAVE'}, **_restoring_degree_accessors('swing_restoring_stiffness'))
+    swing_restoring_damping_degree: FloatProperty(name='圆锥回正阻尼 N·mm·s/°', min=0., precision=6, options={'SKIP_SAVE'}, **_restoring_degree_accessors('swing_restoring_damping'))
     soft_limit_mode: EnumProperty(name='摆动范围', items=[('AXES','分轴','分别设置Y/Z软角度范围'),('CONE','圆锥','各个摆动方向共用圆形软范围，X扭转独立')], default='AXES', options=NOT_ANIMATED)
     swing_cone_half_angle: FloatProperty(name='圆锥半角', description='相对父关节轴的圆形软范围；超过后额外回弹', subtype='ANGLE', unit='ROTATION', default=math.pi/4, min=1.e-6, max=3.1405, options=NOT_ANIMATED)
     swing_cone_stiffness: FloatProperty(name='圆锥刚度（Nm/rad）', default=.04, min=0., options=NOT_ANIMATED)
@@ -984,7 +1016,7 @@ def collect_bindings(context):
             bone_world, author_scale = bone_world_frame_scale(arm, bone)
             proxy_world = rigid_matrix(proxy.matrix_world.copy(), proxy.name)
             axis = Matrix.Rotation(math.pi/2, 4, 'Z') @ Euler(tuple(s.joint_axis_euler)).to_matrix().to_4x4()
-            physics = {"density_kg_per_m3": float(s.density if s.is_property_set("density") else (group.solid_density if expected_type == "SOLID" else group.pdrd_density)), "anchor_stiffness_N_per_m": float(s.anchor_stiffness), "collide_connected": bool(s.collide_connected), "angular_control_v1": {"coordinate_model": MODEL, "stiffness_Nm_per_rad": dict(zip(AXES, s.angular_stiffness)), "damping_Nms_per_rad": dict(zip(AXES, s.angular_damping))}, "angular_soft_limits_v1": {"coordinate_model": MODEL, **{a: {"enabled": bool(s.soft_limits_enabled[i]), "lower_rad": float(s.soft_lower[i]), "upper_rad": float(s.soft_upper[i]), "stiffness_Nm_per_rad": float(s.soft_stiffness[i])} for i, a in enumerate(AXES)}}}
+            physics = {"density_kg_per_m3": float(s.density if s.is_property_set("density") else (group.solid_density if expected_type == "SOLID" else group.pdrd_density)), "anchor_stiffness_N_per_m": float(s.anchor_stiffness), "collide_connected": bool(s.collide_connected), "angular_control_v1": _angular_control(s), "angular_soft_limits_v1": {"coordinate_model": MODEL, **{a: {"enabled": bool(s.soft_limits_enabled[i]), "lower_rad": float(s.soft_lower[i]), "upper_rad": float(s.soft_upper[i]), "stiffness_Nm_per_rad": float(s.soft_stiffness[i])} for i, a in enumerate(AXES)}}}
             if s.soft_limit_mode=='CONE':
                 limits=physics['angular_soft_limits_v1']
                 for a in AXES[1:]:limits[a]['enabled']=False

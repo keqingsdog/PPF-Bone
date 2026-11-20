@@ -446,7 +446,7 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
             if physical_loaded and restoring.physical_status:
                 direct.label(text=restoring.physical_status,icon='INFO')
             from ..ops.bone_physical_controls import draw_inline
-            draw_inline(direct,context,bone,restoring,physical_loaded)
+            draw_inline(direct,context,bone,restoring,physical_loaded,show_swing_mode=native_parent is None)
         if body:
             from ..ops.bone_proxy_editor import editor_active,editor_scope
             unified=editor_active(context)
@@ -540,7 +540,23 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
                 if s.soft_limit_mode=='CONE':
                     limits.prop(s,'swing_cone_half_angle',text='圆锥半角')
                     if s.soft_limit_policy=='ABSOLUTE_SI':limits.prop(s,'swing_cone_stiffness_degree',text='圆锥 N·mm/°')
-                if s.soft_limit_policy=='AUTO_INERTIA':limits.prop(s,'soft_limit_strength',text='强度倍率')
+                if s.soft_limit_policy=='AUTO_INERTIA':
+                    limits.prop(s,'soft_limit_strength',text='强度倍率')
+                    from ..core.soft_limit_display import display_values
+                    axes = [('twist_x', 'X'), ('swing_y', 'Y'), ('swing_z', 'Z')]
+                    if s.soft_limit_mode == 'CONE':
+                        active_axes = [axes[0]] if s.soft_limits_enabled[0] else []
+                        active_axes.append(('swing_cone', '圆锥'))
+                    else:
+                        active_axes = [axis for axis, enabled in zip(axes, s.soft_limits_enabled) if enabled]
+                    if active_axes:
+                        values = display_values(context, s.joint_uuid, s.soft_limit_frequency_hz,
+                                                [channel for channel, _ in active_axes])
+                        if values is None:
+                            limits.label(text='完成构建后显示 1.0 对应的刚度')
+                        else:
+                            summary = ' · '.join(f'{label} {values[channel]:.4g}' for channel, label in active_axes)
+                            limits.label(text=f'1.0 = {summary} N·mm/°', translate=False)
                 for index,label in enumerate(('X 扭转','Y 弯曲','Z 弯曲')):
                     if s.soft_limit_mode=='CONE' and index>0:continue
                     row=limits.row(align=True);row.prop(s,'soft_limits_enabled',index=index,text=label)

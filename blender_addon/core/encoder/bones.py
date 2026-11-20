@@ -175,7 +175,7 @@ def _validate_static_pose_scales(context, state, start_frame, *, explicit_only=F
         context.view_layer.update()
 
 
-def encode_bones(context, state, fps, start_frame):
+def encode_bones(context, state, fps, start_frame, *, cone_restoring_joint_ids=None):
     """Capture authoring at start and root motion at the original frame times."""
     from ...models.bone_bindings import (
         bone_frame_cache, bone_world_matrix, collect_bindings, collect_body_controls_contract,
@@ -234,7 +234,12 @@ def encode_bones(context, state, fps, start_frame):
         bone = next((b for b in arm.data.bones if b.ppf_bone_physics.bone_uuid == row["bone_uuid"]), None)
         if bone is None:
             raise ValueError("BLENDER_BONE_INVALID: root bone UUID cannot be resolved")
-        drives = _drives(bone.ppf_bone_physics, start_frame, fps) if (row.get("parent_body_uuid") or row.get("automatic_parent_anchor_v1")) else None
+        has_joint = bool(row.get('parent_body_uuid') or row.get('automatic_parent_anchor_v1'))
+        settings = bone.ppf_bone_physics
+        if (cone_restoring_joint_ids is not None and has_joint
+                and settings.angular_restoring_mode == 'CONE'):
+            cone_restoring_joint_ids.add(row['joint_uuid'])
+        drives = _drives(settings, start_frame, fps) if has_joint else None
         if drives:
             if any('angular_hard_hinge_v1' in r['physics'] or 'joint_d6_hard_v1' in r['physics'] for r in result['bindings']):
                 raise ValueError('Hard joints cannot be combined with angular drive channels')

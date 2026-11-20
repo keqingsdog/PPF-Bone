@@ -281,7 +281,8 @@ def state_from_scene(scene):
     return {'mode':owner.mode,'document':document}
 
 
-def export_scene(scene, ordered_pair_ids=None, active_joint_ids=None):
+def export_scene(scene, ordered_pair_ids=None, active_joint_ids=None, *,
+                 cone_restoring_joint_ids=()):
     """Export the author library entries consumed by this payload only.
 
     The scene document is an authoring library and can retain records for
@@ -302,6 +303,9 @@ def export_scene(scene, ordered_pair_ids=None, active_joint_ids=None):
     bindings=[]
     for binding in document['bindings']:
         target=binding['target']
+        if (target['kind'] == 'JOINT' and target['joint_uuid'] in cone_restoring_joint_ids
+                and target['channel'] in ('swing_y', 'swing_z')):
+            continue  # Circular swing uses the native linear fallback on both axes.
         if (target['kind']=='JOINT' and target['joint_uuid'] in joint_ids
                 or target['kind']=='STITCH_PAIR' and target['pair_id'] in active_pair_ids):
             bindings.append(copy.deepcopy(binding))

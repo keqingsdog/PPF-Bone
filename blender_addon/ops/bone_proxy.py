@@ -1274,6 +1274,7 @@ COLLISION_COPY_FIELDS = {'collision_filter_enabled', 'collision_group_layers',
 PARAMETER_COPY_FIELDS = {'density', 'mass_mode', 'target_mass_kg', 'material_preset',
     'solid_model', 'solid_young_modulus', 'solid_poisson_ratio', 'solid_deformation_damping',
     'anchor_stiffness', 'angular_stiffness', 'angular_damping', 'soft_limits_enabled',
+    'angular_restoring_mode', 'swing_restoring_stiffness', 'swing_restoring_damping',
     'soft_lower', 'soft_upper', 'soft_limit_policy', 'soft_limit_strength',
     'soft_limit_frequency_hz', 'soft_stiffness', 'soft_limit_mode', 'swing_cone_half_angle', 'swing_cone_stiffness'}
 
@@ -1401,7 +1402,7 @@ def copy_bone_settings(context, scope='SELECTED', category='ALL'):
     # rather than as ordinary fields: their write must land on the target's own
     # group, and a target that owns no compatible group must stay unchanged and
     # be reported instead of being written blind.
-    excluded = {'rna_type', 'soft_stiffness_degree', 'swing_cone_stiffness_degree', 'new_binding_physical_model', 'enabled', 'proxy', 'bone_uuid', 'body_uuid', 'joint_uuid', 'group_uuid', 'parent_frame_translation', 'parent_frame_quaternion', 'child_frame_translation', 'child_frame_quaternion'}
+    excluded = {'rna_type', 'soft_stiffness_degree', 'swing_cone_stiffness_degree', 'swing_restoring_stiffness_degree', 'swing_restoring_damping_degree', 'new_binding_physical_model', 'enabled', 'proxy', 'bone_uuid', 'body_uuid', 'joint_uuid', 'group_uuid', 'parent_frame_translation', 'parent_frame_quaternion', 'child_frame_translation', 'child_frame_quaternion'}
     nested = {'root_control_events', 'drive_twist_x', 'drive_swing_y', 'drive_swing_z', *(f'd6_{kind}_{axis}' for kind in ('translation','rotation') for axis in 'xyz')}
     excluded.update(nested)
     excluded.update(MATERIAL_OWNED_PROPERTIES)

@@ -80,7 +80,7 @@ def snapshot_rna(owner):
         key=prop.identifier
         # Collection properties cannot be assigned, but their mutable items
         # must be included in draft/creation rollback snapshots.
-        if key in ('rna_type','soft_stiffness_degree','swing_cone_stiffness_degree','solid_young_mpa') or (prop.is_readonly and prop.type!='COLLECTION'):continue
+        if key in ('rna_type','soft_stiffness_degree','swing_cone_stiffness_degree','swing_restoring_stiffness_degree','swing_restoring_damping_degree','solid_young_mpa') or (prop.is_readonly and prop.type!='COLLECTION'):continue
         if key=='pin_vertex_group_items':
             from ..core.pin_picker_identity import snapshot_metadata
             result[key]=(key in owner,('PIN_PICKER_METADATA',snapshot_metadata(owner)))

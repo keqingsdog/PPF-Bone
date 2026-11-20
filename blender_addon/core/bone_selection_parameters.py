@@ -17,6 +17,8 @@ FIELDS=('collide_connected','collision_filter_enabled','collision_group_layers',
     'new_binding_physical_model','mass_mode','target_mass_kg','density','material_preset',
     'solid_model','solid_young_modulus','solid_young_mpa','solid_poisson_ratio','solid_deformation_damping',
     'use_hierarchy_joint','auto_follow_parent','root_mode','root_motion_source','anchor_stiffness','angular_stiffness','angular_damping',
+    'angular_restoring_mode','swing_restoring_stiffness','swing_restoring_damping',
+    'swing_restoring_stiffness_degree','swing_restoring_damping_degree',
     'soft_limits_enabled','soft_lower','soft_upper','soft_stiffness','soft_stiffness_degree',
     'soft_limit_mode','swing_cone_half_angle','swing_cone_stiffness','swing_cone_stiffness_degree',
     'soft_limit_policy','soft_limit_strength','preview_color_custom','preview_color')
@@ -25,7 +27,9 @@ DIMENSIONS={'shape','radius','length_ratio','box_width','box_depth'}
 MATERIAL={'solid_model','solid_young_modulus','solid_young_mpa','solid_poisson_ratio','solid_deformation_damping'}
 AUTHOR_FIELDS={'solid_young_mpa':'solid_young_modulus',
                'soft_stiffness_degree':'soft_stiffness',
-               'swing_cone_stiffness_degree':'swing_cone_stiffness'}
+               'swing_cone_stiffness_degree':'swing_cone_stiffness',
+               'swing_restoring_stiffness_degree':'swing_restoring_stiffness',
+               'swing_restoring_damping_degree':'swing_restoring_damping'}
 _busy=False
 _draw_reads=ContextVar('ppf_bone_parameter_draw_reads',default=None)
 
@@ -268,8 +272,8 @@ def set_selected_parameter(context,field,value,*,assign=None,_indices=None):
                 raise ValueError(bone.name+'：跟随非物理父骨时不能使用根控制或释放事件')
         keys={target_field,'auto_geometry_snapshot_json','recreate_geometry_intent_json'} if owner==settings else {target_field}
         if field in MATERIAL: keys.update(MATERIAL - {'solid_young_mpa'})
-        if field=='soft_stiffness_degree':keys.add('soft_stiffness')
-        if field=='swing_cone_stiffness_degree':keys.add('swing_cone_stiffness')
+        if field in AUTHOR_FIELDS:
+            keys.add(author_field)  # Roll back the saved value written by a display alias.
         old={k:(owner.is_property_set(k),_plain(getattr(owner,k))) for k in keys}
         entries.append((arm,bone,owner,old,target_value,target_field))
         if group is not None and group.as_pointer() not in seen_groups:

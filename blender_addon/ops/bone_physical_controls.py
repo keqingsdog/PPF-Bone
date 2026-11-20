@@ -459,19 +459,28 @@ def custom_changed(owner,context):
         finally:_refresh_depth-=1
 
 
-def draw_inline(layout,context,bone,owner,physical_loaded):
-    """Read-only panel rendering; automatic values never invented by drawing."""
-    for index,label in enumerate(('X扭转','Y弯曲','Z弯曲')):
+def draw_inline(layout, context, bone, owner, physical_loaded, *, show_swing_mode=True):
+    """Draw restoring parameters in their original locations."""
+    settings = bone.ppf_bone_physics
+    if show_swing_mode:
+        layout.prop(settings, 'angular_restoring_mode', text='摆动恢复')
+    cone = show_swing_mode and settings.angular_restoring_mode == 'CONE'
+    axes = ('X扭转',) if cone else ('X扭转', 'Y弯曲', 'Z弯曲')
+    for index, label in enumerate(axes):
         row=layout.row(align=True);row.label(text=label)
         switch=row.row(align=True);switch.enabled=physical_loaded
         switch.prop(owner,'physical_custom',index=index,text='自定义')
         value=row.row(align=True);value.enabled=physical_loaded and owner.physical_custom[index] and owner.physical_available[index]
         if physical_loaded and owner.physical_available[index]:value.prop(owner,'angular_stiffness_degree',index=index,text='')
         else:value.label(text='自动值待构建' if physical_loaded else '等待选择父关节')
+    if cone:
+        layout.prop(settings, 'swing_restoring_stiffness_degree', text='圆锥刚度 N·mm/°')
     header,body=layout.panel('ppf_bone_physical_damping',default_closed=True)
     header.label(text='角向阻尼 N·mm·s/°')
     if body is not None:
-        for index,label in enumerate(('X扭转','Y弯曲','Z弯曲')):
+        for index, label in enumerate(axes):
             row=body.row(align=True);row.enabled=physical_loaded and owner.physical_custom[index] and owner.physical_available[index]
             if physical_loaded and owner.physical_available[index]:row.prop(owner,'angular_damping_degree',index=index,text=label)
             else:row.label(text=label+'：自动值待构建')
+        if cone:
+            body.prop(settings, 'swing_restoring_damping_degree', text='圆锥阻尼')
