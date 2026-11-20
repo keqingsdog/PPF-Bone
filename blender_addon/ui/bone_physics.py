@@ -464,7 +464,7 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
             body.prop(s,'mass_mode',text='质量')
             body.prop(s,'target_mass_kg' if s.mass_mode=='MASS' else 'density',text='质量 kg' if s.mass_mode=='MASS' else '密度 kg/m³')
             group=get_group_by_uuid(context.scene,s.group_uuid) if s.group_uuid else None
-            if model=='SOFT' and has_joint_parent and s.joint_mode == 'SOFT':
+            if has_joint_parent and s.joint_mode == 'SOFT':
                 body.label(text='柔性关节')
                 try:
                     controlled = _selected_anchor_curve_active(context, bone)
