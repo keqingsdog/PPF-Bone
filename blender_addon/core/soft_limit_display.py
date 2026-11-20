@@ -5,32 +5,12 @@ import json
 import math
 from pathlib import Path
 
-from .bone_physical_units import ANGULAR_FACTOR
+from .bone_physical_units import ANGULAR_FACTOR, local_build_key
 
 
 _RECEIPT = "bin/soft_limit_auto_v1.json"
 _display_key = None
 _resolved = {}
-
-
-def _local_build_key(context):
-    from .facade import communicator, engine, runner
-    from .state import Activity, Phase, Server, Solver
-    from ..models.groups import get_addon_data
-
-    data = get_addon_data(context.scene)
-    state = engine.state
-    if (data.ssh_state.server_type != "WIN_NATIVE"
-            or data.state.project_name != communicator.project_name
-            or state.phase is not Phase.ONLINE or state.server is not Server.RUNNING
-            or state.solver not in {Solver.READY, Solver.RESUMABLE, Solver.STARTING, Solver.RUNNING, Solver.SAVING}
-            or state.activity in {Activity.SENDING, Activity.BUILDING}
-            or not state.remote_root or not state.server_upload_id):
-        return None
-    with runner._collision_lock:
-        if runner._body_retransfer or runner._collision_retransfer:
-            return None
-    return (context.scene.as_pointer(), str(state.remote_root), state.server_upload_id)
 
 
 def _read_base_values(root, upload_id):
@@ -78,7 +58,7 @@ def _read_base_values(root, upload_id):
 def display_values(context, joint_uuid, frequency_hz, channels):
     """Return the Build's 1.0 multiplier values in N·mm/degree for these channels."""
     global _display_key, _resolved
-    key = _local_build_key(context)
+    key = local_build_key(context)
     if key != _display_key:
         _display_key = key
         _resolved = {}

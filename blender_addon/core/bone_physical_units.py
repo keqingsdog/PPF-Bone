@@ -136,21 +136,126 @@ _display_key=None
 _display_document=None
 
 
+def local_build_key(context, *, allow_solver_failure=False):
+    """In-memory identity of a local Build available for read-only displays."""
+    from .facade import communicator, engine, runner
+    from .state import Activity, Phase, Server, Solver
+    from ..models.groups import get_addon_data
+
+    data = get_addon_data(context.scene)
+    state = engine.state
+    if (data.ssh_state.server_type != "WIN_NATIVE"
+            or data.state.project_name != communicator.project_name
+            or state.phase is not Phase.ONLINE or state.server is not Server.RUNNING
+            or state.activity in {Activity.SENDING, Activity.BUILDING}
+            or not state.remote_root or not state.server_upload_id):
+        return None
+    if state.solver not in {Solver.READY, Solver.RESUMABLE, Solver.STARTING, Solver.RUNNING, Solver.SAVING}:
+        if not allow_solver_failure or state.solver is not Solver.FAILED:
+            return None
+        from .protocol import STATUS_FAILED, STATUS_READY, STATUS_RESUMABLE
+        # Blender also reports FAILED for a Build error, which arrives as NO_BUILD.
+        response = communicator.info.response or {}
+        if (response.get("status") not in {STATUS_FAILED, STATUS_READY, STATUS_RESUMABLE}
+                or response.get("upload_id") != state.server_upload_id
+                or response.get("root") != str(state.remote_root)):
+            return None
+    with runner._collision_lock:
+        if runner._body_retransfer or runner._collision_retransfer:
+            return None
+    return (context.scene.as_pointer(), str(state.remote_root), state.server_upload_id)
+
+
 def display_build_key(context):
     """Only existing acknowledged in-memory Build state; no hashes or IO."""
-    from .facade import communicator,engine,runner
+    from .facade import communicator, engine, runner
     from ..models.groups import get_addon_data
+
+    data = get_addon_data(context.scene)
+    project = data.state.project_name
+    state = engine.state
+    if data.ssh_state.server_type != 'WIN_NATIVE' or project != communicator.project_name:
+        return None
+
     with runner._collision_lock:
-        expected=runner._body_expected;seal=runner._body_seal
-        if not runner._body_verified or runner._body_retransfer or expected is None or seal is None:return None
-    project=get_addon_data(context.scene).state.project_name
-    response=communicator.info.response or {}
-    identity=tuple(getattr(expected,k,'') for k in ('root','upload_id','data_hash','param_hash'))
-    if not all(identity) or project!=communicator.project_name:return None
-    if any(response.get(k)!=v for k,v in zip(('root','upload_id','data_hash','param_hash'),identity)):return None
-    if str(engine.state.remote_root)!=identity[0]:return None
-    if get_addon_data(context.scene).ssh_state.server_type!='WIN_NATIVE':return None
-    return (context.scene.as_pointer(),project,*identity,tuple(_seal_contexts(seal)))
+        if runner._body_retransfer or runner._collision_retransfer:
+            return None
+        body_expected, body_seal = runner._body_expected, runner._body_seal
+        body_verified = runner._body_verified and body_expected is not None and body_seal is not None
+        if runner._body_required and not body_verified:
+            return None
+        collision_required = runner._collision_required
+        collision_verified = runner._collision_verified
+        collision_expected, collision_seal = runner._collision_expected, runner._collision_seal
+        # Build requests invalidate this epoch even when they reuse an upload.
+        epoch = runner._collision_epoch
+
+    fields = ('root', 'upload_id', 'data_hash', 'param_hash')
+    if body_verified:
+        response = communicator.info.response or {}
+        identity = tuple(getattr(body_expected, field, '') for field in fields)
+        if (not all(identity) or str(state.remote_root) != identity[0]
+                or any(response.get(field) != value for field, value in zip(fields, identity))):
+            return None
+        proofs = tuple(_seal_contexts(body_seal))
+        if not proofs:
+            return None
+        epoch = None
+    else:
+        local = local_build_key(context, allow_solver_failure=True)
+        if local is None:
+            return None
+        identity = (*local[1:], state.server_data_hash, state.server_param_hash)
+        proofs = ()
+
+    collision_scene = None
+    if collision_required or (not body_verified and collision_verified):
+        if not collision_verified or collision_expected is None or collision_seal is None:
+            return None
+        root, upload_id, data_hash, param_hash = identity
+        if ((collision_expected.root, collision_expected.upload_id, collision_expected.param_hash)
+                != (root, upload_id, param_hash)
+                or (collision_expected.data_hash and collision_expected.data_hash != data_hash)):
+            return None
+        # The collision seal uses its own inputs digest. The scene UUID is shared.
+        collision_scene = collision_seal.scene_uuid
+        if not collision_scene or any(proof[0] != collision_scene for proof in proofs):
+            return None
+    return (context.scene.as_pointer(), project, *identity, epoch, proofs, collision_scene)
+
+
+def _read_local_restoring_document(root, upload_id, collision_scene):
+    """Read the single restoring receipt and match its completed Build seal."""
+    from hashlib import sha256
+    from pathlib import Path
+    import json
+    from .module import get_cbor2
+
+    root = Path(root)
+    upload_path = root / "upload_id.txt"
+    if upload_path.read_text(encoding="utf-8").strip() != upload_id:
+        return None
+    directory = root / "session/bin"
+    envelope = get_cbor2().loads((directory / "pdrd_scene_context.cbor").read_bytes())
+    if envelope["kind"] != "ppf.pdrd_scene_context" or envelope["version"] != 2:
+        return None
+    sealed = envelope["payload"]
+    scene, basis = sealed["scene_uuid"], sealed["scene_inputs_sha256"]
+    if (sealed["complete"] is not True or not scene or not basis
+            or collision_scene is not None and scene != collision_scene):
+        return None
+    marker = sealed["restoring_curves_v1"]
+    if marker["required_feature"] != "restoring_curves_v1":
+        return None
+    raw = (directory / "restoring_curves_v1.json").read_bytes()
+    if marker["sidecar_byte_length"] != len(raw) or marker["sidecar_sha256"] != sha256(raw).hexdigest():
+        return None
+    if upload_path.read_text(encoding="utf-8").strip() != upload_id:
+        return None
+    document = json.loads(raw)
+    if document["scene_uuid"] != scene or document["basis_sha256"] != basis:
+        return None
+    return document
 
 
 def display_build_document(context):
@@ -168,12 +273,16 @@ def display_build_document(context):
     try:
         import json
         from pathlib import Path
-        document=json.loads((Path(key[2])/'session/bin/restoring_curves_v1.json').read_text(encoding='utf8'))
-        proofs=key[-1]
-        if not proofs or any((document.get('scene_uuid'),document.get('basis_sha256'))!=proof[:2] for proof in proofs):return None
-        if document.get('kind')!='ppf.restoring_curves' or document.get('version')!=1:return None
+        root, upload_id = key[2:4]
+        proofs, collision_scene = key[-2:]
+        if proofs:
+            document=json.loads((Path(root)/'session/bin/restoring_curves_v1.json').read_text(encoding='utf8'))
+            if any((document['scene_uuid'],document['basis_sha256'])!=proof[:2] for proof in proofs):return None
+        else:
+            document = _read_local_restoring_document(root, upload_id, collision_scene)
+        if not isinstance(document, dict) or document.get('kind')!='ppf.restoring_curves' or document.get('version')!=1:return None
         _display_document=document
-    except (OSError,ValueError,TypeError,KeyError):pass
+    except (ImportError,OSError,ValueError,TypeError,KeyError):pass
     return _display_document
 
 
