@@ -22,6 +22,7 @@
 from ...i18n import props as _ppf_props
 from ... import i18n as _ppf_i18n
 import time
+import math
 
 import bpy  # pyright: ignore
 import numpy as np
@@ -146,7 +147,7 @@ def _max_keyframe_in_action(action) -> int | None:
         # Keyframes can be edited out of order; inspect every frame in bulk.
         coords = np.empty(len(points) * 2, dtype=np.float32)
         points.foreach_get("co", coords)
-        f = int(np.max(coords[::2]))
+        f = math.ceil(float(np.max(coords[::2])))
         if max_f is None or f > max_f:
             max_f = f
 
@@ -163,17 +164,10 @@ def _max_keyframe_in_action(action) -> int | None:
 
 
 def _collect_influencing_actions(obj, _seen=None) -> list:
-    """Every Action that can change *obj*'s depsgraph-evaluated mesh.
+    """Collect object, data and shape-key actions along the parent chain.
 
-    Walks (1) the object's own animation_data, (2) its shape-keys
-    animation_data, (3) every parent in the chain, (4) every modifier's
-    ``.object`` target recursively. Cycle-protected via ``_seen``
-    (id-keyed). Covers the common deformers: Armature on a parent or
-    self, MeshDeform / SurfaceDeform / Lattice / Hook with their own
-    animated cages, shape keys driven by an action. Does NOT walk
-    drivers, constraints, or geometry-nodes Scene-Time inputs; those
-    return no actions and the capture falls back to the solver's global
-    frame count (see ``_effective_frame_range``).
+    All action slots are included conservatively. Complex influences are
+    separately detected by _motion_end_uncertain and use the full solve.
     """
     if _seen is None:
         _seen = set()
@@ -181,16 +175,11 @@ def _collect_influencing_actions(obj, _seen=None) -> list:
     if obj is None or id(obj) in _seen:
         return out
     _seen.add(id(obj))
-    ad = getattr(obj, "animation_data", None)
-    if ad is not None and ad.action is not None:
-        out.append(ad.action)
     data = getattr(obj, "data", None)
-    if data is not None:
-        sk = getattr(data, "shape_keys", None)
-        if sk is not None:
-            sk_ad = getattr(sk, "animation_data", None)
-            if sk_ad is not None and sk_ad.action is not None:
-                out.append(sk_ad.action)
+    for owner in (obj, data, getattr(data, "shape_keys", None)):
+        ad = getattr(owner, "animation_data", None)
+        if ad is not None and ad.action is not None:
+            out.append(ad.action)
     parent = getattr(obj, "parent", None)
     if parent is not None:
         out.extend(_collect_influencing_actions(parent, _seen))
@@ -200,6 +189,42 @@ def _collect_influencing_actions(obj, _seen=None) -> list:
             out.extend(_collect_influencing_actions(target, _seen))
     return out
 
+
+def _motion_end_uncertain(obj, seen=None):
+    """Only shorten when visible influences have a finite keyframe end."""
+    if seen is None:
+        seen = set()
+    if obj is None or id(obj) in seen:
+        return False
+    seen.add(id(obj))
+    # These can depend on arbitrary objects, node trees, time, or caches.
+    if (getattr(obj, "modifiers", None) or getattr(obj, "constraints", None)
+            or getattr(obj, "rigid_body", None)):
+        return True
+    data = getattr(obj, "data", None)
+    for owner in (obj, data, getattr(data, "shape_keys", None)):
+        ad = getattr(owner, "animation_data", None)
+        if ad is None:
+            continue
+        if getattr(ad, "drivers", None) or getattr(ad, "nla_tracks", None):
+            return True
+        action = getattr(ad, "action", None)
+        if action is None:
+            continue
+        curves = list(getattr(action, "fcurves", []) or [])
+        for layer in getattr(action, "layers", []) or []:
+            for strip in layer.strips:
+                for bag in strip.channelbags:
+                    curves.extend(bag.fcurves)
+        if not curves:
+            return True
+        for curve in curves:
+            if (getattr(curve, "sampled_points", None)
+                    or not getattr(curve, "keyframe_points", None)
+                    or getattr(curve, "extrapolation", "CONSTANT") != "CONSTANT"
+                    or getattr(curve, "modifiers", None)):
+                return True
+    return _motion_end_uncertain(getattr(obj, "parent", None), seen)
 
 def _sim_frame_count(scene) -> int | None:
     """The solver's global simulation frame count for *scene*.
@@ -226,17 +251,14 @@ def _effective_frame_range(scene, obj, *, legacy_uncapped=False) -> tuple[int, i
     capture and the solve share one origin. The upper bound depends on how the
     motion is authored:
 
-      - Keyframed deformers (Armature, Lattice, shape keys, animated
-        Geometry Nodes inputs): stop at the last influencing keyframe or
-        the solver's last frame, whichever comes first. The viewport
-        timeline being shrunk doesn't truncate the cache.
-      - Procedural motion with no detectable keyframes (Geometry Nodes
-        driven by Scene Time, drivers, constraints): there's no settle
-        point to read, so the capture is bounded by the solver's global
-        frame count (``state.frame_count``), exactly the number of
-        frames the simulation will consume from the cache. Only when
-        the addon state is unavailable do we fall back to
-        ``scene.frame_end``.
+      - Plain keyframed object, data, shape-key and parent actions with
+        constant extrapolation stop at the last keyframe, rounded up, or
+        the solver's last frame, whichever comes first.
+      - Drivers, NLA, sampled or modified curves, nonconstant extrapolation,
+        modifiers, constraints and rigid bodies have an uncertain end and
+        use the solver's global frame count. When addon state is unavailable,
+        scene.frame_end is the fallback.
+
     """
     # Fall back to frame 1 when the state is not registered yet, matching
     # ``_sim_frame_count``'s guard below: this helper is reached from panel
@@ -249,7 +271,7 @@ def _effective_frame_range(scene, obj, *, legacy_uncapped=False) -> tuple[int, i
         f = _max_keyframe_in_action(act)
         if f is not None and (max_kf is None or f > max_kf):
             max_kf = f
-    if max_kf is None:
+    if max_kf is None or _motion_end_uncertain(obj):
         # No detectable keyframes: procedural motion (Geometry Nodes
         # on Scene Time, drivers, constraints). Bound the capture by the
         # solver's frame count, not the viewport timeline's frame_end.
