@@ -224,8 +224,15 @@ def validate_capture(scene, obj, frames, kind, vg_name=None, pin_item=None):
             start, end = _effective_pin_frame_range(scene, obj, pin_item)[:2]
             if proof['frame_start'] != start or proof['frame_end'] < end:
                 raise ValueError('capture does not cover the required Pin frame range')
-        elif tuple(_effective_frame_range(scene, obj)[:2]) != (proof['frame_start'], proof['frame_end']):
-            raise ValueError('effective start/frame range changed after capture')
+        else:
+            current = tuple(_effective_frame_range(scene, obj)[:2])
+            recorded = (proof['frame_start'], proof['frame_end'])
+            if recorded != current:
+                if recorded[0] != current[0] or recorded[1] < current[1]:
+                    raise ValueError('effective start/frame range changed after capture')
+                legacy = tuple(_effective_frame_range(scene, obj, legacy_uncapped=True)[:2])
+                if recorded != legacy:
+                    raise ValueError('effective start/frame range changed after capture')
         if kind == 'PIN':
             from .encoder.pin import _get_pin_indices
             indices = proof.get('vertex_indices')

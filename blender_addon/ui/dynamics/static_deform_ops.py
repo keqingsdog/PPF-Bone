@@ -216,7 +216,7 @@ def _sim_frame_count(scene) -> int | None:
         return None
 
 
-def _effective_frame_range(scene, obj) -> tuple[int, int, str]:
+def _effective_frame_range(scene, obj, *, legacy_uncapped=False) -> tuple[int, int, str]:
     """Pick the [frame_start, frame_end] to capture for *obj*.
 
     Lower bound is always the solve's starting frame (see
@@ -227,10 +227,9 @@ def _effective_frame_range(scene, obj) -> tuple[int, int, str]:
     motion is authored:
 
       - Keyframed deformers (Armature, Lattice, shape keys, animated
-        Geometry Nodes inputs): the highest keyframe across every
-        influencing action. The action settles at its last key, so
-        capturing past it would burn frames on a static pose, and the
-        viewport timeline being shrunk doesn't truncate the cache.
+        Geometry Nodes inputs): stop at the last influencing keyframe or
+        the solver's last frame, whichever comes first. The viewport
+        timeline being shrunk doesn't truncate the cache.
       - Procedural motion with no detectable keyframes (Geometry Nodes
         driven by Scene Time, drivers, constraints): there's no settle
         point to read, so the capture is bounded by the solver's global
@@ -260,6 +259,11 @@ def _effective_frame_range(scene, obj) -> tuple[int, int, str]:
             return frame_start, frame_end, iface_("simulation frame count ({count})").format(count=n_sim)
         return frame_start, int(scene.frame_end), iface_("scene.frame_end (state unavailable)")
     frame_end = max(max_kf, frame_start)
+    n_sim = _sim_frame_count(scene)
+    if not legacy_uncapped and n_sim is not None and n_sim > 0:
+        if frame_end > frame_start + n_sim - 1:
+            frame_end = frame_start + n_sim - 1
+            return frame_start, frame_end, iface_("simulation frame count ({count})").format(count=n_sim)
     return frame_start, frame_end, iface_("last keyframe ({frame})").format(frame=max_kf)
 
 
