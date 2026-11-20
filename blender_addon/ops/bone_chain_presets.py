@@ -41,13 +41,19 @@ def strength_to_frequency(strength):
     return 10.0 * math.sqrt(value)
 
 
-def _joint_parent_status(bone):
+def _joint_parent_status(bone, arm=None):
     """Whether this author bone exports a real compliant parent joint."""
     parent = bone.parent
     if parent is None:
         return False, 'bone has no parent'
     parent_settings = parent.ppf_bone_physics
     settings = bone.ppf_bone_physics
+    if arm is not None:
+        from ..core.encoder.pmx_joints import parent_joint_pair, parent_joint_pairs
+        if parent_joint_pair(bone, parent_joint_pairs(arm)):
+            return False, 'parent uses an imported MMD joint'
+    if not settings.use_hierarchy_joint:
+        return False, 'parent joint is disabled'
     if parent_settings.enabled:
         if not parent_settings.proxy or not parent_settings.body_uuid:
             return False, 'enabled parent has no physical proxy/body'
@@ -61,7 +67,7 @@ def _joint_parent_status(bone):
 
 def _targets_for_bone(arm, bone):
     settings = bone.ppf_bone_physics
-    valid_parent, _reason = _joint_parent_status(bone)
+    valid_parent, _reason = _joint_parent_status(bone, arm)
     if not valid_parent:
         return []
     if settings.joint_mode in {'HINGE', 'D6'}:
@@ -122,7 +128,7 @@ def _active_physical_bone(context):
     if not settings.enabled or not settings.proxy:
         raise ValueError(f'{bone.name}: create and enable its physical body first')
     validate_proxy_owner(arm, bone)
-    valid_parent, reason = _joint_parent_status(bone)
+    valid_parent, reason = _joint_parent_status(bone, arm)
     if not valid_parent:
         raise ValueError(f'{bone.name}: no real parent joint is available ({reason})')
     if bone.parent.ppf_bone_physics.enabled:

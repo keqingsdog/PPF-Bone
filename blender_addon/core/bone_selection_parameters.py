@@ -3,7 +3,6 @@ from ..i18n import props as _ppf_props
 from .. import i18n as _ppf_i18n
 import bpy
 import math
-import json
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
@@ -153,6 +152,17 @@ def _value_owner(context,field):
     return _group(context,*source) if field=='friction' else source[1].ppf_bone_physics
 
 
+def hierarchy_joint_field(arm, bone):
+    from .encoder.pmx_joints import parent_joint_pair, parent_joint_pairs
+    if parent_joint_pair(bone, parent_joint_pairs(arm)) is not None:
+        return 'pmx_parent_joint_enabled'
+    return 'use_hierarchy_joint'
+
+
+def hierarchy_joint_enabled(arm, bone):
+    return bool(getattr(bone.ppf_bone_physics, hierarchy_joint_field(arm, bone)))
+
+
 def _plain(value):
     return value if isinstance(value,(str,bool,int,float)) else list(value)
 
@@ -229,7 +239,8 @@ def set_selected_parameter(context,field,value,*,assign=None,_indices=None):
                 raise ValueError(bone.name+'：代理材质类型与骨骼物理类型不一致，请先修复绑定')
         owner=group if field=='friction' else settings
         if owner is None:raise ValueError(bone.name+'：尚无可编辑的独占材质')
-        if _animated(owner,field):raise ValueError(bone.name+'：动画或驱动字段请沿原作者RNA编辑')
+        target_field=hierarchy_joint_field(arm,bone) if field=='use_hierarchy_joint' else field
+        if _animated(owner,target_field):raise ValueError(bone.name+'：动画或驱动字段请沿原作者RNA编辑')
         # UI unit aliases write the underlying author property as well.
         author_field=AUTHOR_FIELDS.get(field,field)
         if author_field!=field and _animated(owner,author_field):
@@ -248,24 +259,19 @@ def set_selected_parameter(context,field,value,*,assign=None,_indices=None):
                 raise ValueError('批量向量分量无效')
             target_value=_plain(getattr(owner,field))
             for index in _indices:target_value[index]=value[index]
-        _validate_rna(owner,field,target_value)
-        if field=='use_hierarchy_joint' and target_value and bone.parent:
+        _validate_rna(owner,target_field,target_value)
+        if target_field=='use_hierarchy_joint' and target_value and bone.parent:
             parent=bone.parent.ppf_bone_physics
             if parent.enabled and parent.physical_model=='SOFT' and settings.joint_mode!='SOFT':
                 raise ValueError(bone.name+'：软体父级仅支持柔性关节')
             if not parent.enabled and settings.auto_follow_parent and (settings.root_mode!='FREE' or len(settings.root_control_events)):
                 raise ValueError(bone.name+'：跟随非物理父骨时不能使用根控制或释放事件')
-            if parent.enabled and settings.body_uuid and parent.body_uuid:
-                pair={settings.body_uuid,parent.body_uuid}
-                for joint in json.loads(arm.get('ppf_mmd_joints_v1','[]')):
-                    if {joint.get('body_a_uuid'),joint.get('body_b_uuid')}==pair:
-                        raise ValueError(bone.name+'：父子骨骼已有 MMD 关节，请先处理重复关节')
-        keys={field,'auto_geometry_snapshot_json','recreate_geometry_intent_json'} if owner==settings else {field}
+        keys={target_field,'auto_geometry_snapshot_json','recreate_geometry_intent_json'} if owner==settings else {target_field}
         if field in MATERIAL: keys.update(MATERIAL - {'solid_young_mpa'})
         if field=='soft_stiffness_degree':keys.add('soft_stiffness')
         if field=='swing_cone_stiffness_degree':keys.add('swing_cone_stiffness')
         old={k:(owner.is_property_set(k),_plain(getattr(owner,k))) for k in keys}
-        entries.append((arm,bone,owner,old,target_value))
+        entries.append((arm,bone,owner,old,target_value,target_field))
         if group is not None and group.as_pointer() not in seen_groups:
             seen_groups.add(group.as_pointer());group_snapshots.append((group,snapshot_rna(group)))
     def current(entry):
@@ -273,24 +279,23 @@ def set_selected_parameter(context,field,value,*,assign=None,_indices=None):
             from ..models.bone_bindings import effective_solid_material
             values=effective_solid_material(entry[2])
             return values['solid_young_modulus']/1e6 if field=='solid_young_mpa' else values[field]
-        return _plain(getattr(entry[2],field))
+        return _plain(getattr(entry[2],entry[5]))
     # Equal RNA fallback values still need an explicit author write. First-creation
     # planning deliberately distinguishes unset values from authored defaults.
     # Unit aliases store that intent on their backing property, not the getter.
-    authored_field=AUTHOR_FIELDS.get(field,field)
     changed=[entry for entry in entries
-             if not entry[3][authored_field][0] or not _equal(current(entry),entry[4])]
+             if not entry[3][AUTHOR_FIELDS.get(entry[5],entry[5])][0] or not _equal(current(entry),entry[4])]
     if not changed:return 0
     assign=assign or setattr;_busy=True
     try:
         with collision_edit_batch():
             try:
                 with material_write_guard():
-                    for _arm,_bone,owner,_old,target_value in changed:
-                        assign(owner,field,target_value)
-                        if field not in MATERIAL and not _equal(_plain(getattr(owner,field)),target_value):raise ValueError('参数赋值被拒绝')
+                    for _arm,_bone,owner,_old,target_value,target_field in changed:
+                        assign(owner,target_field,target_value)
+                        if field not in MATERIAL and not _equal(_plain(getattr(owner,target_field)),target_value):raise ValueError('参数赋值被拒绝')
                 from ..models import bone_bindings as bindings
-                for _arm,bone,owner,_old,_target_value in changed:
+                for arm,bone,owner,_old,_target_value,target_field in changed:
                     settings=bone.ppf_bone_physics
                     if field=='density':bindings._sync_density(settings,context)
                     elif field in MATERIAL:
@@ -298,11 +303,11 @@ def set_selected_parameter(context,field,value,*,assign=None,_indices=None):
                         bindings.apply_solid_material_patch(settings,{key: _target_value * 1e6 if field=='solid_young_mpa' else _target_value})
                     elif field in DIMENSIONS:bindings._cancel_recreate_geometry_intent(settings,context)
                     elif field in {'mass_mode','target_mass_kg'}:mark_settings(settings,context)
-                    if field in {'root_mode','root_motion_source','auto_follow_parent','use_hierarchy_joint'}:
-                        check_soft_supported(settings,bone.name,has_physical_joint_parent(bone))
+                    if target_field in {'root_mode','root_motion_source','auto_follow_parent','use_hierarchy_joint'}:
+                        check_soft_supported(settings,bone.name,has_physical_joint_parent(bone,arm=arm))
             except Exception:
                 with material_write_guard():
-                    for _arm,_bone,owner,old,_target_value in reversed(entries):
+                    for _arm,_bone,owner,old,_target_value,_target_field in reversed(entries):
                         for key,(was_set,previous) in old.items():
                             if key in AUTHOR_FIELDS: continue  # Restore backing RNA only, never computed aliases.
                             setattr(owner,key,previous)
@@ -319,15 +324,18 @@ def set_selected_parameter(context,field,value,*,assign=None,_indices=None):
 def _get(field,definition):
     def getter(_self):
         owner=_value_owner(bpy.context,field)
+        target_field=field
         if field=='use_hierarchy_joint':
             active=active_author(bpy.context)
             if active is not None and active[1].parent is None:
-                eligible=next((bone for _arm,bone in resolve_selected_authors(bpy.context) if bone.parent),None)
-                if eligible is not None:owner=eligible.ppf_bone_physics
+                active=next(((arm,bone) for arm,bone in resolve_selected_authors(bpy.context) if bone.parent),active)
+            if active is not None:
+                owner=active[1].ppf_bone_physics
+                target_field=hierarchy_joint_field(*active)
         if owner is None:
             value=definition.keywords.get('default',tuple(0. for _ in range(definition.keywords['size'])) if 'size' in definition.keywords else 0.)
         else:
-            value=getattr(owner,field)
+            value=getattr(owner,target_field)
             if field in MATERIAL:
                 from ..models.bone_bindings import effective_solid_material
                 values=effective_solid_material(owner)
@@ -413,10 +421,11 @@ def parameter_owner(context,owner,field):
     rows=resolve_selected_authors(context)
     if source is None or not any(a==source[0] and b==source[1] for a,b in rows):return owner
     expected=_value_owner(context,field)
-    prop=owner.bl_rna.properties.get(field)
+    target_field=hierarchy_joint_field(*source) if field=='use_hierarchy_joint' else field
+    prop=owner.bl_rna.properties.get(target_field)
     if field=='friction' and context.scene.tool_settings.use_keyframe_insert_auto:return owner
     if field!='friction' and prop is not None and prop.is_animatable:return owner
-    if owner!=expected or _animated(owner,field):return owner
+    if owner!=expected or _animated(owner,target_field):return owner
     return context.window_manager.ppf_selection_parameters
 
 
@@ -433,6 +442,10 @@ class SelectionLayout:
         if key in {'prop','prop_enum'}:
             def prop(owner,field,*a,**kw):
                 target=parameter_owner(self.context,owner,field)
+                if field=='use_hierarchy_joint' and target==owner:
+                    source=active_author(self.context)
+                    if source is not None and owner==source[1].ppf_bone_physics:
+                        field=hierarchy_joint_field(*source)
                 if key=='prop' and field=='friction' and owner==_value_owner(self.context,field):
                     row=self.layout.row(align=True);row.use_property_decorate=False
                     friction_kw=dict(kw)

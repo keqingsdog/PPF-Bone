@@ -6,7 +6,7 @@
 
 schema_version = "1.0.0"
 id = "ppf_contact_solver"
-version = "1.0.52"
+version = "1.0.53"
 name = "ZOZO's Contact Solver"
 tagline = "用于物理模拟的接触求解器"
 maintainer = "keqingsdog"

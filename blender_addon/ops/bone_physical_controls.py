@@ -58,7 +58,7 @@ def refresh_active():
         if arm is None or bone is None or context.mode not in {'OBJECT','POSE'}:
             _refresh_key=None;return .3
         s=bone.ppf_bone_physics
-        if not s.enabled or not s.proxy or s.joint_mode in {'HINGE','D6'} or not _joint_parent_status(bone)[0]:
+        if not s.enabled or not s.proxy or s.joint_mode in {'HINGE','D6'} or not _joint_parent_status(bone, arm)[0]:
             _refresh_key=None;return .3
         from ..core.bone_physical_units import display_build_key
         key=(_author_key(context,bone),display_build_key(context))

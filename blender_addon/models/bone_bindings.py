@@ -475,6 +475,7 @@ class PPF_BonePhysics(PropertyGroup):
     body_uuid: StringProperty(options=NOT_ANIMATED)
     joint_uuid: StringProperty(options=NOT_ANIMATED)
     use_hierarchy_joint: BoolProperty(name="连接父骨物理", description="使用骨架父级生成物理关节或运动学锚点", default=True, options=NOT_ANIMATED)
+    pmx_parent_joint_enabled: BoolProperty(name="连接父骨物理", description="启用当前父子骨之间已导入的 PMX 关节", default=True, options=NOT_ANIMATED)
     auto_follow_parent: BoolProperty(name="Follow Nonphysical Parent", description="通过内部运动学锚点跟随父骨骼，保留作者偏移，不改变父骨骼物理状态；跟随时仅支持自由动态，不支持独立接管事件", default=True, options=NOT_ANIMATED)
     group_uuid: StringProperty(options=NOT_ANIMATED)
     proxy: PointerProperty(type=bpy.types.Object, poll=_mesh_only, update=_mark_mass_dirty, options=NOT_ANIMATED)
@@ -804,10 +805,14 @@ def _frame(settings, prefix):
     return {"translation_m": list(getattr(settings, prefix + "_frame_translation")), "quaternion_wxyz": list(q)}
 
 
-def has_physical_joint_parent(bone, enabled_names=None):
-    """Physical or automatic parent endpoint; a Blender hierarchy alone is not a joint."""
+def has_physical_joint_parent(bone, enabled_names=None, *, arm=None):
+    """Whether this bone authors a generated PPF joint or automatic anchor."""
     if bone is None or bone.parent is None or not getattr(bone.ppf_bone_physics, 'use_hierarchy_joint', True):
         return False
+    if arm is not None:
+        from ..core.encoder.pmx_joints import parent_joint_pair, parent_joint_pairs
+        if parent_joint_pair(bone, parent_joint_pairs(arm)) is not None:
+            return False
     parent_enabled = (bone.parent.name in enabled_names if enabled_names is not None
                       else bool(bone.parent.ppf_bone_physics.enabled))
     return bool(parent_enabled or getattr(bone.ppf_bone_physics, 'auto_follow_parent', True))
@@ -907,6 +912,7 @@ def collect_bindings(context):
     from ..core.uuid_registry import get_object_uuid
     from mathutils import Euler
     from .bone_collision import settings_record
+    from ..core.encoder.pmx_joints import parent_joint_pair, parent_joint_pairs
     out = {"schema": "PPF_BLENDER_BONES_V1", "coordinate_space": "BLENDER_Z_UP", "scene_unit_scale_m": float(context.scene.unit_settings.scale_length), "frame_start": int(context.scene.frame_current), "armatures": [], "bindings": []}
     # Preserve legacy enum values for old files, but refuse their transfer.
     for arm in context.scene.objects:
@@ -934,6 +940,7 @@ def collect_bindings(context):
             raise _error("Duplicate armature identity; duplicated rigs need independent bindings")
         seen_armatures.add(arm.ppf_armature_uuid)
         out["armatures"].append({"armature_uuid": arm.ppf_armature_uuid, "object_name": arm.name, "matrix_world_blender": _matrix_rows(arm.matrix_world)})
+        native_pairs = parent_joint_pairs(arm)
         for bone in sorted(enabled, key=lambda b: b.name):
             s = bone.ppf_bone_physics; proxy = s.proxy
             if not proxy or proxy.type != "MESH" or context.scene.objects.get(proxy.name) != proxy:
@@ -943,7 +950,7 @@ def collect_bindings(context):
             if s.bone_uuid in seen_bones or s.body_uuid in seen_bodies:
                 raise _error("Duplicate bone or body identity; do not share a proxy between bones")
             seen_bones.add(s.bone_uuid);seen_bodies.add(s.body_uuid)
-            hierarchy_parent = bone.parent if s.use_hierarchy_joint else None
+            hierarchy_parent = bone.parent if s.use_hierarchy_joint and parent_joint_pair(bone, native_pairs) is None else None
             parent = hierarchy_parent if hierarchy_parent and hierarchy_parent.ppf_bone_physics.enabled else None
             nonphysical_parent = hierarchy_parent if hierarchy_parent and parent is None else None
             auto_parent = bool(nonphysical_parent and getattr(s, 'auto_follow_parent', True))

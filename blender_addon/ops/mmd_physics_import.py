@@ -225,6 +225,8 @@ def _plan(context, helpers=None):
         typ = str(rigid.type)
         if typ not in {'0', '1', '2'}:
             raise ValueError('Unknown MMD body type: ' + obj.name)
+        # Imported PMX parent connections are enabled through pmx_parent_joint_enabled.
+        # Keep the generated PPF fallback restricted to isolated dynamic bodies.
         isolated_dynamic = typ in {'1', '2'} and bone.parent is not None and obj not in joint_endpoints
         settings = dict(shape='CUSTOM', custom_object=obj, physical_model='RIGID', new_binding_physical_model='RIGID', auto_follow_parent=isolated_dynamic, use_hierarchy_joint=isolated_dynamic,
             root_mode='KINEMATIC' if typ == '0' else 'FREE', root_motion_source='POSE',

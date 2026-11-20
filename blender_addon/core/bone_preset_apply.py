@@ -385,7 +385,7 @@ def apply(context,document,scope,size_mode,mask=None):
             state=read_state(context.scene)
             if state['mode']=='LEGACY' and state.get('document'):raise ValueError('目标含未启用的旧曲线；请先明确处理旧曲线')
             for bone in bones:
-                if not has_physical_joint_parent(pseudo[bone.name],enabled_names):raise ValueError(bone.name+'：恢复曲线需要真实父关节')
+                if not has_physical_joint_parent(pseudo[bone.name],enabled_names,arm=arm):raise ValueError(bone.name+'：恢复曲线需要真实父关节')
         for bone in arm.data.bones:
             if bone.name not in enabled_names:continue
             current=pseudo[bone.name]

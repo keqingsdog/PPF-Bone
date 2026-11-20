@@ -289,15 +289,19 @@ def _resolve_armatures(scene, receipt, *, current):
 
 def _targets(scene, receipt, *, current=True):
     from .fem_pose import binding_kind, FEM
+    from .encoder.pmx_joints import parent_joint_pair, parent_joint_pairs
     arms=_resolve_armatures(scene,receipt,current=current)
     # Resolve once within this read-only call. No RNA reference survives the
     # call, so Edit-mode rebuilds/Undo and later author changes still revalidate.
     by_arm = {}
+    pmx_pairs_by_arm = {}
     for uid, arm in arms.items():
         by_uuid = {}
         for pb in arm.pose.bones:
             by_uuid.setdefault(pb.bone.ppf_bone_physics.bone_uuid, []).append(pb)
         by_arm[uid] = by_uuid
+        if current:
+            pmx_pairs_by_arm[uid] = parent_joint_pairs(arm)
     checked_transforms = set()
     targets = []
     for row in receipt["bindings"]:
@@ -306,11 +310,13 @@ def _targets(scene, receipt, *, current=True):
         if len(bones) != 1 or (current and (not bones[0].bone.ppf_bone_physics.enabled or bones[0].bone.ppf_bone_physics.body_uuid != row["body_uuid"])):
             raise ValueError("bone pose: author binding changed; transfer again")
         pb = bones[0]
-        has_physical_parent = (pb.bone.ppf_bone_physics.use_hierarchy_joint and pb.parent is not None
-                               and pb.parent.bone.ppf_bone_physics.enabled)
-        parent = pb.parent.bone.ppf_bone_physics.bone_uuid if has_physical_parent else None
-        if current and parent != row.get("parent_bone_uuid"):
-            raise ValueError("bone pose: parent binding changed")
+        if current:
+            has_physical_parent = (pb.bone.ppf_bone_physics.use_hierarchy_joint and pb.parent is not None
+                                   and pb.parent.bone.ppf_bone_physics.enabled
+                                   and parent_joint_pair(pb.bone, pmx_pairs_by_arm[row["armature_uuid"]]) is None)
+            parent = pb.parent.bone.ppf_bone_physics.bone_uuid if has_physical_parent else None
+            if parent != row.get("parent_bone_uuid"):
+                raise ValueError("bone pose: parent binding changed")
         if current and any(c.mute is False for c in pb.constraints):
             raise ValueError(f"{pb.name}: disable pose constraints before applying physical frames")
         if current:
@@ -1098,6 +1104,7 @@ def _fem_parent_anchor_target(target, material_tail, parent_matrix, parent_rest_
 
 
 def _authored_flags(scene, targets, index=None):
+    from .encoder.pmx_joints import parent_joint_pair, parent_joint_pairs
     records = _connect_records(scene)
     legacy = (index or {}).get(CONNECT_KEY) or {}
     flags = {}
@@ -1105,7 +1112,8 @@ def _authored_flags(scene, targets, index=None):
         record = (records.get(_armature_key(arm)) or {}).get(row['bone_uuid'])
         connected = _author_connection(records, legacy, arm, row, pb)
         connected = bool(pb.bone.use_connect) if connected is None else connected
-        connected = bool(connected and pb.bone.ppf_bone_physics.use_hierarchy_joint)
+        connected = bool(connected and pb.bone.ppf_bone_physics.use_hierarchy_joint
+                         and parent_joint_pair(pb.bone, parent_joint_pairs(arm)) is None)
         if (connected and (not isinstance(record, dict) or 'inherit_scale' not in record)
                 and scene.get(CACHE_KEY) and pb.bone.inherit_scale == 'NONE'):
             raise ValueError('connected bone pose: legacy author inherit_scale is unknown: '+pb.name)
