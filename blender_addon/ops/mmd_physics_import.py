@@ -198,6 +198,8 @@ def _plan(context, helpers=None):
             bodies[name] = obj
         elif typ == 'JOINT' and obj.rigid_body_constraint:
             joints.append(obj)
+    joint_endpoints = {endpoint for j in joints for endpoint in
+                       (j.rigid_body_constraint.object1, j.rigid_body_constraint.object2) if endpoint is not None}
     missing = original_names - bodies.keys()
     bones = [b for b in bones if b.name in bodies]
     if not bones:
@@ -223,7 +225,8 @@ def _plan(context, helpers=None):
         typ = str(rigid.type)
         if typ not in {'0', '1', '2'}:
             raise ValueError('Unknown MMD body type: ' + obj.name)
-        settings = dict(shape='CUSTOM', custom_object=obj, physical_model='RIGID', new_binding_physical_model='RIGID', auto_follow_parent=False, use_hierarchy_joint=False,
+        isolated_dynamic = typ in {'1', '2'} and bone.parent is not None and obj not in joint_endpoints
+        settings = dict(shape='CUSTOM', custom_object=obj, physical_model='RIGID', new_binding_physical_model='RIGID', auto_follow_parent=isolated_dynamic, use_hierarchy_joint=isolated_dynamic,
             root_mode='KINEMATIC' if typ == '0' else 'FREE', root_motion_source='POSE',
             collision_filter_enabled=True,
             collision_group_layers=tuple(i == group for i in range(16)),
@@ -506,3 +509,4 @@ def register():
 
 def unregister():
     bpy.utils.unregister_class(PPF_OT_ImportMMDPhysics)
+

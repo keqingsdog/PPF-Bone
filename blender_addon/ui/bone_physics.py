@@ -705,7 +705,8 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
         """Basic movement controls plus explicit removal of saved invalid events."""
         physical_parent=bool(s.use_hierarchy_joint and bone.parent and bone.parent.ppf_bone_physics.enabled)
         follows_parent=bool(s.use_hierarchy_joint and bone.parent and not physical_parent and s.auto_follow_parent)
-        if bone.parent:
+        from ..core.bone_selection_parameters import resolve_selected_authors
+        if bone.parent or any(selected.parent for _arm,selected in resolve_selected_authors(bpy.context)):
             control.prop(s, 'use_hierarchy_joint', text='连接父骨物理')
         if s.use_hierarchy_joint and bone.parent and not physical_parent:
             control.prop(s,'auto_follow_parent',text='跟随父骨骼')

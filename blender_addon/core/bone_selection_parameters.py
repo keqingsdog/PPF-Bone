@@ -3,6 +3,7 @@ from ..i18n import props as _ppf_props
 from .. import i18n as _ppf_i18n
 import bpy
 import math
+import json
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
@@ -16,7 +17,7 @@ FIELDS=('collide_connected','collision_filter_enabled','collision_group_layers',
     'shape','proxy_quality','new_proxy_quality','proxy_face_mode','radius','length_ratio','box_width','box_depth',
     'new_binding_physical_model','mass_mode','target_mass_kg','density','material_preset',
     'solid_model','solid_young_modulus','solid_young_mpa','solid_poisson_ratio','solid_deformation_damping',
-    'auto_follow_parent','root_mode','root_motion_source','anchor_stiffness','angular_stiffness','angular_damping',
+    'use_hierarchy_joint','auto_follow_parent','root_mode','root_motion_source','anchor_stiffness','angular_stiffness','angular_damping',
     'soft_limits_enabled','soft_lower','soft_upper','soft_stiffness','soft_stiffness_degree',
     'soft_limit_mode','swing_cone_half_angle','swing_cone_stiffness','swing_cone_stiffness_degree',
     'soft_limit_policy','soft_limit_strength','preview_color_custom','preview_color')
@@ -248,6 +249,17 @@ def set_selected_parameter(context,field,value,*,assign=None,_indices=None):
             target_value=_plain(getattr(owner,field))
             for index in _indices:target_value[index]=value[index]
         _validate_rna(owner,field,target_value)
+        if field=='use_hierarchy_joint' and target_value and bone.parent:
+            parent=bone.parent.ppf_bone_physics
+            if parent.enabled and parent.physical_model=='SOFT' and settings.joint_mode!='SOFT':
+                raise ValueError(bone.name+'：软体父级仅支持柔性关节')
+            if not parent.enabled and settings.auto_follow_parent and (settings.root_mode!='FREE' or len(settings.root_control_events)):
+                raise ValueError(bone.name+'：跟随非物理父骨时不能使用根控制或释放事件')
+            if parent.enabled and settings.body_uuid and parent.body_uuid:
+                pair={settings.body_uuid,parent.body_uuid}
+                for joint in json.loads(arm.get('ppf_mmd_joints_v1','[]')):
+                    if {joint.get('body_a_uuid'),joint.get('body_b_uuid')}==pair:
+                        raise ValueError(bone.name+'：父子骨骼已有 MMD 关节，请先处理重复关节')
         keys={field,'auto_geometry_snapshot_json','recreate_geometry_intent_json'} if owner==settings else {field}
         if field in MATERIAL: keys.update(MATERIAL - {'solid_young_mpa'})
         if field=='soft_stiffness_degree':keys.add('soft_stiffness')
@@ -286,7 +298,7 @@ def set_selected_parameter(context,field,value,*,assign=None,_indices=None):
                         bindings.apply_solid_material_patch(settings,{key: _target_value * 1e6 if field=='solid_young_mpa' else _target_value})
                     elif field in DIMENSIONS:bindings._cancel_recreate_geometry_intent(settings,context)
                     elif field in {'mass_mode','target_mass_kg'}:mark_settings(settings,context)
-                    if field in {'root_mode','root_motion_source','auto_follow_parent'}:
+                    if field in {'root_mode','root_motion_source','auto_follow_parent','use_hierarchy_joint'}:
                         check_soft_supported(settings,bone.name,has_physical_joint_parent(bone))
             except Exception:
                 with material_write_guard():
@@ -307,6 +319,11 @@ def set_selected_parameter(context,field,value,*,assign=None,_indices=None):
 def _get(field,definition):
     def getter(_self):
         owner=_value_owner(bpy.context,field)
+        if field=='use_hierarchy_joint':
+            active=active_author(bpy.context)
+            if active is not None and active[1].parent is None:
+                eligible=next((bone for _arm,bone in resolve_selected_authors(bpy.context) if bone.parent),None)
+                if eligible is not None:owner=eligible.ppf_bone_physics
         if owner is None:
             value=definition.keywords.get('default',tuple(0. for _ in range(definition.keywords['size'])) if 'size' in definition.keywords else 0.)
         else:
