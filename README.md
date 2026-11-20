@@ -10,8 +10,8 @@ PPF-Bone 是由 keqingsdog 维护的独立骨骼物理分支与发行版。它�
 
 ### 安装和使用
 
-1. 从 [v1.0.36 Release](https://github.com/keqingsdog/PPF-Bone/releases/tag/v1.0.36) 下载并解压 `PPF_Bone_Windows_x64.zip`。完整求解器包包含 Python、CPU 和 CUDA 构建。
-2. 在 Blender 中通过“从磁盘安装”选择 `PPF_Bone_Blender_4.2-5.1.zip`，然后在插件设置中将求解器路径指向解压后的文件夹。统一安装包支持 Blender 4.2–5.1。
+1. 从 [最新发布](https://github.com/keqingsdog/PPF-Bone/releases/latest) 下载并解压 `PPF_Bone_Windows_x64.zip`。完整求解器包包含 Python、CPU 和 CUDA 构建。
+2. 在 Blender 中通过“从磁盘安装”选择 `PPF_Bone_Blender_4.2-5.1.zip`，然后在插件设置中将求解器路径指向解压后的文件夹。统一安装包支持 Blender 4.2–5.1。插件版本以 ZIP 内的 `blender_manifest.toml` 为准，可能与 Release 的 Git 标签不同。
 3. 配置骨骼代理和连接，传输场景并运行模拟，再获取结果和烘焙动画。
 
 本分支发布的预编译求解器仅支持 Windows x64，目前没有 Linux 或 macOS 的预编译求解器。
@@ -24,8 +24,8 @@ In Blender, create rigid or soft proxies for individual bones, connect bone chai
 
 ### Installation and use
 
-1. Download and extract `PPF_Bone_Windows_x64.zip` from the [v1.0.36 Release](https://github.com/keqingsdog/PPF-Bone/releases/tag/v1.0.36). The complete solver package includes Python and CPU and CUDA builds.
-2. In Blender, use Install from Disk to select `PPF_Bone_Blender_4.2-5.1.zip`, then point the solver path in the add-on settings to the extracted folder. The unified installer supports Blender 4.2–5.1.
+1. Download and extract `PPF_Bone_Windows_x64.zip` from the [latest release](https://github.com/keqingsdog/PPF-Bone/releases/latest). The complete solver package includes Python and CPU and CUDA builds.
+2. In Blender, use Install from Disk to select `PPF_Bone_Blender_4.2-5.1.zip`, then point the solver path in the add-on settings to the extracted folder. The unified installer supports Blender 4.2–5.1. Check `blender_manifest.toml` in the ZIP for the add-on version, which may differ from the release's Git tag.
 3. Configure bone proxies and connections, transfer the scene and run the simulation, then fetch the results and bake animation.
 
 Prebuilt solver releases from this fork support Windows x64 only. No prebuilt Linux or macOS solver is provided by this fork.
