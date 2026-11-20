@@ -97,12 +97,11 @@ def _action_curves(action, slot=None):
                     yield from bag.fcurves
 
 
-def _validate_static_pose_scales(context, state, start_frame, *, explicit_only=False):
-    """Scale is frozen geometry, never an unencoded animation channel.
+def _pose_scale_sources(context, *, explicit_only=False):
+    """Collect the frozen scale references needed by the frame sampler.
 
     Check FREE and STATIC bodies too, including ancestors that are not physical.
     Explicit scale curves/drivers fail before sampling, including subframe curves.
-    Other evaluated dependencies are checked at the actual encoded frame times.
     """
     from ...models.bone_bindings import bone_world_frame_scale
     sources = {}
@@ -145,26 +144,42 @@ def _validate_static_pose_scales(context, state, start_frame, *, explicit_only=F
             continue
         for name in names:
             sources[(arm.name, name)] = (arm, arm.data.bones[name], bone_world_frame_scale(arm, arm.data.bones[name])[1])
-    if explicit_only or not sample_needed:
+    return sources.values() if sample_needed and not explicit_only else ()
+
+
+def _validate_pose_scales_at_frame(sources, frame):
+    from ...models.bone_bindings import bone_world_frame_scale
+    for arm, bone, initial in sources:
+        scale = bone_world_frame_scale(arm, bone)[1]
+        if abs(scale / initial - 1.) > 1.e-5:
+            raise ValueError(f'{bone.name}: animated pose scale is unsupported; frozen author scale changed at frame {frame}')
+
+
+def _validate_static_pose_scales(context, state, start_frame, *, explicit_only=False):
+    from ...models.bone_bindings import bone_frame_cache
+    sources = _pose_scale_sources(context, explicit_only=explicit_only)
+    if not sources:
         return
+    from ..frame_time import set_scene_frame
     scene = context.scene
     previous, subframe = scene.frame_current, scene.frame_subframe
     try:
         for offset in range(int(state.frame_count)):
-            scene.frame_set(start_frame + offset)
+            frame = start_frame + offset
+            scene.frame_set(frame)
             context.view_layer.update()
-            for arm, bone, initial in sources.values():
-                scale = bone_world_frame_scale(arm, bone)[1]
-                if abs(scale / initial - 1.) > 1.e-5:
-                    raise ValueError(f'{bone.name}: animated pose scale is unsupported; frozen author scale changed at frame {start_frame + offset}')
+            with bone_frame_cache():
+                _validate_pose_scales_at_frame(sources, frame)
     finally:
-        scene.frame_set(previous, subframe=subframe)
+        set_scene_frame(scene, previous, subframe)
         context.view_layer.update()
 
 
 def encode_bones(context, state, fps, start_frame):
     """Capture authoring at start and root motion at the original frame times."""
-    from ...models.bone_bindings import collect_bindings, collect_body_controls_contract, bone_world_matrix
+    from ...models.bone_bindings import (
+        bone_frame_cache, bone_world_matrix, collect_bindings, collect_body_controls_contract,
+    )
     from .automatic_parent_anchors import prepare_parent_track, sample_parent_track, finish_parent_track
     source = collect_bindings(context)
     from ..cross_links import encode as encode_cross_links, collision_pairs
@@ -172,7 +187,7 @@ def encode_bones(context, state, fps, start_frame):
     cross_collision_pairs = collision_pairs(context, source['bindings'])
     if not source["bindings"]:
         return None
-    _validate_static_pose_scales(context, state, start_frame)
+    scale_sources = _pose_scale_sources(context)
     if source.get("schema") != SCHEMA or source.get("coordinate_space") != "BLENDER_Z_UP":
         raise ValueError("BLENDER_BONE_INVALID: unsupported authoring schema/coordinates")
     if source.get("scene_unit_scale_m", 1.) != 1.:
@@ -251,36 +266,41 @@ def encode_bones(context, state, fps, start_frame):
         if result.get('body_controls_v1'):
             row['root_motion_source'] = source_mode
         roots.append((arm, bone.name, row, root, source_mode))
-    if roots or sampled_auto_anchors:
+    # Frozen scale and motion both use the evaluated pose at the same frame.
+    if scale_sources or roots or sampled_auto_anchors:
         if sampled_auto_anchors and int(state.frame_count) < 2:
             raise ValueError("BLENDER_BONE_INVALID: automatic parent follow requires at least two sampled frames")
+        from ..frame_time import set_scene_frame
         scene = context.scene
         previous, subframe = scene.frame_current, scene.frame_subframe
         try:
             for offset in range(int(state.frame_count)):
-                scene.frame_set(start_frame + offset)
+                sample_frame = start_frame + offset
+                scene.frame_set(sample_frame)
                 context.view_layer.update()
-                for request in sampled_auto_anchors.values():
-                    sample_parent_track(request, offset, fps,
-                                        request['anchors'][0]['parent_world_matrix_blender'])
-                for arm, bone_name, row, root, source_mode in roots:
-                    if root["mode"] == "static" and offset > 0 and not root.get("control_events"):
-                        continue
-                    if source_mode == "POSE":
-                        world = bone_world_matrix(arm, arm.data.bones[bone_name])
-                    else:
-                        proxy = arm.data.bones[bone_name].ppf_bone_physics.proxy
-                        if proxy is None:
-                            raise ValueError("BLENDER_BONE_INVALID: missing root proxy motion source")
-                        world = proxy.matrix_world
-                    frame = _frame(world, f"root {bone_name} frame {start_frame + offset}")
-                    if offset == 0:
-                        frame = root["initial_frame"]
-                    root["keys"].append({"time_s": offset / float(fps),
-                                          "center_world_m": frame["translation_m"],
-                                          "rotation_world_wxyz": frame["quaternion_wxyz"]})
+                with bone_frame_cache():
+                    _validate_pose_scales_at_frame(scale_sources, sample_frame)
+                    for request in sampled_auto_anchors.values():
+                        sample_parent_track(request, offset, fps,
+                                            request['anchors'][0]['parent_world_matrix_blender'])
+                    for arm, bone_name, row, root, source_mode in roots:
+                        if root["mode"] == "static" and offset > 0 and not root.get("control_events"):
+                            continue
+                        if source_mode == "POSE":
+                            world = bone_world_matrix(arm, arm.data.bones[bone_name])
+                        else:
+                            proxy = arm.data.bones[bone_name].ppf_bone_physics.proxy
+                            if proxy is None:
+                                raise ValueError("BLENDER_BONE_INVALID: missing root proxy motion source")
+                            world = proxy.matrix_world
+                        frame = _frame(world, f"root {bone_name} frame {sample_frame}")
+                        if offset == 0:
+                            frame = root["initial_frame"]
+                        root["keys"].append({"time_s": offset / float(fps),
+                                              "center_world_m": frame["translation_m"],
+                                              "rotation_world_wxyz": frame["quaternion_wxyz"]})
         finally:
-            scene.frame_set(previous, subframe=subframe)
+            set_scene_frame(scene, previous, subframe)
             context.view_layer.update()
     for request in sampled_auto_anchors.values():
         key, value = finish_parent_track(request, request['anchors'][0]['parent_world_matrix_blender'])

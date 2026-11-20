@@ -15,6 +15,8 @@ choice to the original Bone Physics authoring data.
 from .. import i18n as _ppf_i18n
 import math
 import uuid
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 import bpy
 from ..i18n import pgettext_iface as iface
@@ -615,6 +617,34 @@ def similarity_frame_scale(matrix, name):
     return rigid_matrix(frame, name), scale
 
 
+_bone_frame_cache = ContextVar('ppf_bone_frame_cache', default=None)
+
+
+@contextmanager
+def bone_frame_cache():
+    """Cache only while the caller guarantees an unchanged evaluation frame."""
+    token = _bone_frame_cache.set({'rest': {}, 'frame': {}})
+    try:
+        yield
+    finally:
+        _bone_frame_cache.reset(token)
+
+
+def _bone_key(bone):
+    pointer = getattr(bone, 'as_pointer', None)
+    return pointer() if callable(pointer) else id(bone)
+
+
+def _cached_rest_frame(bone):
+    cache = _bone_frame_cache.get()
+    if cache is None:
+        return _rest_frame_for_drift(bone.matrix_local)
+    key = _bone_key(bone)
+    if key not in cache['rest']:
+        cache['rest'][key] = _rest_frame_for_drift(bone.matrix_local)
+    return cache['rest'][key]
+
+
 def _rest_frame_for_drift(rest):
     """Admit only the existing narrow finite, near-rigid rest envelope."""
     if (not all(math.isfinite(v) for row in rest for v in row)
@@ -644,7 +674,7 @@ def _animated_rest_drift_frame(armature, bone):
         if current.name in seen:
             return None
         seen.add(current.name)
-        info = _rest_frame_for_drift(current.matrix_local)
+        info = _cached_rest_frame(current)
         if info is None:
             return None
         chain.append((current, info[0], info[1]))
@@ -697,6 +727,11 @@ def _animated_rest_drift_frame(armature, bone):
 
 def bone_world_frame_scale(armature, bone):
     """Return a rigid world head frame and frozen total object/pose scale."""
+    cache = _bone_frame_cache.get()
+    key = (_bone_key(armature), _bone_key(bone))
+    if cache is not None and key in cache['frame']:
+        frame, scale = cache['frame'][key]
+        return frame.copy(), scale
     world, object_scale = similarity_frame_scale(armature.matrix_world, armature.name)
     pose = armature.pose.bones[bone.name].matrix
     rest = bone.matrix_local
@@ -709,7 +744,7 @@ def bone_world_frame_scale(armature, bone):
     repaired = _animated_rest_drift_frame(armature, bone)
     if repaired is not None:
         pose_frame, pose_scale = repaired
-    elif (same_rest_orientation and _rest_frame_for_drift(rest) is not None
+    elif (same_rest_orientation and _cached_rest_frame(bone) is not None
             and all(math.isfinite(v) for row in pose for v in row)
             and all(abs(pose[3][j] - (1. if j == 3 else 0.)) <= 1.e-7 for j in range(4))
             and math.isfinite(gram_error) and gram_error <= 1.e-4
@@ -722,7 +757,10 @@ def bone_world_frame_scale(armature, bone):
     rotation = (world.to_quaternion() @ pose_frame.to_quaternion()).normalized()
     frame = rotation.to_matrix().to_4x4()
     frame.translation = armature.matrix_world @ pose.translation
-    return rigid_matrix(frame, bone.name), object_scale * pose_scale
+    result = rigid_matrix(frame, bone.name), object_scale * pose_scale
+    if cache is not None:
+        cache['frame'][key] = (result[0].copy(), result[1])
+    return result
 
 
 def bone_world_matrix(armature, bone):
