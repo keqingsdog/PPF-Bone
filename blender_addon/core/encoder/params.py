@@ -1093,7 +1093,7 @@ def sand_scene_radius_conflict(scene, groups=None):
     return rows if len({float(np.float32(radius)) for _name, radius in rows}) > 1 else None
 
 
-def _build_param_dict(context) -> dict:
+def _build_param_dict(context, *, pre_mmd_default=None) -> dict:
     """Assemble the parameter dict that ``encode_param`` serializes.
 
     Factored out so ``compute_param_hash`` and ``encode_param_with_hash``
@@ -1158,14 +1158,18 @@ def _build_param_dict(context) -> dict:
         cross_stitch = _encode_cross_stitch(context, groups, ordered_pair_ids)
         from .bones import encode_bones
         cone_restoring_joint_ids = set()
+        mmd_automatic_channels = []
         bone_data = encode_bones(context, state, fps, start_frame,
-                                 cone_restoring_joint_ids=cone_restoring_joint_ids)
+                                 cone_restoring_joint_ids=cone_restoring_joint_ids,
+                                 mmd_automatic_channels=mmd_automatic_channels)
         joint_curve_owners = _active_restoring_joint_owners(bone_data)
         from ...models.restoring_curves import export_scene
         restoring_curves = export_scene(
             scene, ordered_pair_ids=ordered_pair_ids,
             active_joint_ids=joint_curve_owners,
             cone_restoring_joint_ids=cone_restoring_joint_ids,
+            mmd_automatic_channels=mmd_automatic_channels,
+            pre_mmd_default=pre_mmd_default,
         )
         # Scene settings the artist keyframed, sampled from their own
         # F-curves. This is the authoring path; `_encode_dyn_params` reads the

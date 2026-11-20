@@ -175,12 +175,14 @@ def _validate_static_pose_scales(context, state, start_frame, *, explicit_only=F
         context.view_layer.update()
 
 
-def encode_bones(context, state, fps, start_frame, *, cone_restoring_joint_ids=None):
+def encode_bones(context, state, fps, start_frame, *, cone_restoring_joint_ids=None,
+                 mmd_automatic_channels=None):
     """Capture authoring at start and root motion at the original frame times."""
     from ...models.bone_bindings import (
         bone_frame_cache, bone_world_matrix, collect_bindings, collect_body_controls_contract,
     )
     from .automatic_parent_anchors import prepare_parent_track, sample_parent_track, finish_parent_track
+    from ...models.restoring_curves import mmd_automatic_angular_channels
     source = collect_bindings(context)
     from ..cross_links import encode as encode_cross_links, collision_pairs
     cross_links = encode_cross_links(context, source['bindings'])
@@ -239,6 +241,9 @@ def encode_bones(context, state, fps, start_frame, *, cone_restoring_joint_ids=N
         if (cone_restoring_joint_ids is not None and has_joint
                 and settings.angular_restoring_mode == 'CONE'):
             cone_restoring_joint_ids.add(row['joint_uuid'])
+        if mmd_automatic_channels is not None and has_joint:
+            mmd_automatic_channels.extend((row['joint_uuid'], channel)
+                                          for channel in mmd_automatic_angular_channels(settings))
         drives = _drives(settings, start_frame, fps) if has_joint else None
         if drives:
             if any('angular_hard_hinge_v1' in r['physics'] or 'joint_d6_hard_v1' in r['physics'] for r in result['bindings']):

@@ -198,8 +198,6 @@ def _plan(context, helpers=None):
             bodies[name] = obj
         elif typ == 'JOINT' and obj.rigid_body_constraint:
             joints.append(obj)
-    joint_endpoints = {endpoint for j in joints for endpoint in
-                       (j.rigid_body_constraint.object1, j.rigid_body_constraint.object2) if endpoint is not None}
     missing = original_names - bodies.keys()
     bones = [b for b in bones if b.name in bodies]
     if not bones:
@@ -212,7 +210,6 @@ def _plan(context, helpers=None):
                 raise ValueError('Existing PPF proxy conflicts with MMD body: ' + bone.name)
             existing.append(bone.name)
     bones = [b for b in bones if b.name not in existing]
-    new_names = {b.name for b in bones}
     by_obj = {obj: name for name, obj in bodies.items()}
     rows = {}
     deps = context.evaluated_depsgraph_get()
@@ -227,8 +224,8 @@ def _plan(context, helpers=None):
             raise ValueError('Unknown MMD body type: ' + obj.name)
         # Imported PMX parent connections are enabled through pmx_parent_joint_enabled.
         # Keep the generated PPF fallback restricted to isolated dynamic bodies.
-        isolated_dynamic = typ in {'1', '2'} and bone.parent is not None and obj not in joint_endpoints
-        settings = dict(shape='CUSTOM', custom_object=obj, physical_model='RIGID', new_binding_physical_model='RIGID', auto_follow_parent=isolated_dynamic, use_hierarchy_joint=isolated_dynamic,
+        follow_parent = typ in {'1', '2'} and bone.parent is not None
+        settings = dict(shape='CUSTOM', custom_object=obj, physical_model='RIGID', new_binding_physical_model='RIGID', auto_follow_parent=follow_parent, use_hierarchy_joint=True,
             root_mode='KINEMATIC' if typ == '0' else 'FREE', root_motion_source='POSE',
             collision_filter_enabled=True,
             collision_group_layers=tuple(i == group for i in range(16)),
@@ -239,7 +236,7 @@ def _plan(context, helpers=None):
         if not _body_follows_bone(obj, arm, source_bone):
             world = _pose_delta(arm, source_bone, deps) @ world
         rows[bone.name] = {'settings': settings, 'geometry': _geometry(deps, obj, world),
-                           'source': obj.name, 'hybrid': typ == '2'}
+                           'source': obj.name, 'hybrid': typ == '2', 'joints': joints}
     plans = []
     for joint in joints:
         c = joint.rigid_body_constraint
@@ -268,6 +265,54 @@ def _plan(context, helpers=None):
     return arm, bones, rows, plans, len(existing), len(missing)
 
 
+def _parent_default_snapshot(context, settings):
+    from ..core.bone_preset_apply import _read, _capture_curves
+    from .restoring_curve_operators import snapshot_rna
+    fields = (
+        'anchor_stiffness', 'angular_stiffness', 'angular_damping', 'soft_limits_enabled',
+        'soft_lower', 'soft_upper', 'soft_stiffness', 'soft_limit_mode', 'swing_cone_half_angle',
+        'swing_cone_stiffness', 'soft_limit_policy', 'soft_limit_frequency_hz', 'soft_limit_strength',
+        'collide_connected', 'auto_follow_parent', 'joint_mode', 'hinge_twist_mode', 'hinge_lower',
+        'hinge_upper', 'use_auto_frames', 'joint_axis_euler', 'angular_restoring_mode',
+        'swing_restoring_stiffness', 'swing_restoring_damping')
+    fields += ('parent_frame_translation', 'parent_frame_quaternion', 'child_frame_translation', 'child_frame_quaternion')
+    groups = ('drive_twist_x', 'drive_swing_y', 'drive_swing_z', 'd6_translation_x',
+              'd6_translation_y', 'd6_translation_z', 'd6_rotation_x', 'd6_rotation_y', 'd6_rotation_z')
+    curves = _capture_curves(context.scene, settings.joint_uuid)
+    if not any(curves['channels'].values()):
+        curves = None
+    return json.dumps({'fields': _read(settings, fields),
+                       'groups': {k: snapshot_rna(getattr(settings, k)) for k in groups},
+                       'curves': curves}, sort_keys=True)
+
+
+def _mark_parent_defaults(context, arm, bones, rows):
+    for bone in bones:
+        if bone.parent is None:
+            continue
+        source = rows[bone.name]['settings']['custom_object']
+        direct = []
+        for joint in rows[bone.name]['joints']:
+            c = getattr(joint, 'rigid_body_constraint', None)
+            if getattr(joint, 'mmd_type', '') != 'JOINT' or c is None:
+                continue
+            other = c.object2 if c.object1 == source else c.object1 if c.object2 == source else None
+            if other and getattr(other, 'mmd_type', '') == 'RIGID_BODY' and other.mmd_rigid.bone == bone.parent.name:
+                direct.append(joint)
+        if direct:
+            proxy = bone.ppf_bone_physics.proxy
+            proxy['ppf_mmd_pending_parent_sources'] = {str(i): j for i, j in enumerate(direct)}
+            proxy['ppf_mmd_pending_parent_snapshot'] = _parent_default_snapshot(context, bone.ppf_bone_physics)
+
+
+def _pending_parent_source(bone, joint):
+    proxy = bone.ppf_bone_physics.proxy
+    if not proxy:
+        return False
+    sources = proxy.get('ppf_mmd_pending_parent_sources')
+    return bool(sources and joint in sources.values())
+
+
 def _apply(context, arm, bones, rows, plans):
     from ..core import cross_links
     stored = json.loads(arm.get('ppf_mmd_joints_v1', '[]'))
@@ -275,6 +320,7 @@ def _apply(context, arm, bones, rows, plans):
     source_ids = {obj: key for key, obj in sources.items() if obj is not None}
     indices = {r['joint_uuid']: i for i, r in enumerate(stored)}
     additions = []
+    disable_parent = []
     migrated_pairs = set()
     old_links = cross_links._records(arm)
     for _kind, joint, a, b, child_name, frames in plans:
@@ -285,8 +331,13 @@ def _apply(context, arm, bones, rows, plans):
         if joint_id in indices:
             stored[indices[joint_id]] = record
             continue
-        if child_name and arm.data.bones[child_name].ppf_bone_physics.use_hierarchy_joint:
+        child = arm.data.bones[child_name] if child_name else None
+        pending = bool(child and _pending_parent_source(child, joint))
+        unchanged = bool(pending and child.ppf_bone_physics.proxy.get('ppf_mmd_pending_parent_snapshot') == _parent_default_snapshot(context, child.ppf_bone_physics))
+        if child and child_name not in {bone.name for bone in bones} and child.ppf_bone_physics.use_hierarchy_joint and not unchanged:
             raise ValueError('骨骼“' + child_name + '”已有层级关节，无法判断是否包含手工修改。请先备份场景；如需保留修改，请保留旧设置并暂不导入该关节；如需按 MMD 原关节重建，请在 PPF 骨骼物理中关闭该骨骼的层级关节后重新导入。')
+        if pending and not child.ppf_bone_physics.use_hierarchy_joint:
+            disable_parent.append(child.ppf_bone_physics)
         migrated_pairs.add(frozenset(pair))
         additions.append(record)
         sources[record['joint_uuid']] = joint
@@ -299,12 +350,18 @@ def _apply(context, arm, bones, rows, plans):
                 frozenset((r['bone_a_uuid'], r['bone_b_uuid'])) in migrated_pairs)]
     old_joint_json = arm.get('ppf_mmd_joints_v1')
     old_sources = dict(arm.get('ppf_mmd_joint_sources_v1', {}).items())
+    old_parent = [(s, s.pmx_parent_joint_enabled, s.is_property_set('pmx_parent_joint_enabled')) for s in disable_parent]
     try:
+        for settings, _, _ in old_parent:
+            settings.pmx_parent_joint_enabled = False
         if len(retained) != len(old_links):
             cross_links._replace(arm, retained)
         arm['ppf_mmd_joints_v1'] = json.dumps(stored + additions, ensure_ascii=False)
         arm['ppf_mmd_joint_sources_v1'] = sources
     except Exception:
+        for settings, value, was_set in old_parent:
+            if was_set: settings.pmx_parent_joint_enabled = value
+            else: settings.property_unset('pmx_parent_joint_enabled')
         if old_joint_json is None:
             if 'ppf_mmd_joints_v1' in arm: del arm['ppf_mmd_joints_v1']
         else:
@@ -469,6 +526,7 @@ class PPF_OT_ImportMMDPhysics(bpy.types.Operator):
                 settings['target_mass_kg'] *= self.mass_multiplier
         result = {}
         def after_apply(a, bs):
+            _mark_parent_defaults(context, a, bs, rows)
             result.update(_apply(context, a, bs, rows, plans))
         authoring = {name: {'settings': row['settings'], 'geometry': row['geometry']} for name, row in rows.items()}
         from ..core import cross_links

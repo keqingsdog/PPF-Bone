@@ -2,10 +2,9 @@
 import copy
 import hashlib
 from ..models import restoring_curves as curves
+from ..models.restoring_curves import COMMON_ANGULAR_FREQUENCY_HZ, COMMON_DAMPING_RATIO
 
 COMMON_FREQUENCY_HZ = 10.0
-COMMON_ANGULAR_FREQUENCY_HZ = 1.0
-COMMON_DAMPING_RATIO = .7
 
 
 def _commit(state, mode, document):

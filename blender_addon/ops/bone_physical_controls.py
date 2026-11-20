@@ -14,7 +14,19 @@ _refresh_key=None
 def _author_key(context,bone):
     s=bone.ppf_bone_physics;author=context.scene.ppf_restoring_curves
     return (context.scene.as_pointer(),bone.as_pointer(),s.bone_uuid,s.joint_uuid,
-            author.mode,author.document_json,tuple(s.angular_stiffness),tuple(s.angular_damping),s.anchor_stiffness)
+            author.mode,author.document_json,tuple(s.angular_stiffness),tuple(s.angular_damping),
+            s.anchor_stiffness,s.angular_restoring_mode,curves.mmd_automatic_angular_channels(s))
+
+
+def _mmd_auto_channels(context, bone, state):
+    if state['mode']=='LEGACY' and state['document'] is not None:
+        return ()
+    channels=curves.mmd_automatic_angular_channels(bone.ppf_bone_physics)
+    if not channels:
+        return ()
+    from ..models.bone_bindings import active_armature, has_physical_joint_parent
+    arm=active_armature(context)
+    return channels if arm is not None and has_physical_joint_parent(bone, arm=arm) else ()
 
 
 def refresh(context,bone):
@@ -23,9 +35,15 @@ def refresh(context,bone):
     try:
         owner,state=_initialize(context,bone)
         s=bone.ppf_bone_physics; available=[]; labels=[]; custom=[]
+        auto_channels=_mmd_auto_channels(context, bone, state)
         for index,channel in enumerate(CHANNELS):
             saved=_channel_state(state,s.joint_uuid,channel);value=None
-            if state['mode']=='LEGACY' or saved is None or not saved['binding']['enabled']:
+            if saved is None and channel in auto_channels:
+                from ..core.bone_physical_units import display_auto_value
+                value=display_auto_value(context,s.joint_uuid,channel,
+                                         curves.mmd_automatic_angular_curve(s.joint_uuid, channel))
+                label='当前构建自动值' if value is not None else '按惯量自动适配；待构建计算'
+            elif state['mode']=='LEGACY' or saved is None or not saved['binding']['enabled']:
                 value=(s.anchor_stiffness,0.) if channel=='anchor' else (s.angular_stiffness[index],s.angular_damping[index])
                 label='固定 SI（旧线性）'
             elif saved['binding']['mode']=='ABSOLUTE_SI':
@@ -61,7 +79,8 @@ def refresh_active():
         if not s.enabled or not s.proxy or s.joint_mode in {'HINGE','D6'} or not _joint_parent_status(bone, arm)[0]:
             _refresh_key=None;return .3
         from ..core.bone_physical_units import display_build_key
-        key=(_author_key(context,bone),display_build_key(context))
+        from ..models.bone_bindings import has_physical_joint_parent
+        key=(_author_key(context,bone),display_build_key(context),has_physical_joint_parent(bone, arm=arm))
         if key!=_refresh_key:
             refresh(context,bone);_refresh_key=key
     except (ValueError,RuntimeError,ReferenceError,AttributeError,KeyError,TypeError):
@@ -230,11 +249,15 @@ def load(context,bone):
 
 def _load(context,bone):
     owner,state=_initialize(context,bone);s=bone.ppf_bone_physics
-    last=None;source=None;sources={};attempted=False;available=[];has_auto=False;has_custom=False;used_build=False;pending_auto=False
+    last=None;snapshot=None;source=None;sources={};attempted=False;available=[];has_auto=False;has_custom=False;used_build=False;pending_auto=False
+    auto_channels=_mmd_auto_channels(context, bone, state)
     for index,channel in enumerate(CHANNELS):
         saved=_channel_state(state,s.joint_uuid,channel)
         value=None
-        if state['mode']=='LEGACY' or saved is None or not saved['binding']['enabled']:
+        implicit=saved is None and channel in auto_channels
+        if implicit:
+            saved=curves.mmd_automatic_angular_curve(s.joint_uuid, channel)
+        if not implicit and (state['mode']=='LEGACY' or saved is None or not saved['binding']['enabled']):
             value=(s.anchor_stiffness,0.) if channel=='anchor' else (s.angular_stiffness[index],s.angular_damping[index])
         elif saved['binding']['mode']=='ABSOLUTE_SI':
             value=linear_constants(saved['table'],saved['binding']['damping'])
@@ -254,7 +277,11 @@ def _load(context,bone):
                         last=resolved_channels(snapshot,s.joint_uuid)
                     except (ValueError,OSError,TypeError,KeyError):
                         last=None
-                value=(last or {}).get(channel)
+                if implicit:
+                    from ..core.bone_physical_units import resolved_auto_value
+                    value=resolved_auto_value(snapshot,s.joint_uuid,channel,saved)
+                else:
+                    value=(last or {}).get(channel)
                 if value is not None:sources[channel]=source
                 used_build=used_build or value is not None
                 pending_auto=pending_auto or value is None
@@ -326,6 +353,7 @@ def apply(context,bone):
                 raise ValueError('该通道的旧线性作者参数已改变，请重新载入')
     sources=snapshots.get('__auto_resolved_sources__',{})
     derived=[]
+    auto_channels=_mmd_auto_channels(context, bone, state)
     for channel in changed:
         if owner.physical_force_replace[CHANNELS.index(channel)]:continue
         saved=_channel_state(state,s.joint_uuid,channel)
@@ -333,7 +361,7 @@ def apply(context,bone):
                    and saved['binding']['mode']=='AUTO_FREQUENCY'
                    and not (all(float(f)==0. for _x,f in saved['table']['nodes'])
                             and saved['binding']['damping_ratio']==0))
-        if dependent:
+        if dependent or (saved is None and channel in auto_channels):
             if channel not in sources:
                 raise ValueError('旧恢复力草稿缺少当前构建来源，请重新载入数值')
             derived.append(channel)

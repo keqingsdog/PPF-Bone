@@ -18,6 +18,35 @@ MAX_TABLES = 4096
 MAX_BINDINGS = 65536
 MAX_NODES = 262144
 ID_PATTERN = re.compile(r'[A-Za-z0-9_-]{1,64}\Z')
+COMMON_ANGULAR_FREQUENCY_HZ = 1.0
+COMMON_DAMPING_RATIO = .7
+
+
+def mmd_automatic_angular_channels(settings):
+    """Default channels on an imported, generated compliant joint."""
+    if (settings.physical_model != 'RIGID' or settings.joint_mode != 'SOFT'
+            or settings.root_mode != 'FREE'
+            or not settings.proxy or not settings.proxy.get('ppf_mmd_source')
+            or settings.is_property_set('angular_stiffness')
+            or settings.is_property_set('angular_damping')):
+        return ()
+    if settings.angular_restoring_mode == 'CONE':
+        return ('twist_x',)
+    return ('twist_x', 'swing_y', 'swing_z')
+
+
+def mmd_automatic_angular_curve(joint_uuid, channel):
+    """Use the standard linear angular frequency on native rest inertia."""
+    return {
+        'table': {'table_id': 'mmd_default_angular', 'domain': 'ODD',
+                  'tail': 'LINEAR', 'nodes': [[0, 0], [1, 1]]},
+        'binding': {
+            'target': {'kind': 'JOINT', 'joint_uuid': joint_uuid, 'channel': channel},
+            'enabled': True, 'table_id': 'mmd_default_angular', 'mode': 'AUTO_FREQUENCY',
+            'frequency_hz': COMMON_ANGULAR_FREQUENCY_HZ, 'damping_ratio': COMMON_DAMPING_RATIO,
+            'coordinate_scale': 1, 'mass_policy': 'LOCAL_REST_V1',
+        },
+    }
 
 
 class CurveError(ValueError):
@@ -282,7 +311,8 @@ def state_from_scene(scene):
 
 
 def export_scene(scene, ordered_pair_ids=None, active_joint_ids=None, *,
-                 cone_restoring_joint_ids=()):
+                 cone_restoring_joint_ids=(), mmd_automatic_channels=(),
+                 pre_mmd_default=None):
     """Export the author library entries consumed by this payload only.
 
     The scene document is an authoring library and can retain records for
@@ -291,10 +321,13 @@ def export_scene(scene, ordered_pair_ids=None, active_joint_ids=None, *,
     The projection is read-only: it never retires or rewrites author records.
     """
     state=state_from_scene(scene)
-    if state['mode']=='LEGACY':return None
+    owner=getattr(scene, 'ppf_restoring_curves', None)
+    if state['mode']=='LEGACY' and (not mmd_automatic_channels or getattr(owner, 'document_json', '')):
+        return None
     # Strictly validate every authored record, including inactive library
     # entries, before selecting the entries consumed by this payload.
-    document=validate_author_map(state['document'])
+    document=(validate_author_map(state['document']) if state['document'] is not None else
+              {'version': VERSION, 'tables': [], 'bindings': [], 'stitch_pairs': []})
     joint_ids={canonical_uuid(value,'active_joint_id') for value in (active_joint_ids or ())}
     if ordered_pair_ids is None:
         from .groups import get_addon_data
@@ -318,8 +351,25 @@ def export_scene(scene, ordered_pair_ids=None, active_joint_ids=None, *,
         'bindings':bindings,
         'stitch_pairs':stitch_mapping(ordered_pair_ids,referenced_pairs),
     }
-    state['document']=validate_author_map(projected)
-    return export_author(state)
+    if not mmd_automatic_channels:
+        return export_author({'mode': state['mode'], 'document': projected})
+    # A disabled author record is still an explicit choice and takes precedence.
+    occupied={target_key(binding['target']) for binding in document['bindings']}
+    generated=[mmd_automatic_angular_curve(joint_uuid, channel)
+               for joint_uuid, channel in mmd_automatic_channels
+               if joint_uuid in joint_ids and ('JOINT', joint_uuid, channel) not in occupied]
+    if not generated:
+        return export_author({'mode': state['mode'], 'document': projected})
+    if pre_mmd_default is not None:
+        pre_mmd_default.append(export_author({'mode': state['mode'], 'document': projected}))
+    table=generated[0]['table']
+    reserved_ids={entry['table_id'] for entry in document['tables']}
+    if table['table_id'] in reserved_ids:
+        table['table_id']=next(f"mmd_default_angular_{i}" for i in range(len(reserved_ids)+1)
+                               if f"mmd_default_angular_{i}" not in reserved_ids)
+    projected['tables'].append(table)
+    projected['bindings'].extend(dict(row['binding'], table_id=table['table_id']) for row in generated)
+    return export_author({'mode': 'ADVANCED', 'document': projected})
 
 
 def preview_table(table, coordinate):

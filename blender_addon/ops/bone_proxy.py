@@ -408,8 +408,6 @@ def _update_proxies_author_transaction(context, all_bones=False, scope='SELECTED
         from ..core.bone_author_follow import flush_author_before_update
         follow_changed = flush_author_before_update(context)
         count=_update_proxies(context,all_bones,scope,rebuild,planned_ids,retained_meshes,new_visibility,reset_default_size,shape_changed_from,new_resources,authoring_rows)
-        if after_apply is not None:
-            after_apply(arm, bones)
         for bone in bones:
             if bone.name in fresh and not bone.ppf_bone_physics.is_property_set('soft_limit_policy'):
                 bone.ppf_bone_physics.soft_limit_policy='AUTO_INERTIA'
@@ -418,6 +416,8 @@ def _update_proxies_author_transaction(context, all_bones=False, scope='SELECTED
         if candidate!=previous:write_state(context.scene,candidate)
         if not follow_changed and before_geometry!=[_proxy_geometry_state(b.ppf_bone_physics.proxy) for b in bones]:
             _facade_communicator().bone_physical_body_changed()
+        if after_apply is not None:
+            after_apply(arm, bones)
         return count
     except Exception:
         from ..core.bone_proxy_visibility import restore_proxy

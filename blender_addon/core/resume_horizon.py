@@ -131,13 +131,25 @@ def prepare_request(context, response, from_frame, twist_resume_mode=None):
     if type(from_frame) is not int or from_frame<=0 or target<=from_frame:
         raise ValueError('RESUME_TARGET_INVALID: select nonzero checkpoint earlier than target')
     producer_preflight(context,commit=False)
-    tree=_build_param_dict(context)
+    pre_mmd_default=[]
+    tree=_build_param_dict(context,pre_mmd_default=pre_mmd_default)
     if twist_resume_mode is not None:
         if twist_resume_mode != TWIST_MODE:raise ValueError('TWIST_RESUME_MODE_INVALID')
         tree=project_sealed_models(tree,response.get('twist_resume_contract'))
     if target!=sealed:
         if target<sealed:raise ValueError('RESUME_TARGET_INVALID: horizon may only increase')
         tree=normalized_param_tree(tree,sealed)
-    if not _matches_sealed_param(tree, response.get('param_hash'), dumps_envelope, twist_resume_mode is None):
-        raise ValueError('RESUME_INPUT_DRIFT: only horizon and identical constant root tail are allowed; do not Update Params/Build for same-seal resume')
-    return target if target>sealed else None
+    seal_hash=response.get('param_hash')
+    allow_legacy=twist_resume_mode is None
+    if _matches_sealed_param(tree, seal_hash, dumps_envelope, allow_legacy):
+        return target if target>sealed else None
+    # Previously sealed generations keep their original restoring values.
+    # Only remove newly synthesized defaults and require the full old seal.
+    if pre_mmd_default:
+        if pre_mmd_default[0] is None:
+            tree.pop('restoring_curves_v1')
+        else:
+            tree['restoring_curves_v1']=pre_mmd_default[0]
+        if _matches_sealed_param(tree, seal_hash, dumps_envelope, allow_legacy):
+            return target if target>sealed else None
+    raise ValueError('RESUME_INPUT_DRIFT: only horizon and identical constant root tail are allowed; do not Update Params/Build for same-seal resume')

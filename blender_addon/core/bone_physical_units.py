@@ -287,7 +287,10 @@ def display_build_document(context):
 
 
 def display_auto_value(context,joint,channel,saved):
-    document=display_build_document(context)
+    return resolved_auto_value(display_build_document(context), joint, channel, saved)
+
+
+def resolved_auto_value(document, joint, channel, saved):
     if document is None or linear_constants(saved['table'],0.) is None:return None
     receipts=[r for r in document.get('mass_receipts',[]) if r.get('target',{}).get('joint_uuid')==joint and r.get('target',{}).get('channel')==channel]
     if len(receipts)!=1:return None
