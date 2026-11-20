@@ -132,6 +132,12 @@ def validate_environment(data):
 def install(fixed, document, param_data):
     from ._soft_limit_auto_ import prepare_author
     from ._bone_connected_collision_ import cross_link_pairs
+    pmx_joints = None
+    if isinstance(document, dict) and 'pmx_joints_v1' in document:
+        from ._pmx_joints_ import validate_author
+        document = deepcopy(document)
+        pmx_joints = document.pop('pmx_joints_v1')
+        validate_author(pmx_joints, document.get('bindings', []))
     collision_pairs = cross_link_pairs(document)
     fixed._cross_link_collision_uuid_pairs = collision_pairs
     if isinstance(document, dict) and 'cross_link_collision_pairs_v1' in document:
@@ -153,6 +159,9 @@ def install(fixed, document, param_data):
     if cross_links is not None:
         from ._cross_links_ import install as install_cross_links
         result = install_cross_links(fixed, cross_links, document, result)
+    if pmx_joints is not None:
+        from ._pmx_joints_ import install as install_pmx_joints
+        install_pmx_joints(fixed, pmx_joints, document['bindings'], result)
     if collision_pairs:
         from ._bone_connected_collision_ import CROSS_FEATURE
         result['required_features'] = sorted(set(result.get('required_features', []) + [CROSS_FEATURE]))

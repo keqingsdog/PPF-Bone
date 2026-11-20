@@ -458,7 +458,7 @@ def _on_depsgraph_update(scene, depsgraph):
         # fires for a duplicate; the original is unchanged), so the
         # per-update loop alone would miss it.
         for o in objs:
-            if o is owner:
+            if o == owner:
                 continue
             if _is_writable(o):
                 del o[_OBJ_UUID_KEY]
@@ -477,7 +477,7 @@ def _on_depsgraph_update(scene, depsgraph):
     for update in depsgraph.updates:
         if not isinstance(update.id, bpy.types.Object):
             continue
-        obj = update.id
+        obj = update.id.original
         uid = obj.get(_OBJ_UUID_KEY)
         if not uid:
             continue
@@ -490,7 +490,7 @@ def _on_depsgraph_update(scene, depsgraph):
         owner = uuid_index.get(uid)
         if owner is None:
             continue
-        if owner is not obj:
+        if owner != obj:
             if _is_writable(obj):
                 del obj[_OBJ_UUID_KEY]
                 _duplicate_detected[0] = True

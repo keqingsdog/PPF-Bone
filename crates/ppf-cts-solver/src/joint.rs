@@ -715,6 +715,16 @@ fn gate_angular_control_contract(payload: &JointPayload, version: u32) -> Result
         }
     }
     if let Some(features)=payload.required_features.as_ref() {
+        if features.iter().any(|f|f==crate::pmx_joints::FEATURE) {
+            if version<3 || features.windows(2).any(|w|w[0]>=w[1]) || !cfg!(neutral_driver) {
+                return Err(err("pmx-joints","PMX_JOINT_INVALID","required_features",None,None,"PMX requires a sorted versioned neutral carrier"));
+            }
+            let mut stripped=payload.clone();
+            stripped.required_features=Some(features.iter().filter(|f|f.as_str()!=crate::pmx_joints::FEATURE).cloned().collect());
+            return gate_angular_control_contract(&stripped,version);
+        }
+    }
+    if let Some(features)=payload.required_features.as_ref() {
         if features.iter().any(|f|f==crate::cross_links::FEATURE) {
             if version<3 || features.windows(2).any(|w|w[0]>=w[1]) {return Err(err("cross-links","CROSS_LINK_INVALID","required_features",None,None,"sorted unique versioned carrier required"));}
             let mut stripped=payload.clone();stripped.required_features=Some(features.iter().filter(|f|f.as_str()!=crate::cross_links::FEATURE).cloned().collect());
@@ -1184,6 +1194,9 @@ fn check_root_orphan(path: &Path) -> Result<(), JointError> {
     if !checked_regular_file_or_absent(path,JOINT_FILE)? && checked_regular_file_or_absent(path,crate::connected_collision_native::CROSS_FILE)? {
         return Err(err("cross-links","CROSS_LINK_COLLISION_INVALID","required_features",None,None,"orphan collision sidecar requires sealed joint carrier"));
     }
+    if !checked_regular_file_or_absent(path,JOINT_FILE)? && checked_regular_file_or_absent(path,crate::pmx_joints::FILE)? {
+        return Err(err("pmx-joints","PMX_JOINT_INVALID","required_features",None,None,"orphan PMX sidecar requires sealed joint carrier"));
+    }
     if !checked_regular_file_or_absent(path,JOINT_FILE)? && checked_regular_file_or_absent(path,crate::cross_links::FILE)? {
         return Err(err("cross-links","CROSS_LINK_INVALID","required_features",None,None,"orphan cross-link sidecar requires sealed joint carrier"));
     }
@@ -1312,6 +1325,7 @@ pub fn prepare_native_input(path: &Path) -> Result<Option<ValidatedJointInput>, 
     // validated physical mixed joints, without adding phantom PDRD records.
     let soft=crate::soft_joint::prepare(&input)?;
     crate::cross_links::prepare(&input)?;
+    crate::pmx_joints::prepare(&input, 1.0)?;
     let fem_parents:HashSet<String>=soft.as_ref().map(|s|s.wires.iter()
         .filter(|j|j.wire.enabled).map(|j|j.wire.parent_body_uuid.clone()).collect()).unwrap_or_default();
     // Retain the same strict-prepare evidence for the SECOND (runtime

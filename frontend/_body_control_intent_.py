@@ -7,7 +7,7 @@ def validate_author_intent(document, fail):
     required_document = {'schema', 'armatures', 'bindings', 'start_frame', 'fps', 'world_scaling',
                          'body_controls_v1', 'body_controls_author_intent_v1'}
     if (not isinstance(document, dict) or not required_document.issubset(document)
-            or set(document) - required_document - {'collision_filter_v1', 'bone_mass_intent_v1', 'soft_limit_auto_v1', 'cross_links_v1', 'cross_link_collision_pairs_v1'}
+            or set(document) - required_document - {'collision_filter_v1', 'bone_mass_intent_v1', 'soft_limit_auto_v1', 'cross_links_v1', 'cross_link_collision_pairs_v1', 'pmx_joints_v1'}
             or document['body_controls_v1'] is not True or document['schema'] != 'PPF_BLENDER_BONES_V1'
             or not isinstance(document['bindings'], list)):
         fail('unsupported encoded body author document')

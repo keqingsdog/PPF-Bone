@@ -198,7 +198,7 @@ pub(super) fn pure_rigid_cross_rows(owned:&crate::soft_joint::OwnedSoftScene)->b
     !owned.records.is_empty() && owned.wires.is_empty() && owned.bodies.is_empty()
         && owned.controlled_vertices.is_empty() && owned.control_events.is_none() && owned.extensions.is_none()
         && owned.records.iter().all(|r|r.enabled==1 && r.a.kind==crate::soft_joint_gpu::FEM_PDRD && r.b.kind==crate::soft_joint_gpu::FEM_PDRD
-            && r.ball_stiffness==0. && r.v2.enabled==0 && r.v2.max_angle_rad==0.
+            && r.pmx.enabled==0 && r.ball_stiffness==0. && r.v2.enabled==0 && r.v2.max_angle_rad==0.
             && r.v2.stiffness_nm_per_rad==0. && r.v2.damping_nms_per_rad==0. && r.control.enabled==0
             && r.control.stiffness_nm_per_rad==[0.;3] && r.control.damping_nms_per_rad==[0.;3])
 }

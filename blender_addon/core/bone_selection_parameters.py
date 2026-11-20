@@ -429,8 +429,8 @@ class SelectionLayout:
                     if target==owner and len(rows)>1:
                         self.layout.label(text='动画或自动关键帧：仅修改活动骨骼，不批量',icon='KEY_HLT')
                     elif len(rows)>1:
-                        values=[getattr(group,'friction') for arm,bone in rows
-                                if (group:=_group(self.context,arm,bone)) is not None]
+                        from ..ops.bone_proxy import selected_bone_materials
+                        values = [group.friction for group in selected_bone_materials(self.context.scene, rows)]
                         if values and any(not _equal(values[0],value) for value in values[1:]):
                             self.layout.label(text='所选摩擦值不同；输入将统一',icon='INFO')
                 else:return member(target,field,*a,**kw)

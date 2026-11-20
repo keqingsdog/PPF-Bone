@@ -372,4 +372,14 @@ fn the_interior_height_retries_exactly_at_a_wider_scale() {
     assert!(out.contains("PASS: exact interior height scaling"), "{out}");
 }
 
+#[test]
+fn pmx_joint_limits_and_world_space_gradient_agree() {
+    if !have_compiler() {
+        eprintln!("SKIPPED: no C++ compiler on this host");
+        return;
+    }
+    let out = run_gate("pmx_joints");
+    assert!(out.contains("PMX native joint evaluation PASS"), "{out}");
+}
+
 

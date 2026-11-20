@@ -158,6 +158,40 @@ def _rebuild_cached(name, key, build, *, force=False):
     return True
 
 
+def _edit_overlay_needs_refresh(context, state):
+    """Live edit invalidation for meshes used by a dynamics overlay."""
+    from ...core.uuid_registry import get_object_uuid
+
+    edited = [obj for obj in getattr(context, 'objects_in_mode', ())
+              if obj.type == 'MESH' and obj.mode == 'EDIT']
+    if not edited:
+        return False
+    ids = {uid for obj in edited if (uid := get_object_uuid(obj))}
+    names = {obj.name for obj in edited}
+    for group in iterate_active_object_groups(context.scene):
+        if group.object_type == 'STATIC':
+            continue
+        assigned = [ref for ref in group.assigned_objects if ref.included and ref.uuid in ids]
+        if not assigned:
+            continue
+        if group.object_type == 'ROD' and group.show_overlay_color:
+            return True
+        if group.object_type == 'PDRD' and any(ref.pdrd_hinge_enable for ref in assigned):
+            return True
+        if any(pin.object_uuid in ids for pin in group.pin_vertex_groups):
+            return True
+    if state is not None:
+        for pair in state.merge_pairs:
+            if pair.show_stitch and pair.cross_stitch_json and (
+                pair.object_a_uuid in ids or pair.object_b_uuid in ids
+                or (not pair.object_a_uuid and pair.object_a in names)
+                or (not pair.object_b_uuid and pair.object_b in names)
+                or (not pair.object_a_uuid and not pair.object_b_uuid and not pair.object_a and not pair.object_b)
+            ):
+                return True
+    return False
+
+
 def draw_overlay_callback():
     """Draw overlay for ROD objects and pin vertices"""
     context = bpy.context
@@ -209,45 +243,19 @@ def draw_overlay_callback():
     frame = scene.frame_current
     view_distance = region.view_distance
     cached_view_distance = _overlay_cache["view_distance"]
-    # An object in Edit Mode owns its vertex positions via BMesh; the
-    # object-mode mesh data and the overlay_version are not updated
-    # for live vertex drags. Force a per-redraw rebuild while any
-    # pinned mesh is being edited so the pin overlay tracks the drag
-    # in real time. Cost is bounded by ``_build_pin_data`` over the
-    # active groups, which is the same cost as a normal frame change.
-    # Iterate the objects actually in Edit Mode (``objects_in_mode`` is
-    # usually empty, occasionally one, never the whole scene) and test
-    # membership against the assigned set, rather than walking every
-    # assigned object and resolving it per redraw. A quiet redraw on a
-    # large scene then pays O(objects-in-edit) instead of O(assigned),
-    # which is the difference between a free check and ~46ms on a
-    # 1.6k-object net.
-    any_pin_obj_in_edit = False
+    # Native mesh drags do not bump overlay_version. Only overlays that
+    # consume the edited mesh need a live rebuild. An ordinary bone proxy
+    # can be in a dynamics group without contributing pins, rods or stitches.
     try:
-        edited = [
-            ob for ob in getattr(context, "objects_in_mode", ())
-            if ob.type == "MESH" and ob.mode == "EDIT"
-        ]
-        if edited:
-            from ...core.uuid_registry import get_object_uuid
-            pinned_uuids = {
-                obj_ref.uuid
-                for grp in iterate_active_object_groups(scene)
-                if grp.object_type != "STATIC"
-                for obj_ref in grp.assigned_objects
-                if obj_ref.included and obj_ref.uuid
-            }
-            any_pin_obj_in_edit = any(
-                get_object_uuid(ob) in pinned_uuids for ob in edited
-            )
+        live_edit_refresh = _edit_overlay_needs_refresh(context, vis_state)
     except Exception:
-        any_pin_obj_in_edit = False
+        live_edit_refresh = False
     # One key shared by the three scene-topology builders, compared per
     # builder so a failure in one does not drag the others into a per-redraw
     # rebuild (see ``_rebuild_cached``).
     scene_key = (version, frame)
     rod_needs_rebuild = (
-        any_pin_obj_in_edit
+        live_edit_refresh
         or _overlay_cache["rod_key"] != scene_key
         or _overlay_cache["pin_key"] != scene_key
         or _overlay_cache["snap_key"] != scene_key
@@ -287,9 +295,9 @@ def draw_overlay_callback():
         # Each builder promotes its own key, so a failure in one does not force
         # the other two to rebuild on every redraw. An edit-mode drag forces
         # all three, since BMesh positions do not bump overlay_version.
-        _rebuild_cached("rod", scene_key, _rebuild_rod, force=any_pin_obj_in_edit)
-        _rebuild_cached("pin", scene_key, _rebuild_pin, force=any_pin_obj_in_edit)
-        _rebuild_cached("snap", scene_key, _rebuild_snap, force=any_pin_obj_in_edit)
+        _rebuild_cached("rod", scene_key, _rebuild_rod, force=live_edit_refresh)
+        _rebuild_cached("pin", scene_key, _rebuild_pin, force=live_edit_refresh)
+        _rebuild_cached("snap", scene_key, _rebuild_snap, force=live_edit_refresh)
 
         # Kept in step for any reader that inspects the legacy shared key.
         _overlay_cache["version"] = version
@@ -771,6 +779,29 @@ def unregister_overlay():
     clear_point_shaders()
 
 
+def refresh_bone_proxy_color(settings, scene):
+    """Refresh one proxy after an author color edit without scanning objects."""
+    from ...core.uuid_registry import get_object_uuid
+    from ...models.bone_bindings import effective_preview_color
+    proxy = settings.proxy
+    if scene is None or proxy is None or not proxy.get('ppf_bone_proxy_owned', False):
+        return
+    uid = get_object_uuid(proxy)
+    hide = bool(get_addon_data(scene).state.hide_overlay_colors)
+    target = None
+    for group in iterate_active_object_groups(scene):
+        for assigned in group.assigned_objects:
+            if assigned.uuid != uid:
+                continue
+            visible = bool(assigned.included and group.show_overlay_color and not hide)
+            target = tuple(group.color) if visible else (1.0, 1.0, 1.0, 1.0)
+            if visible and (settings.preview_color_custom or
+                    (settings.collision_filter_enabled and any(settings.collision_group_layers))):
+                target = (*effective_preview_color(settings, settings.physical_model), target[3])
+    if target is not None and tuple(proxy.color) != target:
+        proxy.color = target
+
+
 def apply_object_overlays():
     """Update object colors for addon-managed objects only.
 
@@ -807,6 +838,7 @@ def apply_object_overlays():
     # appears in multiple groups gets the last group's color (matches
     # the prior unconditional-overwrite ordering).
     target_color: dict[str, tuple[float, float, float, float]] = {}
+    target_visible: dict[str, bool] = {}
     for group in iterate_active_object_groups(scene):
         if (not hide_overlay_colors) and group.show_overlay_color:
             tint = (
@@ -821,12 +853,31 @@ def apply_object_overlays():
             uid = obj_ref.uuid
             if not uid:
                 continue
+            target_visible[uid] = bool(obj_ref.included and not hide_overlay_colors and group.show_overlay_color)
             if not obj_ref.included:
                 # included=False means the object isn't participating
                 # in the sim; clear any addon-applied tint on it.
                 target_color[uid] = (1.0, 1.0, 1.0, 1.0)
             else:
                 target_color[uid] = tint
+
+    # Bone-owned proxy colors follow their author settings when collision
+    # coloring or an explicit preview color is active. Legacy group tints
+    # remain unchanged for unfiltered bones.
+    from ...models.bone_bindings import effective_preview_color
+    proxy_colors = {}
+    if not hide_overlay_colors:
+        for arm in scene.objects:
+            if arm.type != 'ARMATURE':
+                continue
+            for bone in arm.data.bones:
+                settings = bone.ppf_bone_physics
+                proxy = settings.proxy
+                if (not settings.enabled or proxy is None or
+                        not proxy.get('ppf_bone_proxy_owned', False)):
+                    continue
+                if settings.preview_color_custom or (settings.collision_filter_enabled and any(settings.collision_group_layers)):
+                    proxy_colors[proxy.as_pointer()] = effective_preview_color(settings, settings.physical_model)
 
     # Walk meshes and curves once and write only when the object's
     # UUID is in the target map. Objects the user hasn't added to any
@@ -841,6 +892,11 @@ def apply_object_overlays():
         new = target_color.get(uid)
         if new is None:
             continue
+        # Only tint when its active group actually displays overlay colors.
+        # White means the group or global overlay is disabled.
+        rgb = proxy_colors.get(obj.as_pointer())
+        if rgb is not None and target_visible.get(uid, False):
+            new = (*rgb, new[3])
         cur = obj.color
         if (cur[0], cur[1], cur[2], cur[3]) != new:
             obj.color = new

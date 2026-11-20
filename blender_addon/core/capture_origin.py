@@ -43,11 +43,20 @@ def require_capture_ranges(scene, entries):
     """Refuse stale buffers before publication; never undo authored settings."""
     from .uuid_registry import get_object_by_uuid
     from ..ui.dynamics.static_deform_ops import _effective_frame_range
+    ranges = {}
     for entry in entries:
-        obj = get_object_by_uuid(entry['obj_uuid'])
-        if obj is None:
-            raise RuntimeError('Capture range target is no longer available; capture cancelled')
-        current = _effective_frame_range(scene, obj)[:2]
+        uid = entry['obj_uuid']
+        if uid not in ranges:
+            obj = get_object_by_uuid(uid)
+            if obj is None:
+                raise RuntimeError('Capture range target is no longer available; capture cancelled')
+            ranges[uid] = _effective_frame_range(scene, obj)
+        current = ranges[uid][:2]
+        if 'pin_pointer' in entry:
+            from ..ui.dynamics.pin_capture_ops import _resolve_capture_pin, _effective_pin_frame_range
+            pin = _resolve_capture_pin(scene, entry, identity_only=True)[0]
+            obj = get_object_by_uuid(uid)
+            current = _effective_pin_frame_range(scene, obj, pin, base_range=ranges[uid])[:2]
         if current != (entry['frame_start'], entry['frame_end']):
             raise RuntimeError('Effective capture frame range changed; capture cancelled')
 

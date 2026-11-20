@@ -60,6 +60,7 @@ from .dynamics.bake_ops import bake_progress_snapshot, is_bake_running
 from .dynamics.pin_capture_ops import (
     is_pin_capture_running,
     pin_capture_progress_snapshot,
+    pin_capture_stop_save_failed,
 )
 from .dynamics.static_deform_ops import (
     capture_progress_snapshot,
@@ -647,6 +648,8 @@ class SOLVER_PT_SolverPanel(Panel):
                 "REC",
                 "solver.pin_capture_abort",
             )
+            if pin_capture_stop_save_failed():
+                box.operator("solver.pin_capture_abort", text="丢弃未完成进度", icon="X").save_partial = False
 
         # Show missing frames warning (not during simulation)
         response = com.info.response

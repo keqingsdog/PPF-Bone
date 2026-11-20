@@ -83,6 +83,8 @@ from .session import new_session_id
 from . import collision_receipt
 from . import body_control_receipt
 
+_SCENE_QUERY_COMMANDS = frozenset(("build", "start", "resume"))
+
 if TYPE_CHECKING:
     from .engine import Engine
 
@@ -661,7 +663,7 @@ class EffectRunner:
                 return None, ""
             return key, self._cold_refused.get(key, "")
 
-    def _collision_main_snapshot(self):
+    def _collision_main_snapshot(self, *, rebuild_cold=True):
         """Called only by execute(), never by the I/O worker."""
         import bpy
         from ..models.bone_collision import collect_collision_filters
@@ -679,12 +681,12 @@ class EffectRunner:
             self._collision_required = author is not None or self._collision_retransfer
             cold = (author is not None and self._collision_expected is None
                     and not self._collision_retransfer)
-        if cold:
+        if cold and rebuild_cold:
             self._cold_adopt_expectation("collision", author, identity)
-        self._body_main_snapshot()
+        self._body_main_snapshot(rebuild_cold=rebuild_cold)
         return author
 
-    def _body_main_snapshot(self):
+    def _body_main_snapshot(self, *, rebuild_cold=True):
         """Immutable author intent captured only on Blender's main thread."""
         import bpy
         from ..models.bone_bindings import collect_body_controls_contract
@@ -698,9 +700,20 @@ class EffectRunner:
             self._body_required = author is not None or self._body_retransfer
             cold = (author is not None and self._body_expected is None
                     and not self._body_retransfer)
-        if cold:
+        if cold and rebuild_cold:
             self._cold_adopt_expectation("body", author, identity)
         return author
+
+    def _cold_expectation_pending(self):
+        """A status-only reconnect has not verified the current scene bytes."""
+        with self._collision_lock:
+            return (
+                self._collision_required and self._collision_expected is None
+                and not self._collision_retransfer
+            ) or (
+                self._body_required and self._body_expected is None
+                and not self._body_retransfer
+            )
 
     def _cold_adopt_expectation(self, family, author, identity):
         """ONE cold rebuild attempt per identity, with a remembered outcome.
@@ -1375,7 +1388,6 @@ class EffectRunner:
             # -- Connection (commands) --
             case DoConnect(backend_type=bt, config=cfg, server_port=sp):
                 self._collision_invalidate(discard=True)
-                self._collision_main_snapshot()
                 cfg_copy = dict(cfg)
                 if sp:
                     cfg_copy["server_port"] = sp
@@ -1440,7 +1452,8 @@ class EffectRunner:
                     from .query_contract import validate_query
                     validate_query(req)
                 try:
-                    self._collision_main_snapshot()
+                    command = req.get("request") if req else None
+                    self._collision_main_snapshot(rebuild_cold=command in _SCENE_QUERY_COMMANDS)
                     if req and req.get("request") == "build":
                         with self._collision_lock:
                             if self._collision_required and (self._collision_expected is None or self._collision_build_started):
@@ -1483,7 +1496,7 @@ class EffectRunner:
                                  data_hash=dh, param_hash=ph, expected_connection_ticket=expected_connection):
                 self._collision_invalidate(discard=True)
                 try:
-                    current = self._collision_main_snapshot()
+                    current = self._collision_main_snapshot(rebuild_cold=False)
                     uploaded = collision_receipt.uploaded_contract(pm)
                     body_upload = body_control_receipt.uploaded_contract(pm)
                     if (body_upload is not None) != (self._body_intent_hash is not None):
@@ -1519,6 +1532,11 @@ class EffectRunner:
 
             # -- Fetch (commands) --
             case DoFetchMap(root=r):
+                try:
+                    self._collision_main_snapshot()
+                except Exception as exc:
+                    self._collision_reject(exc, self._collision_ticket())
+                    return
                 # Capture the immutable identity ONCE, at submission, under the
                 # collision lock, after Reset/snapshot have finished: ticket and
                 # generation travel together and are never re-read live later.
@@ -1538,13 +1556,15 @@ class EffectRunner:
                 if me >= 0 and me != self._anim_map_generation:
                     return
                 # Re-read current local authorship before any frame is handed to
-                # the animation, the same main-thread gate DoConnect, DoQuery and
-                # DoUploadAtomic already run.
+                # the animation. Automatic live preview waits for an explicit
+                # operation to rebuild a cold scene's receipt expectation.
                 if me < 0:
                     try:
-                        self._collision_main_snapshot()
+                        self._collision_main_snapshot(rebuild_cold=not ol)
                     except Exception as exc:
                         self._collision_reject(exc, self._collision_ticket())
+                        return
+                    if ol and self._cold_expectation_pending():
                         return
                 with self._collision_lock:
                     drifted = self._body_retransfer or self._collision_retransfer
@@ -2474,7 +2494,11 @@ class EffectRunner:
                         self._collision_invalidate(discard=True)
                         ticket = self._collision_ticket()
             if alive and response.get("status") in ("READY", "RESUMABLE") and not response.get("error"):
-                if not self._collision_validate(response, ticket, query_id=status_query_id):
+                command = request.get("request") if request else None
+                # Show project status on a cold connection. Actions that use
+                # the result still rebuild and validate the local expectation.
+                inspect_only = command not in _SCENE_QUERY_COMMANDS and self._cold_expectation_pending()
+                if not inspect_only and not self._collision_validate(response, ticket, query_id=status_query_id):
                     self._cancel_status_query(status_query_id)
                     return
         except Exception as exc:

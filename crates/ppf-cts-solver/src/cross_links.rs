@@ -57,10 +57,10 @@ pub(crate) fn decode(bytes:&[u8], scene_uuid:&str)->Result<Payload,JointError> {
     }
     Ok(p)
 }
-fn inert_row(a:FemEndpointGpu,b:FemEndpointGpu)->FemJointGpu {
+pub(crate) fn inert_row(a:FemEndpointGpu,b:FemEndpointGpu)->FemJointGpu {
     FemJointGpu {a,b,enabled:1,ball_stiffness:0.,v2:crate::joint_angular_gpu::AngularJointGpuV2 {
         body_a:0,body_b:0,enabled:0,max_angle_rad:0.,frame_a_wxyz:[1.,0.,0.,0.],frame_b_wxyz:[1.,0.,0.,0.],rest_relative_wxyz:[1.,0.,0.,0.],stiffness_nm_per_rad:0.,damping_nms_per_rad:0.
-    },control:crate::joint_angular_control_gpu::AngularControlGpu {body_a:0,body_b:0,enabled:0,coordinate_model:1,frame_a_wxyz:[1.,0.,0.,0.],frame_b_wxyz:[1.,0.,0.,0.],rest_relative_wxyz:[1.,0.,0.,0.],stiffness_nm_per_rad:[0.;3],damping_nms_per_rad:[0.;3]}}
+    },pmx:Default::default(),control:crate::joint_angular_control_gpu::AngularControlGpu {body_a:0,body_b:0,enabled:0,coordinate_model:1,frame_a_wxyz:[1.,0.,0.,0.],frame_b_wxyz:[1.,0.,0.,0.],rest_relative_wxyz:[1.,0.,0.,0.],stiffness_nm_per_rad:[0.;3],damping_nms_per_rad:[0.;3]}}
 }
 pub fn prepare(input:&ValidatedJointInput)->Result<Option<OwnedCrossLinks>,JointError> {
     if input.contains(FILE)!=input.requires_feature(FEATURE)? {return Err(bad("required_features","cross-link sidecar and feature must appear together"));}
@@ -98,17 +98,23 @@ pub fn prepare(input:&ValidatedJointInput)->Result<Option<OwnedCrossLinks>,Joint
 /// Tree rows remain the prefix. Network edges never enter any parent graph.
 pub fn prepare_batch(input:&ValidatedJointInput,scale:f64)->Result<Option<soft_joint::OwnedSoftScene>,JointError> {
     let mut tree=soft_joint::prepare(input)?;
-    let Some(cross)=prepare(input)? else{return Ok(tree);};
+    let cross=prepare(input)?;
+    let pmx=crate::pmx_joints::prepare(input,scale)?;
+    if cross.is_none()&&pmx.is_empty(){return Ok(tree);}
     if !scale.is_finite()||scale<=0. {return Err(bad("world_scaling","positive finite scale required"));}
     let batch=tree.get_or_insert_with(||soft_joint::OwnedSoftScene {
         scene_uuid:input.records().scene_uuid.clone(),scene_inputs_sha256:input.records().scene_inputs_sha256.clone(),payload_sha256:String::new(),
         controlled_vertices:Vec::new(),control_receipt:serde_json::Value::Null,control_events:None,bodies:Vec::new(),wires:Vec::new(),records:Vec::new(),extensions:None,connected_collision:None,
     });
-    for mut row in cross.records {
+    let mut appended=Vec::new();
+    for mut row in cross.into_iter().flat_map(|c|c.records) {
         for endpoint in [&mut row.a,&mut row.b] {
             for x in &mut endpoint.local_anchor {*x=narrow(f64::from(*x)*scale)?;}
             if endpoint.kind==FEM_TET {for x in &mut endpoint.dm_inv {*x=narrow(f64::from(*x)/scale)?;}}
         }
+        appended.push(row);
+    }
+    for row in appended.into_iter().chain(pmx) {
         if let Some(ext)=&mut batch.extensions {ext.limits.push(crate::joint_angular_extension_gpu::AngularSoftLimitGpuV1{joint_index:batch.records.len() as u32,enabled_axis_mask:0,lower_rad:[0.;3],upper_rad:[0.;3],stiffness_nm_per_rad:[0.;3],swing_cone_enabled:0,swing_cone_half_angle_rad:0.,swing_cone_stiffness_nm_per_rad:0.});}
         batch.records.push(row);
     }

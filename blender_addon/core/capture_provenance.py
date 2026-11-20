@@ -208,7 +208,7 @@ def read_bound_proof(path, frames=None):
     return proof
 
 
-def validate_capture(scene, obj, frames, kind, vg_name=None):
+def validate_capture(scene, obj, frames, kind, vg_name=None, pin_item=None):
     from . import pc2
     from .uuid_registry import get_object_uuid
     from ..ui.dynamics.static_deform_ops import _effective_frame_range
@@ -219,7 +219,12 @@ def validate_capture(scene, obj, frames, kind, vg_name=None):
             raise ValueError('this Scene cannot prove ownership of this capture generation')
         if proof.get('object_uuid') != get_object_uuid(obj) or proof.get('kind') != kind:
             raise ValueError('capture object or kind differs from the proven source')
-        if tuple(_effective_frame_range(scene, obj)[:2]) != (proof['frame_start'], proof['frame_end']):
+        if kind == 'PIN' and pin_item is not None:
+            from ..ui.dynamics.pin_capture_ops import _effective_pin_frame_range
+            start, end = _effective_pin_frame_range(scene, obj, pin_item)[:2]
+            if proof['frame_start'] != start or proof['frame_end'] < end:
+                raise ValueError('capture does not cover the required Pin frame range')
+        elif tuple(_effective_frame_range(scene, obj)[:2]) != (proof['frame_start'], proof['frame_end']):
             raise ValueError('effective start/frame range changed after capture')
         if kind == 'PIN':
             from .encoder.pin import _get_pin_indices

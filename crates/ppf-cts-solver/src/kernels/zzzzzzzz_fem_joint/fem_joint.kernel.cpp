@@ -16,6 +16,16 @@ struct FemEndpointGpu {
     float rest_rotation[9];
     float local_anchor[3];
 };
+struct PmxJointGpu {
+    unsigned enabled;
+    unsigned modes[6];
+    float lower[6];
+    float upper[6];
+    float springs[6];
+    float limit_weight[2];
+    float frame_a[4];
+    float frame_b[4];
+};
 struct FemJointGpu {
     FemEndpointGpu a;
     FemEndpointGpu b;
@@ -23,6 +33,7 @@ struct FemJointGpu {
     float ball_stiffness;
     AngularJointGpuV2 v2;
     AngularControlGpu control;
+    PmxJointGpu pmx;
 };
 struct FemFrameGpu {
     float rotation[9];
@@ -354,10 +365,124 @@ struct EcExpansion { float x[32]; unsigned n; };
 }
 
 
+// PMX rows use ordered rigid endpoints and Bullet's XYZ angular chart. The
+// penalty contribution is a box residual, separate from the authored springs.
+[[seam::host_device_fn]] inline void pmx_euler_xyz(const float r[9], float q[3]) {
+    const float cy = fmath::sqrt(r[0]*r[0] + r[1]*r[1]);
+    if (cy > 1e-5f) {
+        q[0] = fmath::atan2(-r[5], r[8]);
+        q[1] = fmath::atan2(r[2], cy);
+        q[2] = fmath::atan2(-r[1], r[0]);
+    } else {
+        const float sign = r[2] < 0.f ? -1.f : 1.f;
+        q[0] = sign * fmath::atan2(r[3], r[4]);
+        q[1] = sign * 1.5707963267948966f;
+        q[2] = 0.f;
+    }
+}
+[[seam::host_device_fn]] inline float pmx_atan_derivative(float y, float x, float dy, float dx) {
+    return (x*dy - y*dx) / fmath::max(1e-10f, x*x + y*y);
+}
+[[seam::host_device_fn]] inline void pmx_euler_derivative(const float r[9], const float dr[9], float dq[3]) {
+    const float cy = fmath::sqrt(r[0]*r[0] + r[1]*r[1]);
+    if (cy > 1e-5f) {
+        const float dcy = (r[0]*dr[0] + r[1]*dr[1]) / cy;
+        dq[0] = pmx_atan_derivative(-r[5], r[8], -dr[5], dr[8]);
+        dq[1] = pmx_atan_derivative(r[2], cy, dr[2], dcy);
+        dq[2] = pmx_atan_derivative(-r[1], r[0], -dr[1], dr[0]);
+    } else {
+        dq[0] = (r[2]<0.f ? -1.f : 1.f) * pmx_atan_derivative(r[3], r[4], dr[3], dr[4]);
+        dq[1] = dq[2] = 0.f;
+    }
+}
+[[seam::host_device_fn]] inline bool pmx_evaluate(const FemJointGpu& row, const FemFrameGpu* cache,
+        float g[24], float h[576], [[seam::thread]] float& energy) {
+    if (row.a.kind != RIGID || row.b.kind != RIGID) return false;
+    float qa[9], qb[9], row_major[9], sa[9], sb[9], r[9];
+    joint_angular::quat_matrix(row.pmx.frame_a, row_major);
+    joint_angular::transpose(row_major, qa);
+    joint_angular::quat_matrix(row.pmx.frame_b, row_major);
+    joint_angular::transpose(row_major, qb);
+    mm(cache[0].rotation, qa, sa);
+    mm(cache[1].rotation, qb, sb);
+    tm(sa, sb, r);
+
+    float delta[3], q[6]{}, j[6][12]{}, aj[36], bj[36];
+    for (int c=0; c<3; ++c) delta[c] = cache[1].anchor[c] - cache[0].anchor[c];
+    anchor_jacobian(row.a, cache[0], aj);
+    anchor_jacobian(row.b, cache[1], bj);
+    for (int a=0; a<3; ++a) {
+        const float* axis = sa + 3*a;
+        for (int c=0; c<3; ++c) {
+            q[a] += axis[c] * delta[c];
+            for (int k=0; k<6; ++k) {
+                j[a][k] -= axis[c] * aj[12*c+k];
+                j[a][6+k] += axis[c] * bj[12*c+k];
+            }
+            const int u = (c+1)%3, v = (c+2)%3;
+            j[a][3+c] += axis[u]*delta[v] - axis[v]*delta[u];
+        }
+    }
+
+    pmx_euler_xyz(r, q+3);
+    for (int k=0; k<3; ++k) {
+        // Relative rotation derivative A^T [unit_world_k]x B.
+        const int u = (k+1)%3, v = (k+2)%3;
+        float ds[9]{}, dr[9], dq[3];
+        for (int c=0; c<3; ++c) {
+            ds[3*c+u] = -sb[3*c+v];
+            ds[3*c+v] = sb[3*c+u];
+        }
+        tm(sa, ds, dr);
+        pmx_euler_derivative(r, dr, dq);
+        for (int c=0; c<3; ++c) {
+            j[3+c][3+k] = -dq[c];
+            j[3+c][9+k] = dq[c];
+        }
+    }
+
+    constexpr float pi = 3.14159265358979323846f;
+    for (int a=0; a<6; ++a) {
+        const unsigned mode = row.pmx.modes[a];
+        const float lower = row.pmx.lower[a], upper = row.pmx.upper[a], ks = row.pmx.springs[a];
+        float coordinate = q[a];
+        if (a>=3 && mode && upper-lower<2.f*pi) {
+            const float center = .5f*(upper+lower);
+            if (coordinate-center > pi) coordinate -= 2.f*pi;
+            if (coordinate-center < -pi) coordinate += 2.f*pi;
+        }
+        const bool active = mode==2u || (mode==1u && (coordinate<lower || coordinate>upper));
+        const float error = active ? coordinate - fmath::min(upper, fmath::max(lower, coordinate)) : 0.f;
+        const float kl = active ? row.pmx.limit_weight[a/3] : 0.f;
+        energy += .5f*(ks*q[a]*q[a] + kl*error*error);
+        const float effort = ks*q[a] + kl*error;
+        const float weight = ks + kl;
+        if (!finite(effort) || !finite(weight)) return false;
+        if (weight == 0.f) continue;
+        for (int k=0; k<12; ++k) {
+            const int output_k = k + (k>=6 ? 6 : 0);
+            g[output_k] += effort*j[a][k];
+            for (int l=0; l<12; ++l) {
+                const int output_l = l + (l>=6 ? 6 : 0);
+                h[24*output_k+output_l] += weight*j[a][k]*j[a][l];
+            }
+        }
+    }
+    if (!finite(energy)) return false;
+    for (int k=0; k<24; ++k) if (!finite(g[k])) return false;
+    for (int k=0; k<576; ++k) if (!finite(h[k])) return false;
+    return true;
+}
+
 [[seam::host_device_fn]] inline bool evaluate(const FemJointGpu& row,const FemFrameGpu* cache,float dt,float g[24],float h[576],[[seam::thread]] float& energy,[[seam::thread]] unsigned& fault,const restoring_curve::CurveContext* curves=nullptr,unsigned target_index=0,float* observations=nullptr,float* diagnostics=nullptr,[[seam::thread]] const MaterialSpinContext* material=nullptr) {
     for(int k=0;k<24;++k)g[k]=0.f;for(int k=0;k<576;++k)h[k]=0.f;energy=0.f;fault=OK;if(!row.enabled)return true;
     for(int k=0;k<4;++k)if(cache[k].status!=OK){fault=cache[k].status;return false;}
     if(!(dt>0.f)||!finite(dt)){fault=BAD_STEP;return false;}
+    if(row.pmx.enabled) {
+        if(pmx_evaluate(row,cache,g,h,energy)) return true;
+        fault=BAD_ARITHMETIC;
+        return false;
+    }
     if(!finite(row.ball_stiffness)||row.ball_stiffness<0.f){fault=BAD_ARITHMETIC;return false;}
     float aj[36],bj[36],j[72],res[3];anchor_jacobian(row.a,cache[0],aj);anchor_jacobian(row.b,cache[1],bj);
     for(int r=0;r<3;++r){res[r]=cache[0].anchor[r]-cache[1].anchor[r];energy+=.5f*row.ball_stiffness*res[r]*res[r];for(int k=0;k<12;++k){j[24*r+k]=aj[12*r+k];j[24*r+12+k]=-bj[12*r+k];}}

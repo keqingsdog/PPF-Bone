@@ -10,11 +10,23 @@ from collections import defaultdict
 
 DENSITY_MIN = .01
 DENSITY_MAX = 10000.
+DENSITY_RANGE_MESSAGE = '密度超出 0.01–10000 kg/m³；请调整目标质量或代理体积'
 RNA_DENSITY_MIN = struct.unpack('<f', struct.pack('<f', DENSITY_MIN))[0]
 MAX_TRIANGLES = 40000
 MAX_VERTICES = MAX_TRIANGLES//2+2
 MAX_INTERSECTION_PAIRS = 250000
 MAX_BROAD_PHASE_CHECKS = 500000
+
+
+class DensityOutOfRange(ValueError):
+    """A finite target mass implies a density outside the supported interval."""
+
+    def __init__(self, mass_kg, volume_m3):
+        super().__init__(DENSITY_RANGE_MESSAGE)
+        self.mass_kg = mass_kg
+        self.volume_m3 = volume_m3
+        self.armature_name = None
+        self.bone_name = None
 
 
 def validate_mesh_counts(vertex_count, face_count, loop_count):
@@ -41,7 +53,7 @@ def positive_finite(value, label):
 def valid_density(value):
     value = positive_finite(value, '密度（kg/m³）')
     if not DENSITY_MIN <= value <= DENSITY_MAX:
-        raise ValueError('密度超出 0.01–10000 kg/m³；请调整目标质量或代理体积')
+        raise ValueError(DENSITY_RANGE_MESSAGE)
     return value
 
 
@@ -57,8 +69,12 @@ def valid_authored_density(value):
 
 
 def density_for_mass(mass_kg, volume_m3):
-    return valid_density(positive_finite(mass_kg, '目标质量（kg）') /
-                         positive_finite(volume_m3, '闭合体积（m³）'))
+    mass_kg = positive_finite(mass_kg, '目标质量（kg）')
+    volume_m3 = positive_finite(volume_m3, '闭合体积（m³）')
+    density = positive_finite(mass_kg / volume_m3, '密度（kg/m³）')
+    if not DENSITY_MIN <= density <= DENSITY_MAX:
+        raise DensityOutOfRange(mass_kg, volume_m3)
+    return density
 
 
 def mass_for_density(density, volume_m3):
