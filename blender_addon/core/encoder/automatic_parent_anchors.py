@@ -36,25 +36,27 @@ def sample_parent_motion(context, armature, parent_bone_name: str,
     """
     import math
     from .bones import _frame
-    from ...models.bone_bindings import bone_world_matrix
+    from ...models.bone_bindings import _rigid_matrix_rows, bone_world_matrix
 
     if type(start_frame) is not int or type(frame_count) is not int or frame_count < 2:
         raise ValueError("BLENDER_BONE_INVALID: automatic parent follow requires at least two sampled frames")
     if isinstance(fps, bool) or not isinstance(fps, (int, float)) or not math.isfinite(fps) or fps <= 0:
         raise ValueError("BLENDER_BONE_INVALID: automatic parent follow FPS must be finite and positive")
-    initial = _frame(initial_world_matrix, "automatic parent initial")
+    initial = _frame(initial_world_matrix, f"automatic parent {parent_bone_name} frame {start_frame}")
     scene = context.scene
     previous, subframe = scene.frame_current, scene.frame_subframe
     keys = []
     try:
         for offset in range(frame_count):
-            scene.frame_set(start_frame + offset)
+            sample_frame = start_frame + offset
+            scene.frame_set(sample_frame)
             context.view_layer.update()
             pose_bone = armature.pose.bones.get(parent_bone_name)
             if pose_bone is None:
                 raise ValueError(f"BLENDER_BONE_INVALID: missing nonphysical parent bone {parent_bone_name!r}")
             world = bone_world_matrix(armature, pose_bone.bone)
-            sampled = initial if offset == 0 else _frame(world, f"automatic parent {parent_bone_name} frame {start_frame + offset}")
+            label = f"automatic parent {parent_bone_name} frame {sample_frame}"
+            sampled = initial if offset == 0 else _frame(_rigid_matrix_rows(world, label), label)
             keys.append({
                 "time_s": offset / float(fps),
                 "center_world_m": sampled["translation_m"],
@@ -113,15 +115,17 @@ def _bridge_fail(request, detail):
     raise ValueError(f'骨骼 {request["parent"].name}：非物理中段到参与物理祖先 {request["ancestor"].name} 的桥接不支持{detail}；请保留中段参与物理，或关闭下段“跟随非物理父骨骼”后明确作为独立根。')
 
 
-def sample_parent_track(request, offset, fps, initial_world):
+def sample_parent_track(request, offset, fps, initial_world, sample_frame):
     """Read a single frame; caller owns one timeline pass for all requests."""
     import numpy as np
-    from ...models.bone_bindings import bone_world_matrix
+    from ...models.bone_bindings import _rigid_matrix_rows, bone_world_matrix
     from .bones import _frame
     arm, parent, ancestor = request['arm'], request['parent'], request['ancestor']
     world = bone_world_matrix(arm, parent.bone)
     if ancestor is None:
-        frame = _frame(initial_world if offset == 0 else world, 'automatic parent pose')
+        label = f"automatic parent {arm.name}/{parent.name} frame {sample_frame}"
+        rows = initial_world if offset == 0 else _rigid_matrix_rows(world, label)
+        frame = _frame(rows, label)
         request['keys'].append(dict(time_s=offset/float(fps), center_world_m=frame['translation_m'],
                                     rotation_world_wxyz=frame['quaternion_wxyz']))
         return

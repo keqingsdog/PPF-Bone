@@ -287,7 +287,8 @@ def encode_bones(context, state, fps, start_frame, *, cone_restoring_joint_ids=N
                     _validate_pose_scales_at_frame(scale_sources, sample_frame)
                     for request in sampled_auto_anchors.values():
                         sample_parent_track(request, offset, fps,
-                                            request['anchors'][0]['parent_world_matrix_blender'])
+                                            request['anchors'][0]['parent_world_matrix_blender'],
+                                            sample_frame)
                     for arm, bone_name, row, root, source_mode in roots:
                         if root["mode"] == "static" and offset > 0 and not root.get("control_events"):
                             continue
