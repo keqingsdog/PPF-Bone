@@ -420,6 +420,9 @@ def _register_body():
     cross_link_model.register()
     cross_link_presets.register()
     cross_link_ops.register()
+    from .ops import mmd_physics_import, bone_selection
+    mmd_physics_import.register()
+    bone_selection.register()
     from .models import restoring_curve_rna
     from .ops import restoring_curve_operators
     from .ui import restoring_curves
@@ -840,6 +843,9 @@ def unregister():
     from .ops import cross_links as cross_link_ops
     from .models import cross_links as cross_link_model
     from .ops import cross_link_presets
+    from .ops import mmd_physics_import, bone_selection
+    bone_selection.unregister()
+    mmd_physics_import.unregister()
     cross_link_ops.unregister()
     cross_link_presets.unregister()
     cross_link_model.unregister()

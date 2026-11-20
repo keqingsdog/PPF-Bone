@@ -560,7 +560,7 @@ def _encode_pin_config(context, groups, state, fps=None, start_frame=None):
                 )
             if pin_cache is not None:
                 from ..capture_provenance import validate_capture
-                validate_capture(context.scene, obj, pin_cache, "PIN", vg_name)
+                validate_capture(context.scene, obj, pin_cache, "PIN", vg_name, pin_item=pin_item)
             if pin_cache is not None and pin_cache.shape[0] >= 2:
                 live_pin_indices = _get_pin_indices(obj, vg_name)
                 if pin_cache.shape[1] != len(live_pin_indices):

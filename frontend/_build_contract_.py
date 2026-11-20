@@ -190,7 +190,7 @@ _NATIVE_EXTENSION_ATTRS = (
     '_pdrd_ball_anchor_payload', '_pdrd_root_motion_payload',
     '_fem_bone_joint_payload', '_fem_body_controls_payload',
     '_fem_body_control_events_payload', '_blender_bone_bindings',
-    '_cross_links_payload',
+    '_cross_links_payload', '_pmx_joints_payload',
     '_soft_limit_auto_intent',
 )
 _EXTENSION_SIDECARS = (
@@ -198,7 +198,7 @@ _EXTENSION_SIDECARS = (
     'bin/pdrd_scene_context.cbor', 'bin/restoring_curves_v1.json',
     'bin/fem_bone_joints.json', 'bin/fem_body_controls_v1.json',
     'bin/fem_body_controls_v2.json', 'bin/pdrd_root_motion_v1.cbor',
-    'bin/cross_links_v1.json',
+    'bin/cross_links_v1.json', 'bin/pmx_joints_v1.json',
     'bin/pdrd_root_motion_v2.cbor', 'bin/pdrd_root_motion_v3.cbor',
 )
 
@@ -265,6 +265,10 @@ def validate_requests(contract, param_data):
         from ._cross_links_ import validate_author, capability
         validate_author(document['cross_links_v1'], document.get('bindings', []))
         capability(contract, directional=any('tension_enabled' in row for row in document['cross_links_v1']['links']))
+    if 'pmx_joints_v1' in document:
+        from . import _pmx_joints_ as pmx
+        pmx.validate_author(document['pmx_joints_v1'], document.get('bindings', []))
+        pmx.capability(contract)
     if document.get('cross_link_collision_pairs_v1'):
         from ._cross_links_ import capability
         capability(contract, collision_pairs=True)
@@ -292,6 +296,9 @@ def validate_requests(contract, param_data):
 
 
 def validate_fixed(contract, fixed):
+    if getattr(fixed, '_pmx_joints_payload', None) is not None:
+        from ._pmx_joints_ import capability as pmx_capability
+        pmx_capability(contract)
     if getattr(fixed, '_cross_links_payload', None) is not None:
         from ._cross_links_ import capability
         capability(contract, directional=any('tension_enabled' in row for row in fixed._cross_links_payload['links']))
@@ -351,6 +358,8 @@ def write_receipt(contract, fixed, path):
     validate_fixed(contract, fixed)
     _verify_native_inventory(path, context)
     features = _required_features(path)
+    from ._pmx_joints_ import require_wire_presence
+    require_wire_presence(path, features)
     if ('pdrd_kinematic_roots_v3' in features and contract.producer_version != 3
             or SOFT_FEATURE in features and SOFT_FEATURE not in contract.capabilities
             or 'fem_prescribed_roots_v1' in features and 'fem_prescribed_roots_v1' not in contract.capabilities
@@ -377,6 +386,9 @@ def verify_session(fixed, path):
         return None
     validate_fixed(contract, fixed)
     receipt = validate_receipt(path, contract.receipt())
+    from ._pmx_joints_ import require_wire_presence, capability as pmx_capability
+    if require_wire_presence(path, receipt['required_features']) and getattr(fixed, '_pmx_joints_payload', None) is None:
+        pmx_capability(contract)
     context = _sealed_context(path)
     _verify_native_inventory(path, context)
     if (receipt['scene_uuid'] != context['scene_uuid']

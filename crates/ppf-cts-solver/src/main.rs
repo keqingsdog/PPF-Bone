@@ -15,6 +15,7 @@ mod material_spin_history;
 mod soft_joint;
 mod material_endpoint;
 mod cross_links;
+mod pmx_joints;
 mod fem_control_events;
 mod soft_joint_gpu;
 mod collision_filter;
@@ -230,6 +231,13 @@ fn main() {
         }
         return;
     }
+    if std::env::args().any(|arg|arg=="--pmx-joints-capability-json") {
+        let probe = probe_restoring_backend(args::PcgPrecision::Fp32);
+        println!("{}",serde_json::json!({"kind":"ppf.pmx_joints.capability","version":1,"required_feature":pmx_joints::FEATURE,
+            "supported":probe.is_ok(),"backend":env!("PPF_BACKEND"),"semantic_version":1,
+            "model":"COMPLIANT_EULER_XYZ_BOX","detail":probe.err()}));
+        return;
+    }
     if std::env::args().any(|arg|arg=="--cross-links-capability-json") {
         match ensure_restoring_backend() {
             Ok(_)=>println!("{}",serde_json::json!({"kind":"ppf.cross_links.capability","version":1,"required_feature":cross_links::FEATURE,"supported":true,"backend":env!("PPF_BACKEND"),"model":"AXIAL_DISTANCE","semantic_version":1,"directional_controls_version":1,"full_force_direction_switches":true,"cross_link_collision_pairs_version":1,"binding_kind":5,"requires_matching_native_kernel_build":true,"solver_identity":compiled_restoring_identity()})),
@@ -339,7 +347,8 @@ fn main() {
     }
     let mut restoring_backend_verified = program_args.require_restoring_curves_v1
         || std::path::Path::new(&program_args.path).join("bin/restoring_curves_v1.json").exists()
-        || std::path::Path::new(&program_args.path).join(cross_links::FILE).exists();
+        || std::path::Path::new(&program_args.path).join(cross_links::FILE).exists()
+        || std::path::Path::new(&program_args.path).join(pmx_joints::FILE).exists();
     if restoring_backend_verified {
         if let Err(e)=ensure_restoring_backend(){eprintln!("{e}");std::process::exit(2);}
     }
@@ -348,7 +357,7 @@ fn main() {
     if let Err(e)=collision_filter::prepare_fresh(std::path::Path::new(&program_args.path),program_args.require_collision_filter_v1,0) {
         eprintln!("COLLISION_FILTER_PRE_SIMULATION_REFUSAL {e}");std::process::exit(2);
     }
-    if std::path::Path::new(&program_args.path).join(joint::JOINT_FILE).exists() || std::path::Path::new(&program_args.path).join(joint_root_motion_binding::ROOT_MOTION_FILE).exists() || std::path::Path::new(&program_args.path).join(soft_joint::FILE).exists() || std::path::Path::new(&program_args.path).join(cross_links::FILE).exists() || std::path::Path::new(&program_args.path).join(connected_collision_native::CROSS_FILE).exists() {
+    if std::path::Path::new(&program_args.path).join(joint::JOINT_FILE).exists() || std::path::Path::new(&program_args.path).join(joint_root_motion_binding::ROOT_MOTION_FILE).exists() || std::path::Path::new(&program_args.path).join(soft_joint::FILE).exists() || std::path::Path::new(&program_args.path).join(cross_links::FILE).exists() || std::path::Path::new(&program_args.path).join(pmx_joints::FILE).exists() || std::path::Path::new(&program_args.path).join(connected_collision_native::CROSS_FILE).exists() {
         let gate=joint::preflight_selected(std::path::Path::new(&program_args.path), joint::ExperimentalBallAnchorSelection::Requested);
         if let Err(e)=gate { joint::write_preflight_refusal(std::path::Path::new(&program_args.path),&e); eprintln!("JOINT_NATIVE_PRE_SIMULATION_REFUSAL {e}"); std::process::exit(2); }
         #[cfg(not(neutral_driver))]
@@ -470,7 +479,7 @@ fn main() {
         // Consume exactly the State bytes whose gzip provenance was inspected.
         let mut backend = backend::Backend::load_state_payload(&program_args.output,&decoded_state.payload);
         let required=mixed_pcg||state_requirement!=checkpoint_state_marker::HistoryRequirement::LegacyUnmarkedAmbiguous||scene.joint_input.is_some()||prepared_curves.is_some()||
-            [joint::JOINT_FILE,joint_root_motion_binding::ROOT_MOTION_FILE,soft_joint::FILE,cross_links::FILE,connected_collision_native::CROSS_FILE].iter().any(|p|std::path::Path::new(&program_args.path).join(p).exists());
+            [joint::JOINT_FILE,joint_root_motion_binding::ROOT_MOTION_FILE,soft_joint::FILE,cross_links::FILE,pmx_joints::FILE,connected_collision_native::CROSS_FILE].iter().any(|p|std::path::Path::new(&program_args.path).join(p).exists());
         let versioned_history=checkpoint_history::read_versioned(std::path::Path::new(&program_args.output),program_args.load,required)
             .unwrap_or_else(|e|{eprintln!("{e}");std::process::exit(2)});
         let history=versioned_history.as_ref().map(|h|h.legacy().clone());

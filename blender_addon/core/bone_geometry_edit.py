@@ -126,6 +126,13 @@ def token_for(proxy, kind=None):
     return None
 
 
+def leased_proxies(kind=None):
+    """Return the current lease's proxy references without exposing the lease."""
+    if _lease is None or (kind is not None and _lease['kind'] != kind):
+        return ()
+    return tuple(proxy for proxy, _before in _lease['snapshots'])
+
+
 def finish(token, commit=False):
     """Commit a real change, or release unchanged/cancelled preview.
 

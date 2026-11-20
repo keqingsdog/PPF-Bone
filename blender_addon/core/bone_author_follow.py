@@ -17,6 +17,7 @@ _seen = {}
 _rest_seen = {}
 _author_signatures = {}  # Primitive author inputs, independent of evaluated pose.
 _frame_object_observations = {}
+_motion_dirty_scenes = set()
 _EPS = 2e-6
 _initialized = False
 _active = False
@@ -393,6 +394,8 @@ def _snapshot_all():
         for key, _settings, proxy, *_ in _rows(scene, validate=False):
             _record_row_signature(scene, key, proxy)
     _pose_preview.clear()
+    _motion_dirty_scenes.clear()
+    _motion_dirty_scenes.update(scene.session_uid for scene in scenes)
     _initialized = True
 
 
@@ -439,6 +442,24 @@ def _cancel_initial_snapshot():
         bpy.app.timers.unregister(previous)
 
 
+@persistent
+def _mark_author_motion(scene, depsgraph):
+    if not _initialized or _identity_rebuilding:
+        return
+    for update in depsgraph.updates:
+        item = update.id.original
+        if (isinstance(item, bpy.types.Object) and item.mode == 'EDIT'
+                and item.get('ppf_bone_proxy_visibility_editing')):
+            continue
+        if (isinstance(item, bpy.types.Armature) and update.is_updated_geometry) or (
+            isinstance(item, bpy.types.Object)
+            and (update.is_updated_transform or update.is_updated_geometry)
+            and (item.type == 'ARMATURE' or item.get('ppf_bone_proxy_owned'))
+        ):
+            _motion_dirty_scenes.add(scene.session_uid)
+            return
+
+
 def has_pending():
     """Read-only poll for modal work; no object or PropertyGroup writes."""
     if not _initialized or _identity_rebuilding:
@@ -448,6 +469,8 @@ def has_pending():
         return False
     if any(key[0] == scene.as_pointer() for key in _pose_preview):
         return True
+    if scene.session_uid not in _motion_dirty_scenes:
+        return False
     for scene in (scene,):
         try:
             if not _author_scene(scene):
@@ -468,6 +491,7 @@ def has_pending():
             # alive or authorize writes. The idle path never enters this scan.
             if changed and any(row[0] in changed for row in _rows(scene, skip_animated=True)):
                 return True
+            _motion_dirty_scenes.discard(scene.session_uid)
         except (AttributeError, RuntimeError, TypeError, ValueError):
             continue
     return False
@@ -989,6 +1013,7 @@ def _reset_after_undo(*_args):
 def _author_before_identity_rebuild(*_args):
     _edit_metadata.clear()
     _frame_object_observations.clear()
+    _motion_dirty_scenes.clear()
     global _identity_rebuilding, _initialized, _baseline_generation
     _identity_rebuilding = True
     _initialized = False
@@ -1004,6 +1029,7 @@ def _author_before_identity_rebuild(*_args):
 def _reset_baseline(*, defer=False):
     _edit_metadata.clear()
     _frame_object_observations.clear()
+    _motion_dirty_scenes.clear()
     global _initialized, _baseline_generation
     _baseline_generation += 1
     _initialized = False
@@ -1031,10 +1057,12 @@ def register():
     _seen.clear()
     _author_signatures.clear()
     _frame_object_observations.clear()
+    _motion_dirty_scenes.clear()
     _unproven.clear()
     _rest_seen.clear()
     _pose_preview.clear()
     for collection, fn in ((bpy.app.handlers.load_post, _reset_after_load),
+                           (bpy.app.handlers.depsgraph_update_post, _mark_author_motion),
                            (bpy.app.handlers.frame_change_post, _observe_frame_object_basis),
                            (bpy.app.handlers.undo_pre, _author_before_identity_rebuild),
                            (bpy.app.handlers.redo_pre, _author_before_identity_rebuild),
@@ -1052,17 +1080,20 @@ def unregister():
     _active = False
     _initialized = False
     _cancel_initial_snapshot()
-    for collection in (bpy.app.handlers.load_post, bpy.app.handlers.frame_change_post, bpy.app.handlers.undo_pre,
+    for collection in (bpy.app.handlers.load_post, bpy.app.handlers.frame_change_post,
+                       bpy.app.handlers.depsgraph_update_post, bpy.app.handlers.undo_pre,
                        bpy.app.handlers.redo_pre, bpy.app.handlers.undo_post,
                        bpy.app.handlers.redo_post):
         for fn in list(collection):
-            if fn.__name__ in ('_reset_after_load', '_reset_after_undo', '_author_before_identity_rebuild', '_observe_frame_object_basis'):
+            if fn.__name__ in ('_reset_after_load', '_reset_after_undo', '_author_before_identity_rebuild',
+                               '_observe_frame_object_basis', '_mark_author_motion'):
                 collection.remove(fn)
     _seen.clear()
     _unproven.clear()
     _rest_seen.clear()
     _author_signatures.clear()
     _frame_object_observations.clear()
+    _motion_dirty_scenes.clear()
     _pose_preview.clear()
 
 

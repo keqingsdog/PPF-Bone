@@ -338,21 +338,22 @@ def _proxy_geometry_state(proxy):
             tuple(tuple(row) for row in proxy.matrix_world))
 
 
-def update_proxies(context, all_bones=False, scope='SELECTED', rebuild=False, reset_default_size=False, shape_changed_from=None):
+def update_proxies(context, all_bones=False, scope='SELECTED', rebuild=False, reset_default_size=False, shape_changed_from=None, *, authoring_rows=None, after_apply=None):
     """Keep author follow and proxy updates inside one rollback boundary."""
     from ..core.bone_geometry_edit import preflight
     from ..core.bone_author_follow import transfer_author_transaction
     preflight(context)
     # Follow may move unselected rows too, just as the ordinary FramePump does.
     # Hold every existing author mesh/baseline until the selected update commits.
-    with transfer_author_transaction(context) as commit_author:
+    from ..models.bone_collision import collision_edit_batch
+    with transfer_author_transaction(context) as commit_author, collision_edit_batch():
         count = _update_proxies_author_transaction(
-            context, all_bones, scope, rebuild, reset_default_size, shape_changed_from)
+            context, all_bones, scope, rebuild, reset_default_size, shape_changed_from, authoring_rows, after_apply)
         commit_author()
         return count
 
 
-def _update_proxies_author_transaction(context, all_bones=False, scope='SELECTED', rebuild=False, reset_default_size=False, shape_changed_from=None):
+def _update_proxies_author_transaction(context, all_bones=False, scope='SELECTED', rebuild=False, reset_default_size=False, shape_changed_from=None, authoring_rows=None, after_apply=None):
     """Create new curve authority in the same undoable proxy transaction."""
     from ..core.bone_geometry_edit import preflight
     preflight(context)
@@ -364,6 +365,11 @@ def _update_proxies_author_transaction(context, all_bones=False, scope='SELECTED
     from .restoring_curve_operators import read_state,write_state,snapshot_rna,restore_rna
     from .restoring_curves import add_new_common
     arm,bones=selected_bones(context,all_bones,scope)
+    if authoring_rows is not None:
+        unknown = set(authoring_rows) - {bone.name for bone in bones}
+        if unknown or not authoring_rows:
+            raise ValueError('Authoring rows must name selected bones')
+        bones = [bone for bone in bones if bone.name in authoring_rows]
     rebuild = rebuild or reset_default_size
     before_geometry=[_proxy_geometry_state(b.ppf_bone_physics.proxy) for b in bones]
     owner=context.scene.ppf_restoring_curves
@@ -373,19 +379,8 @@ def _update_proxies_author_transaction(context, all_bones=False, scope='SELECTED
     settings=[(bone,snapshot_rna(bone.ppf_bone_physics)) for bone in bones]
     arm_id=arm.ppf_armature_uuid
     arm_id_set=arm.is_property_set('ppf_armature_uuid')
-    fresh={bone.name for bone in bones if not bone.ppf_bone_physics.enabled and not bone.ppf_bone_physics.proxy
-           and not any(getattr(bone.ppf_bone_physics,key) for key in ('bone_uuid','body_uuid','joint_uuid','group_uuid'))}
-    planned_ids={name:str(uuid.uuid4()) for name in fresh}
-    enabled={b.name for b in arm.data.bones if b.ppf_bone_physics.enabled}|{b.name for b in bones}
-    targets=[{'kind':'JOINT','joint_uuid':planned_ids[b.name],'channel':channel}
-             for b in bones if b.name in fresh and b.parent
-             and (b.parent.name in enabled or b.ppf_bone_physics.auto_follow_parent)
-             and b.ppf_bone_physics.joint_mode in {'SOFT','BALL_FIXED'}
-             for channel in (('twist_x','swing_y','swing_z') if b.ppf_bone_physics.joint_mode=='BALL_FIXED' else ('twist_x','swing_y','swing_z','anchor'))]
-    data=get_addon_data(context.scene)
-    candidate=add_new_common(previous,targets,[p.pair_id for p in data.state.merge_pairs],
-                             has_draft=dormant or bool(owner.editor_target_json or len(owner.nodes)))
     existing_objects={obj.as_pointer() for obj in bpy.data.objects}
+    data=get_addon_data(context.scene)
     group_snapshot=snapshot_rna(data)
     backups=[(b.ppf_bone_physics.proxy,b.ppf_bone_physics.proxy.data,_proxy_channels(b.ppf_bone_physics.proxy,context.scene))
              for b in bones if b.ppf_bone_physics.proxy]
@@ -394,9 +389,27 @@ def _update_proxies_author_transaction(context, all_bones=False, scope='SELECTED
     new_visibility=[]
     new_resources={'objects': [], 'collections': []}
     try:
+        if authoring_rows is not None:
+            for bone in bones:
+                for key, value in authoring_rows[bone.name].get('settings', {}).items():
+                    setattr(bone.ppf_bone_physics, key, value)
+        fresh={bone.name for bone in bones if not bone.ppf_bone_physics.enabled and not bone.ppf_bone_physics.proxy
+               and not any(getattr(bone.ppf_bone_physics,key) for key in ('bone_uuid','body_uuid','joint_uuid','group_uuid'))}
+        planned_ids={name:str(uuid.uuid4()) for name in fresh}
+        enabled={b.name for b in arm.data.bones if b.ppf_bone_physics.enabled}|{b.name for b in bones}
+        targets=[{'kind':'JOINT','joint_uuid':planned_ids[b.name],'channel':channel}
+                 for b in bones if b.name in fresh and b.parent
+                 and has_physical_joint_parent(b, enabled)
+                 and b.ppf_bone_physics.joint_mode in {'SOFT','BALL_FIXED'}
+                 for channel in (('twist_x','swing_y','swing_z') if b.ppf_bone_physics.joint_mode=='BALL_FIXED' else ('twist_x','swing_y','swing_z','anchor'))]
+        data=get_addon_data(context.scene)
+        candidate=add_new_common(previous,targets,[p.pair_id for p in data.state.merge_pairs],
+                                 has_draft=dormant or bool(owner.editor_target_json or len(owner.nodes)))
         from ..core.bone_author_follow import flush_author_before_update
         follow_changed = flush_author_before_update(context)
-        count=_update_proxies(context,all_bones,scope,rebuild,planned_ids,retained_meshes,new_visibility,reset_default_size,shape_changed_from,new_resources)
+        count=_update_proxies(context,all_bones,scope,rebuild,planned_ids,retained_meshes,new_visibility,reset_default_size,shape_changed_from,new_resources,authoring_rows)
+        if after_apply is not None:
+            after_apply(arm, bones)
         for bone in bones:
             if bone.name in fresh and not bone.ppf_bone_physics.is_property_set('soft_limit_policy'):
                 bone.ppf_bone_physics.soft_limit_policy='AUTO_INERTIA'
@@ -454,7 +467,7 @@ def _proxy_channels(obj, scene=None):
     from ..core.bone_proxy_visibility import snapshot_proxy
     scalars=('parent','parent_type','parent_bone','rotation_mode','display_type','show_in_front','hide_render')
     vectors=('location','rotation_euler','rotation_quaternion','rotation_axis_angle','scale',
-             'delta_location','delta_rotation_euler','delta_rotation_quaternion','delta_scale')
+             'delta_location','delta_rotation_euler','delta_rotation_quaternion','delta_scale','color')
     return {**{key:getattr(obj,key) for key in scalars},
             **{key:tuple(getattr(obj,key)) for key in vectors},
             'matrix_parent_inverse':obj.matrix_parent_inverse.copy(),
@@ -479,8 +492,10 @@ def _rollback_guard():
     return material_write_guard()
 
 
-def _update_proxies(context, all_bones=False, scope='SELECTED', rebuild=False, planned_joint_ids=None, retained_meshes=None, new_visibility=None, reset_default_size=False, shape_changed_from=None, new_resources=None):
+def _update_proxies(context, all_bones=False, scope='SELECTED', rebuild=False, planned_joint_ids=None, retained_meshes=None, new_visibility=None, reset_default_size=False, shape_changed_from=None, new_resources=None, authoring_rows=None):
     arm, bones = selected_bones(context, all_bones, scope)
+    if authoring_rows is not None:
+        bones = [bone for bone in bones if bone.name in authoring_rows]
     if not has_addon_data(context.scene):
         raise ValueError("Register the original PPF addon before creating proxies")
     validate_final_binding_ids(context.scene,arm,bones)
@@ -488,6 +503,10 @@ def _update_proxies(context, all_bones=False, scope='SELECTED', rebuild=False, p
     selected_names={b.name for b in bones}
     enabled_names=selected_names|{b.name for b in arm.data.bones if b.ppf_bone_physics.enabled}
     creation_plans={b.name:new_binding_plan(b.ppf_bone_physics,bone_world_length(arm, b),reset_default_size,arm.ppf_armature_uuid) for b in bones}
+    if authoring_rows is not None:
+        for bone in bones:
+            if bone.ppf_bone_physics.proxy is not None:
+                creation_plans[bone.name] = {}
     # Authoring may intentionally overlap. Collision clearance belongs to the
     # real build/solver policy, never a coarse pre-creation fit or refusal.
     planned_models={b.name:creation_plans.get(b.name,{}).get('physical_model',b.ppf_bone_physics.physical_model) for b in arm.data.bones}
@@ -523,7 +542,17 @@ def _update_proxies(context, all_bones=False, scope='SELECTED', rebuild=False, p
                     raise ValueError(f"{bone.name}: dedicated group has unrelated assignments")
                 if len(group.assigned_objects)!=1:
                     raise ValueError(f'{bone.name}: its material group must hold exactly this proxy before settings are synced')
-            if s.proxy and not rebuild:
+            if authoring_rows is not None and authoring_rows[bone.name].get("geometry") is not None:
+                vertices, faces, frame = authoring_rows[bone.name]["geometry"]
+                mesh = bpy.data.meshes.new(f"PPF_Bone_{bone.name}_fit")
+                try:
+                    mesh.from_pydata(vertices, [], faces)
+                    mesh.update()
+                    _validate_bone_proxy_mesh(mesh, arm, bone, generated=True)
+                except Exception:
+                    bpy.data.meshes.remove(mesh)
+                    raise
+            elif s.proxy and not rebuild:
                 # Update authoring metadata without erasing edited geometry or pose.
                 # Validate a disposable copy without changing authored topology.
                 checked = s.proxy.data.copy()
@@ -595,7 +624,9 @@ def _update_proxies(context, all_bones=False, scope='SELECTED', rebuild=False, p
             proxy['ppf_bone_proxy_owned'] = True
             proxy['ppf_bone_uuid'] = s.bone_uuid
             proxy['ppf_armature_uuid'] = arm.ppf_armature_uuid
-            if creation_plans[bone.name].get('_auto_geometry_defaults'):
+            if authoring_rows is not None and authoring_rows[bone.name].get('geometry') is not None:
+                proxy[_RECREATE_SIZE_POLICY] = 'PRESERVE'
+            if creation_plans[bone.name].get('_auto_geometry_defaults') and not (authoring_rows is not None and authoring_rows[bone.name].get('geometry') is not None):
                 if _RECREATE_SIZE_POLICY in proxy:del proxy[_RECREATE_SIZE_POLICY]
             elif created and (old_intent=='PRESERVE' or not geometry_snapshot_matches(s)):
                 # Reconstructing stored author dimensions does not turn them
@@ -1197,11 +1228,13 @@ class PPF_OT_BoneCustomApply(bpy.types.Operator):
         return {'FINISHED'}
 
 
-def _owned_bone_material(scene, arm, bone):
-    try:validate_proxy_owner(arm,bone)
+def _owned_bone_material(scene, arm, bone, *, groups=None, **owner_counts):
+    try:validate_proxy_owner(arm,bone,**owner_counts)
     except ValueError:return None
     s = bone.ppf_bone_physics
-    group = get_group_by_uuid(scene, s.group_uuid) if s.group_uuid else None
+    group = None
+    if s.group_uuid:
+        group = get_group_by_uuid(scene, s.group_uuid) if groups is None else groups.get(s.group_uuid)
     proxy = s.proxy
     if (group and group.active and group.object_type in ('PDRD', 'SOLID') and proxy
             and proxy.get('ppf_bone_proxy_owned')
@@ -1683,6 +1716,31 @@ def owned_bone_material(scene, arm, bone):
     return _owned_bone_material(scene, arm, bone)
 
 
+def selected_bone_materials(scene, rows):
+    """Check one draw's selected rows with a shared ownership inventory."""
+    from collections import Counter
+    from ..models.bone_bindings import armature_data_owner_counts
+    from ..models.groups import iterate_object_groups
+
+    groups = {}
+    for group in iterate_object_groups(scene):
+        groups.setdefault(group.uuid, group)
+    data_counts = armature_data_owner_counts()
+    scene_counts = Counter(obj.as_pointer() for candidate in bpy.data.scenes for obj in candidate.objects)
+    owners = {}
+    for arm, bone in rows:
+        if bone.ppf_bone_physics.proxy is None:
+            continue
+        identity = arm.data.as_pointer()
+        if identity not in owners:
+            owners[identity] = Counter(proxy.as_pointer() for sibling in arm.data.bones
+                                       if (proxy := sibling.ppf_bone_physics.proxy) is not None)
+        group = _owned_bone_material(scene, arm, bone, groups=groups, data_owner_counts=data_counts,
+                                     scene_user_counts=scene_counts, proxy_counts=owners[identity])
+        if group is not None:
+            yield group
+
+
 def escaped_bone_path(bone):
     """The real RNA path of a Bone inside its armature datablock."""
     try:
@@ -2057,11 +2115,15 @@ def register():
     bone_material.register()
     from . import bone_proxy_editor
     bone_proxy_editor.register()
+    from . import bone_weight_fit
+    bone_weight_fit.register()
 
 
 def unregister():
     if hasattr(bpy.types.WindowManager,'ppf_bone_participation_scope'):del bpy.types.WindowManager.ppf_bone_participation_scope
     from . import bone_proxy_editor
+    from . import bone_weight_fit
+    bone_weight_fit.unregister()
     bone_proxy_editor.unregister()
     from . import bone_material
     bone_material.unregister()

@@ -1364,6 +1364,8 @@ class FixedScene:
         write_fem_control_sidecar(self,path)
         from ._cross_links_ import write_sidecar as write_cross_links, FEATURE as CROSS_LINK_FEATURE
         has_cross_links = write_cross_links(self, path)
+        from ._pmx_joints_ import write_sidecar as write_pmx_joints, FEATURE as PMX_FEATURE
+        has_pmx_joints = write_pmx_joints(self, path)
         from ._bone_connected_collision_ import write_cross_sidecar, CROSS_FEATURE
         has_cross_collision = write_cross_sidecar(self, path)
         fem_payload = getattr(self, '_fem_bone_joint_payload', None)
@@ -1469,6 +1471,9 @@ class FixedScene:
         if has_cross_links:
             version = 3 if version == 2 else version
             features = sorted(set(features + [CROSS_LINK_FEATURE]))
+        if has_pmx_joints:
+            version = 3 if version == 2 else version
+            features = sorted(set(features + [PMX_FEATURE]))
         if has_cross_collision:
             version = 3 if version == 2 else version
             features = sorted(set(features + [CROSS_FEATURE]))

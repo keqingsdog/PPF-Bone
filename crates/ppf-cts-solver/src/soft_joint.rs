@@ -217,7 +217,7 @@ pub fn prepare(input:&ValidatedJointInput)->Result<Option<OwnedSoftScene>,JointE
     let v2=crate::joint_angular_gpu::from_validated(&ordered).map_err(|e|bad("angular_v2",&e))?;
     let controls=crate::joint_angular_control_gpu::from_validated(&ordered).map_err(|e|bad("angular_control",&e))?;
     let empty_control=crate::joint_angular_control_gpu::AngularControlGpu {body_a:0,body_b:0,enabled:0,coordinate_model:1,frame_a_wxyz:[1.,0.,0.,0.],frame_b_wxyz:[1.,0.,0.,0.],rest_relative_wxyz:[1.,0.,0.,0.],stiffness_nm_per_rad:[0.;3],damping_nms_per_rad:[0.;3]};
-    let records=p.joints.iter().enumerate().map(|(i,r)|FemJointGpu {a:pairs[i].0,b:pairs[i].1,enabled:u32::from(r.wire.enabled),ball_stiffness:r.wire.stiffness_N_per_m as f32,v2:v2[i],control:controls.get(i).copied().unwrap_or(empty_control)}).collect();
+    let records=p.joints.iter().enumerate().map(|(i,r)|FemJointGpu {a:pairs[i].0,b:pairs[i].1,enabled:u32::from(r.wire.enabled),ball_stiffness:r.wire.stiffness_N_per_m as f32,v2:v2[i],control:controls.get(i).copied().unwrap_or(empty_control),pmx:Default::default()}).collect();
     use crate::joint_angular_extension_gpu as ext;
     if ordered.joints.iter().any(|j|j.wire.angular_control_v1.as_ref().is_some_and(|c|!supported_angular_model(&c.coordinate_model))) {return Err(bad("angular_control","unsupported FEM angular coordinate model"));}
     let refs:Vec<_>=ordered.joints.iter().map(|j|ext::JointExtensionInput {control_present:j.wire.angular_control_v1.is_some(),control_model:j.wire.angular_control_v1.as_ref().map(|c|c.coordinate_model.as_str()),soft:j.wire.angular_soft_limits_v1.as_ref().map(|v|&v.0),drives:j.wire.angular_drives_v1.as_ref().map(|v|&v.0),legacy_angular_nonzero:j.wire.angle_stiffness_nm_per_rad!=0. || j.wire.angle_damping_nms_per_rad!=0. || j.wire.max_angle_rad!=0.}).collect();
@@ -229,6 +229,22 @@ pub fn prepare(input:&ValidatedJointInput)->Result<Option<OwnedSoftScene>,JointE
 }
 
 pub fn write_receipt(output:&std::path::Path, scene:&OwnedSoftScene, accepted_steps:u64,time:f64,state:&str)->Result<(),String> {
+    let pmx = scene.records.iter().filter(|r| r.pmx.enabled != 0).collect::<Vec<_>>();
+    if !pmx.is_empty() {
+        let count = |mode| pmx.iter().flat_map(|r| r.pmx.modes).filter(|&m| m == mode).count();
+        let value = serde_json::json!({
+            "version": 1, "kind": "PmxJointNativeReceipt", "scene_uuid": scene.scene_uuid,
+            "state": state, "accepted_steps": accepted_steps, "accepted_time_seconds": time,
+            "joint_count": pmx.len(), "free_axes": count(0), "limited_axes": count(1), "locked_axes": count(2),
+            "mechanism": "coupled_compliant_euler_xyz_box",
+            "linear_limit_weight_N_per_m": crate::pmx_joints::LINEAR_LIMIT_WEIGHT,
+            "angular_limit_weight_Nm_per_rad": crate::pmx_joints::ANGULAR_LIMIT_WEIGHT,
+        });
+        let temporary = output.join("pmx_joint_native_receipt.json.tmp");
+        let bytes = serde_json::to_vec_pretty(&value).map_err(|e| e.to_string())?;
+        std::fs::write(&temporary, bytes).map_err(|e| e.to_string())?;
+        std::fs::rename(temporary, output.join("pmx_joint_native_receipt.json")).map_err(|e| e.to_string())?;
+    }
     if scene.payload_sha256.is_empty(){return Ok(());}
     let value=serde_json::json!({"version":1,"kind":"FEMMaterialJointNativeReceipt","fem_body_controls":scene.control_receipt,"scene_uuid":scene.scene_uuid,"scene_inputs_sha256":scene.scene_inputs_sha256,"payload_sha256":scene.payload_sha256,"state":state,"accepted_steps":accepted_steps,"accepted_time_seconds":time,"joint_count":scene.wires.len(),"active_joint_count":scene.wires.iter().filter(|r|r.wire.enabled).count(),"fem_body_count":scene.bodies.iter().filter(|b|b.kind=="FEM_TET_MATERIAL").count(),"body_kinds":scene.bodies.iter().map(|b|(&b.body_uuid,&b.kind)).collect::<HashMap<_,_>>(),"mechanism":"material_node_force_and_matrix_free_cross_operator","pose_authority":"accepted_vertices"});
     let bytes=serde_json::to_vec_pretty(&value).map_err(|e|e.to_string())?;

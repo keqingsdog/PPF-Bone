@@ -184,6 +184,10 @@ def encode_bones(context, state, fps, start_frame):
               "fps": float(fps), "world_scaling": 1.}
     if cross_links is not None:
         result['cross_links_v1'] = cross_links
+    from .pmx_joints import encode as encode_pmx_joints
+    pmx_joints = encode_pmx_joints(context, source['bindings'])
+    if pmx_joints:
+        result['pmx_joints_v1'] = pmx_joints
     if cross_collision_pairs:
         result['cross_link_collision_pairs_v1'] = cross_collision_pairs
     if 'bone_mass_intent_v1' in source:

@@ -54,6 +54,8 @@ PREVIEW_RIGID_COLOR = (0.55, 0.8, 0.35)
 def effective_preview_color(settings, physical_model):
     """Resolve display-only RGB, including defensive non-RNA callers."""
     automatic = PREVIEW_SOFT_COLOR if physical_model == 'SOFT' else PREVIEW_RIGID_COLOR
+    from ..core.collision_palette import collision_group_color
+    automatic = collision_group_color(settings, automatic)
     if not getattr(settings, 'preview_color_custom', False):
         return automatic
     try:
@@ -65,8 +67,19 @@ def effective_preview_color(settings, physical_model):
     return tuple(min(1.0, max(0.0, v)) for v in color)
 
 
+def _refresh_proxy_color(settings, context):
+    from ..ui.dynamics.overlay import refresh_bone_proxy_color
+    refresh_bone_proxy_color(settings, getattr(context, 'scene', None))
+
+
+def _update_bone_collision(settings, context):
+    collision_settings_changed(settings, context)
+    _refresh_proxy_color(settings, context)
+
+
 def _update_preview_color(_self, context):
     """Display-only redraw; never synchronize material or retire a session."""
+    _refresh_proxy_color(_self, context)
     manager = getattr(context, 'window_manager', None)
     if manager is not None:
         for window in manager.windows:
@@ -162,10 +175,12 @@ def proxy_parent_armature(proxy):
     return None
 
 
-def validate_proxy_owner(armature,bone, *, data_owner_counts=None):
+def validate_proxy_owner(armature,bone, *, data_owner_counts=None, scene_user_counts=None, proxy_counts=None):
     """Refuse copied/stale pointers before any authoring mutation."""
     if armature.library or armature.data.library:raise _error('Make the armature local before authoring bone physics')
-    if len(armature.users_scene)>1:raise _error('骨架被多个场景共享；请使用独立的场景副本来编辑骨骼物理')
+    arm_scene_users = (len(armature.users_scene) if scene_user_counts is None
+                       else scene_user_counts.get(armature.as_pointer(), 0))
+    if arm_scene_users>1:raise _error('骨架被多个场景共享；请使用独立的场景副本来编辑骨骼物理')
     if data_owner_counts is None:data_owner_counts=armature_data_owner_counts()
     if data_owner_counts[armature.data.as_pointer()]>1:raise _error('Duplicate armature identity; duplicated rigs need independent bindings')
     s=bone.ppf_bone_physics;proxy=s.proxy
@@ -173,7 +188,9 @@ def validate_proxy_owner(armature,bone, *, data_owner_counts=None):
         if s.body_uuid and any(o.get('_solver_uuid')==s.body_uuid for o in bpy.data.objects):
             raise _error('Duplicate bone or body identity; do not share a proxy between bones')
         return
-    if len(proxy.users_scene)>1:raise _error('物理代理被多个场景共享；请先创建独立副本')
+    proxy_scene_users = (len(proxy.users_scene) if scene_user_counts is None
+                         else scene_user_counts.get(proxy.as_pointer(), 0))
+    if proxy_scene_users>1:raise _error('物理代理被多个场景共享；请先创建独立副本')
     if (proxy.type!='MESH' or not proxy.get('ppf_bone_proxy_owned') or
         proxy.get('ppf_bone_uuid')!=s.bone_uuid or proxy.get('ppf_armature_uuid')!=armature.ppf_armature_uuid or
         proxy.get('_solver_uuid')!=s.body_uuid):raise _error('{name}: proxy UUID changed; update its binding',name=bone.name)
@@ -183,7 +200,9 @@ def validate_proxy_owner(armature,bone, *, data_owner_counts=None):
     if owner is None and any(
             o!=armature and o.type=='ARMATURE' and o.ppf_armature_uuid==armature.ppf_armature_uuid for o in bpy.data.objects):
         raise _error('Duplicate armature identity; duplicated rigs need independent bindings')
-    if any(other!=bone and other.ppf_bone_physics.proxy==proxy for other in armature.data.bones):
+    duplicate = (any(other != bone and other.ppf_bone_physics.proxy == proxy for other in armature.data.bones)
+                 if proxy_counts is None else proxy_counts.get(proxy.as_pointer(), 0) > 1)
+    if duplicate:
         raise _error('Duplicate bone or body identity; do not share a proxy between bones')
 
 
@@ -453,6 +472,7 @@ class PPF_BonePhysics(PropertyGroup):
     bone_uuid: StringProperty(options=NOT_ANIMATED)
     body_uuid: StringProperty(options=NOT_ANIMATED)
     joint_uuid: StringProperty(options=NOT_ANIMATED)
+    use_hierarchy_joint: BoolProperty(name="连接父骨物理", description="使用骨架父级生成物理关节或运动学锚点", default=True, options=NOT_ANIMATED)
     auto_follow_parent: BoolProperty(name="Follow Nonphysical Parent", description="通过内部运动学锚点跟随父骨骼，保留作者偏移，不改变父骨骼物理状态；跟随时仅支持自由动态，不支持独立接管事件", default=True, options=NOT_ANIMATED)
     group_uuid: StringProperty(options=NOT_ANIMATED)
     proxy: PointerProperty(type=bpy.types.Object, poll=_mesh_only, update=_mark_mass_dirty, options=NOT_ANIMATED)
@@ -508,8 +528,8 @@ class PPF_BonePhysics(PropertyGroup):
     soft_stiffness_degree: FloatVectorProperty(name='手动限位刚度 N·mm/°', description='已保存手动绝对值；1000N·mm=1N·m，不会自动读取构建结果', size=3, min=0., precision=6, get=_get_soft_stiffness_degree, set=_set_soft_stiffness_degree, options={'SKIP_SAVE'})
     soft_stiffness: FloatVectorProperty(name="软限位刚度（Nm/rad）", description="力度越大越难越界，不同质量和尺寸需要匹配", size=3, default=(.04, .04, .04), min=0., options=NOT_ANIMATED)
     collide_connected: BoolProperty(name="Collide with Adjacent Bone", default=False, update=collision_settings_changed, options=NOT_ANIMATED)
-    collision_filter_enabled: BoolProperty(name="Enable Collision Group Filter", default=False, update=collision_settings_changed, options=NOT_ANIMATED)
-    collision_group_layers: BoolVectorProperty(name="Collision Membership", size=16, default=(True,) + (False,) * 15, update=collision_settings_changed, options=NOT_ANIMATED)
+    collision_filter_enabled: BoolProperty(name="Enable Collision Group Filter", default=False, update=_update_bone_collision, options=NOT_ANIMATED)
+    collision_group_layers: BoolVectorProperty(name="Collision Membership", size=16, default=(True,) + (False,) * 15, update=_update_bone_collision, options=NOT_ANIMATED)
     collision_mask_layers: BoolVectorProperty(name="Allowed Collision Groups", size=16, default=(True,) * 16, update=collision_settings_changed, options=NOT_ANIMATED)
     root_mode: EnumProperty(name="Root Mode", description="自由动态由物理控制；静态固定当前姿态；运动学跟随作者动画。SOFT独立控制仅支持根骨骼", items=CONTROL_MODES, default="FREE", options=NOT_ANIMATED)
     root_motion_source: EnumProperty(name='Animation Source', items=[('POSE','Bone Pose','Sample the authored bone world transform'),('OBJECT','Proxy Object','Sample the authored proxy world transform')], default='POSE', options=NOT_ANIMATED)
@@ -748,7 +768,7 @@ def _frame(settings, prefix):
 
 def has_physical_joint_parent(bone, enabled_names=None):
     """Physical or automatic parent endpoint; a Blender hierarchy alone is not a joint."""
-    if bone is None or bone.parent is None:
+    if bone is None or bone.parent is None or not getattr(bone.ppf_bone_physics, 'use_hierarchy_joint', True):
         return False
     parent_enabled = (bone.parent.name in enabled_names if enabled_names is not None
                       else bool(bone.parent.ppf_bone_physics.enabled))
@@ -885,8 +905,9 @@ def collect_bindings(context):
             if s.bone_uuid in seen_bones or s.body_uuid in seen_bodies:
                 raise _error("Duplicate bone or body identity; do not share a proxy between bones")
             seen_bones.add(s.bone_uuid);seen_bodies.add(s.body_uuid)
-            parent = bone.parent if bone.parent and bone.parent.ppf_bone_physics.enabled else None
-            nonphysical_parent = bone.parent if bone.parent and parent is None else None
+            hierarchy_parent = bone.parent if s.use_hierarchy_joint else None
+            parent = hierarchy_parent if hierarchy_parent and hierarchy_parent.ppf_bone_physics.enabled else None
+            nonphysical_parent = hierarchy_parent if hierarchy_parent and parent is None else None
             auto_parent = bool(nonphysical_parent and getattr(s, 'auto_follow_parent', True))
             has_joint_parent = bool(parent or auto_parent)
             if auto_parent and (s.root_mode != 'FREE' or len(s.root_control_events)):
@@ -939,7 +960,7 @@ def collect_bindings(context):
                 if s.joint_mode == 'D6':
                     physics['angular_control_v1']['stiffness_Nm_per_rad'] = dict.fromkeys(AXES, 0.)
                     physics['angular_control_v1']['damping_Nms_per_rad'] = dict.fromkeys(AXES, 0.)
-            row = {"armature_uuid": arm.ppf_armature_uuid, "bone_uuid": s.bone_uuid, "bone_name": bone.name, "body_uuid": s.body_uuid, "proxy_object_name": proxy.name, "group_uuid": s.group_uuid, "parent_bone_uuid": parent.ppf_bone_physics.bone_uuid if parent else None, "parent_body_uuid": parent.ppf_bone_physics.body_uuid if parent else None, "joint_uuid": s.joint_uuid, "enabled": True, "root_mode": s.root_mode, "root_boundary": {"is_root": parent is None, "nonphysical_parent_bone": bone.parent.name if bone.parent and parent is None else None}, "bone_world_matrix_blender": _rigid_matrix_rows(bone_world, bone.name), "proxy_world_matrix_blender": _rigid_matrix_rows(proxy_world, proxy.name), "body_to_bone_rest_blender": _rigid_matrix_rows(proxy_world.inverted() @ bone_world, bone.name), "joint_world_matrix_blender": _rigid_matrix_rows(bone_world @ axis, bone.name), "use_auto_frames": bool(s.use_auto_frames), "physics": physics}
+            row = {"armature_uuid": arm.ppf_armature_uuid, "bone_uuid": s.bone_uuid, "bone_name": bone.name, "body_uuid": s.body_uuid, "proxy_object_name": proxy.name, "group_uuid": s.group_uuid, "parent_bone_uuid": parent.ppf_bone_physics.bone_uuid if parent else None, "parent_body_uuid": parent.ppf_bone_physics.body_uuid if parent else None, "joint_uuid": s.joint_uuid, "enabled": True, "root_mode": s.root_mode, "root_boundary": {"is_root": parent is None, "nonphysical_parent_bone": nonphysical_parent.name if nonphysical_parent else None}, "bone_world_matrix_blender": _rigid_matrix_rows(bone_world, bone.name), "proxy_world_matrix_blender": _rigid_matrix_rows(proxy_world, proxy.name), "body_to_bone_rest_blender": _rigid_matrix_rows(proxy_world.inverted() @ bone_world, bone.name), "joint_world_matrix_blender": _rigid_matrix_rows(bone_world @ axis, bone.name), "use_auto_frames": bool(s.use_auto_frames), "physics": physics}
             if author_scale != 1.:
                 row['author_uniform_scale'] = author_scale
             if auto_parent:

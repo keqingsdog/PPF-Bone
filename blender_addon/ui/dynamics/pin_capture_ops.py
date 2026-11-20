@@ -54,6 +54,7 @@ _capture_job: dict = {
         "token": None,
         "owner": None,
     "aborted": False,
+    "stop_save_failed": False,
     # One entry per pin captured in this run. Each carries:
     # obj_uuid, obj_name, vg_name, group_index, pin_index,
     # pin_indices (snapshot at job start), frame_start, frame_end,
@@ -63,6 +64,7 @@ _capture_job: dict = {
     "total_frames_processed": 0,
     "total_frames": 0,
     "saved_frame": 1,
+    "range_settings": None,
     "origin_scene": None,
     "origin_pointer": None,
     "origin_filepath": None,
@@ -78,11 +80,13 @@ def _reset_job() -> None:
         "token": None,
         "owner": None,
         "aborted": False,
+        "stop_save_failed": False,
         "entries": [],
         "entry_cursor": 0,
         "total_frames_processed": 0,
         "total_frames": 0,
         "saved_frame": 1,
+        "range_settings": None,
         "origin_sampling_targets": None,
         "origin_scene": None,
         "origin_pointer": None,
@@ -97,6 +101,9 @@ def is_pin_capture_running() -> bool:
     """True while a Capture Pin Deformation job is in flight."""
     return bool(_capture_job.get("active"))
 
+
+def pin_capture_stop_save_failed() -> bool:
+    return bool(_capture_job.get("stop_save_failed"))
 
 def pin_capture_progress_snapshot() -> tuple[int, int, str, int]:
     """(done_frames, total_frames, status_line, pin_count) for the UI."""
@@ -145,6 +152,43 @@ def _sample_pin_frame_world(eval_obj, co) -> np.ndarray:
 def _effective_frame_range(scene, obj) -> tuple[int, int, str]:
     from .static_deform_ops import _effective_frame_range as _sd_range
     return _sd_range(scene, obj)
+
+
+def _effective_pin_frame_range(scene, obj, pin_item, *, base_range=None):
+    """Bound sampling to the solver horizon and the Pin's active interval."""
+    from .static_deform_ops import _sim_frame_count
+    start, end, source = base_range if base_range is not None else _effective_frame_range(scene, obj)
+    count = _sim_frame_count(scene)
+    if count is not None and count > 0 and start + count - 1 < end:
+        end = start + count - 1
+        source = iface_("simulation frame count ({count})").format(count=count)
+    if pin_item.use_pin_duration:
+        # Include the boundary sample used for interpolation up to release.
+        release_frame = start + int(pin_item.pin_duration)
+        if release_frame < end:
+            end = release_frame
+            source = iface_("Pin release frame ({frame})").format(frame=end)
+    return start, max(start, end), source
+
+
+def _require_capture_range_settings(scene, entries, pins=None):
+    """Check explicit bounds without rescanning every animation key."""
+    from ...core.encoder import resolve_start_frame_or_default
+    from .static_deform_ops import _sim_frame_count
+
+    if resolve_start_frame_or_default(scene) != entries[0]["frame_start"]:
+        raise RuntimeError("Effective capture frame range changed; capture cancelled")
+    if pins is None:
+        pins = [_resolve_capture_pin(scene, entry, identity_only=True)[0] for entry in entries]
+    count = _sim_frame_count(scene)
+    fallback_end = int(scene.frame_end) if count is None or count <= 0 else None
+    durations = tuple(int(pin.pin_duration) if pin.use_pin_duration else None for pin in pins)
+    settings = (count, fallback_end, durations)
+    if settings != _capture_job["range_settings"]:
+        # An explicit limit can change without affecting the effective range.
+        from ...core.capture_origin import require_capture_ranges
+        require_capture_ranges(scene, entries)
+        _capture_job["range_settings"] = settings
 
 
 # ---------------------------------------------------------------------------
@@ -204,12 +248,12 @@ def _build_entry(scene, group_index, pin_index, error_collector: list, *, alloca
     if sum(1 for row in group.assigned_objects if row.uuid == uid) != 1:
         error_collector.append("Pin capture owner membership is missing or ambiguous")
         return None
-    frame_start, frame_end, range_source = _effective_frame_range(scene, obj)
+    frame_start, frame_end, range_source = _effective_pin_frame_range(scene, obj, pin_item)
     n_frames = frame_end - frame_start + 1
-    if n_frames <= 0:
+    if n_frames < 2:
         error_collector.append(
             iface_(
-                "Pin '{pin}' on '{object}': empty frame range "
+                "Pin '{pin}' on '{object}': capture requires at least two frames "
                 "(start={start}, end={end})"
             ).format(pin=vg_name, object=obj.name, start=frame_start, end=frame_end)
         )
@@ -234,7 +278,7 @@ def _build_entry(scene, group_index, pin_index, error_collector: list, *, alloca
     }
 
 
-def _resolve_capture_pin(scene, entry):
+def _resolve_capture_pin(scene, entry, *, identity_only=False):
     """Resolve the captured author item, never whichever item occupies its index."""
     from ...core.uuid_registry import plan_pin_reference
     from ...core.encoder.pin import _get_pin_indices
@@ -250,10 +294,42 @@ def _resolve_capture_pin(scene, entry):
         if (plan is not None and plan[0].as_pointer() == entry["obj_pointer"]
                 and plan[0].name == entry["obj_name"] and plan[2] == entry["vg_name"]
                 and sum(1 for row in group.assigned_objects if row.uuid == entry["obj_uuid"]) == 1
-                and np.array_equal(entry["pin_indices"], _get_pin_indices(plan[0], plan[2]))):
-            return item
+                and (identity_only or np.array_equal(entry["pin_indices"], _get_pin_indices(plan[0], plan[2])))):
+            return (item, plan[0]) if identity_only else item
         break
     raise RuntimeError("Captured Pin was removed or retargeted; capture cancelled")
+
+
+
+def _resolve_capture_pins(scene, entries):
+    """Validate a synchronous batch with one membership scan per object."""
+    if len(entries) == 1:
+        return [_resolve_capture_pin(scene, entries[0])]
+    resolved = [_resolve_capture_pin(scene, entry, identity_only=True) for entry in entries]
+    objects = {}
+    for entry, (_, obj) in zip(entries, resolved):
+        key = obj.as_pointer()
+        if key not in objects:
+            objects[key] = (obj, {})
+        groups = objects[key][1]
+        vg = obj.vertex_groups.get(entry["vg_name"])
+        if vg:
+            groups.setdefault(vg.index, [])
+    for obj, groups in objects.values():
+        if hasattr(obj.data, "vertices"):
+            for vertex in obj.data.vertices:
+                seen = set()
+                for membership in vertex.groups:
+                    index = membership.group
+                    if index in groups and index not in seen:
+                        groups[index].append(vertex.index)
+                        seen.add(index)
+    for entry, (_, obj) in zip(entries, resolved):
+        vg = obj.vertex_groups.get(entry["vg_name"])
+        indices = objects[obj.as_pointer()][1].get(vg.index, []) if vg else []
+        if not np.array_equal(entry["pin_indices"], indices):
+            raise RuntimeError("Captured Pin was removed or retargeted; capture cancelled")
+    return [item for item, _ in resolved]
 
 
 def _process_one_frame(scene, depsgraph, entry, frame: int) -> tuple[bool, str]:
@@ -337,6 +413,7 @@ def _start_job(context, entries: list) -> tuple[bool, str]:
         "token": object(),
         "owner": None,
         "aborted": False,
+        "stop_save_failed": False,
         "entries": entries,
         "entry_cursor": 0,
         "total_frames_processed": 0,
@@ -348,6 +425,7 @@ def _start_job(context, entries: list) -> tuple[bool, str]:
     from ...core.capture_origin import remember_origin
     try:
         remember_origin(_capture_job, scene)
+        _require_capture_range_settings(scene, entries)
     except (ReferenceError, RuntimeError, ValueError) as exc:
         _reset_job()
         return False, str(exc)
@@ -355,14 +433,16 @@ def _start_job(context, entries: list) -> tuple[bool, str]:
 
 
 def _tick_job(context, *, budget_ms: int = 40) -> bool:
+    # A failed explicit Stop must not let the timer consume the RAM buffer.
+    if _capture_job.get("stop_save_failed"):
+        return True
     from ...core.capture_origin import require_origin, sampling_cache_scope, sampling_targets
     require_origin(_capture_job, context)
-    from ...core.capture_origin import require_capture_ranges
-    require_capture_ranges(context.scene, _capture_job["entries"])
+    _require_capture_range_settings(context.scene, _capture_job["entries"])
     token = _capture_job.get("token")
     with sampling_cache_scope(sampling_targets(_capture_job, _capture_job["entries"])):
         more = _tick_sampling(context, budget_ms=budget_ms, token=token)
-    require_capture_ranges(context.scene, _capture_job["entries"])
+    _require_capture_range_settings(context.scene, _capture_job["entries"])
     return more
 
 
@@ -391,10 +471,8 @@ def _tick_sampling(context, *, budget_ms: int = 40, token=None) -> bool:
         require_capture_token(_capture_job, token)
         # Frame handlers can change the scene, any row or its object owner.
         require_origin(_capture_job, context)
-        from ...core.capture_origin import require_capture_ranges
-        require_capture_ranges(scene, entries)
-        for candidate in entries:
-            _resolve_capture_pin(scene, candidate)
+        pins = _resolve_capture_pins(scene, entries)
+        _require_capture_range_settings(scene, entries, pins)
         # frame_set re-evaluates cache visibility F-curves, including those
         # on dependency objects. Hide the whole batch again after that update,
         # without muting or rewriting any author's animation channels.
@@ -403,8 +481,8 @@ def _tick_sampling(context, *, budget_ms: int = 40, token=None) -> bool:
             depsgraph = context.evaluated_depsgraph_get()
             require_capture_token(_capture_job, token)
             require_origin(_capture_job, context)
-            for candidate in entries:
-                _resolve_capture_pin(scene, candidate)
+            pins = _resolve_capture_pins(scene, entries)
+            _require_capture_range_settings(scene, entries, pins)
             ok, reason = _process_one_frame(scene, depsgraph, entry, frame)
             require_capture_token(_capture_job, token)
         if not ok:
@@ -435,14 +513,15 @@ def _finalize_job(context) -> tuple[int, int]:
     # after the per-frame guard. Recheck the whole frozen batch before writes.
     from ...core.capture_origin import sampling_targets
     sampling_targets(_capture_job, _capture_job["entries"])
+    # Keys can change during sampling without changing explicit bounds.
+    # Re-read their exact range before publishing any in-memory samples.
     from ...core.capture_origin import require_capture_ranges
     require_capture_ranges(context.scene, _capture_job["entries"])
     from ...core.uuid_registry import get_object_by_uuid
     from .pin_ops import _ensure_embedded_move_op
 
     # Validate every target before writing any completed cache.
-    targets = [_resolve_capture_pin(context.scene, entry)
-               for entry in _capture_job["entries"]]
+    targets = _resolve_capture_pins(context.scene, _capture_job["entries"])
     # A PC2 column is bound to the original vertex index, not just the VG
     # name/count. Validate every completed target before any cache is written.
     # Do this once at commit, rather than scanning full meshes each frame.
@@ -466,8 +545,7 @@ def _finalize_job(context) -> tuple[int, int]:
         if entry["frames_done"] < entry["frames"].shape[0]:
             continue
         require_origin(_capture_job, context)
-        for candidate in _capture_job["entries"]:
-            _resolve_capture_pin(context.scene, candidate)
+        _resolve_capture_pins(context.scene, _capture_job["entries"])
         obj = get_object_by_uuid(entry["obj_uuid"])
         if obj is None:
             continue
@@ -736,6 +814,35 @@ class OBJECT_OT_ClearPinDeformation(Operator):
 # ---------------------------------------------------------------------------
 
 
+def _save_stopped_pin_prefixes(context):
+    """Persist explicit Stop samples separately; never publish them as input."""
+    import uuid
+    from ...core.capture_origin import require_origin, require_capture_ranges, sampling_targets
+    from ...core.capture_provenance import commit_capture, make_proof
+    from ...core.pc2 import get_pc2_path, pin_anim_pc2_key
+    from ...core.uuid_registry import get_object_by_uuid
+
+    entries = _capture_job["entries"]
+    require_origin(_capture_job, context)
+    sampling_targets(_capture_job, entries)
+    require_capture_ranges(context.scene, entries)
+    _resolve_capture_pins(context.scene, entries)
+    saved = []
+    for entry in entries:
+        count = int(entry["frames_done"])
+        if not count:
+            continue
+        obj = get_object_by_uuid(entry["obj_uuid"])
+        partial = dict(entry, frame_end=int(entry["frame_start"]) + count - 1)
+        proof = make_proof(obj, "PIN", partial)
+        proof["status"] = "PARTIAL"
+        key = pin_anim_pc2_key(obj, entry["vg_name"])
+        path = get_pc2_path(key + "__partial_" + uuid.uuid4().hex)
+        commit_capture(path, entry["frames"][:count], proof)
+        saved.append((entry["frame_start"], partial["frame_end"], path))
+    return saved
+
+
 class SOLVER_OT_PinCaptureAbort(Operator):
     """Abort the running Capture Pin Deformation job"""
 
@@ -747,9 +854,28 @@ class SOLVER_OT_PinCaptureAbort(Operator):
     def poll(cls, context):
         return bool(_capture_job.get("active")) and not _capture_job.get("aborted")
 
+    save_partial: _ppf_props.BoolProperty(default=True, options={'HIDDEN'})  # pyright: ignore
+
     def execute(self, context):
+        saved = []
+        if self.save_partial:
+            try:
+                saved = _save_stopped_pin_prefixes(context)
+            except Exception as exc:
+                _capture_job["stop_save_failed"] = True
+                _capture_job["status"] = "保存失败，进度已保留。可重试中止保存或丢弃本次进度。"
+                self.report({"ERROR"}, f"保存已捕获数据失败，已暂停并保留进度：{exc}")
+                redraw_all_areas(context)
+                return {"CANCELLED"}
         _capture_job["aborted"] = True
         _capture_job["status"] = iface_("Aborting...")
+        if saved:
+            self.report({"INFO"}, "已保存 Pin 捕获进度：" + "，".join(
+                f"{start}-{end}: {path}" for start, end, path in saved))
+        elif self.save_partial:
+            self.report({"INFO"}, "已中止，尚未采样 Pin 帧。")
+        else:
+            self.report({"INFO"}, "已丢弃本次未完成的 Pin 捕获进度。")
         redraw_all_areas(context)
         return {"FINISHED"}
 

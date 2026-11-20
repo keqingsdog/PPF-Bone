@@ -4,12 +4,13 @@ Handlers only mark plain identifiers. Timer resolves live RNA anew, measures
 base geometry (Edit BMesh copy included), then writes only uniquely owned groups.
 """
 import math
+import struct
 import time
 from contextlib import contextmanager
 import bpy
 from bpy.app.handlers import persistent
 from .bone_mass_cache import DirtyMassCache
-from .bone_mass_math import resolve_mass, valid_density, valid_authored_density
+from .bone_mass_math import DensityOutOfRange, resolve_mass, valid_density, valid_authored_density
 from .bone_proxy_volume import measure_volume, matrix_determinant, author_geometry_bytes
 
 CACHE = DirtyMassCache()
@@ -21,6 +22,8 @@ _producer_depth = 0
 _identity_rebuilding = False
 _modes = None
 _settle_until = 0.
+_inventory_shape = None
+_identity_names = {}
 DIAGNOSTIC_FIELDS = {'mass_volume_m3', 'mass_measured_kg', 'mass_valid', 'mass_status'}
 TIMER_KEY = '_ppf_bone_mass_timer'
 
@@ -105,11 +108,18 @@ def mass_depsgraph_updated(_scene, depsgraph):
         item = update.id.original
         kind = 'OBJECT' if isinstance(item, bpy.types.Object) else 'MESH' if isinstance(item, bpy.types.Mesh) else 'ARMATURE' if isinstance(item, bpy.types.Armature) else 'SCENE' if isinstance(item, bpy.types.Scene) else None
         if kind is None: continue
-        for key in _indexes.get((kind, item.name), ()):
+        old_name = _identity_names.get((kind, item.as_pointer()))
+        if old_name is not None and old_name != item.name:
+            _inventory_dirty = True
+        keys = _indexes.get((kind, item.name), ())
+        for key in keys:
             if kind == 'MESH':
                 CACHE.dirty(key, now, geometry=True)
             elif kind == 'OBJECT' and item.type == 'MESH':
-                CACHE.dirty(key, now, geometry=bool(update.is_updated_geometry))
+                if (item.data.name != key[8] or item.data.as_pointer() != key[13]):
+                    _inventory_dirty = True
+                if update.is_updated_geometry or update.is_updated_transform:
+                    CACHE.dirty(key, now, geometry=bool(update.is_updated_geometry))
             elif kind == 'SCENE':
                 CACHE.dirty(key, now, geometry=False)
             else:
@@ -117,16 +127,22 @@ def mass_depsgraph_updated(_scene, depsgraph):
                 # Compare only scalar author inputs + proxy transform, so our
                 # own metric publication cannot re-trigger a geometry scan.
                 bone = _resolve(key)
-                if bone is None or _metadata_snapshot(bone.ppf_bone_physics) != _snapshots.get(key): CACHE.dirty(key, now, geometry=False)
-        if kind in ('OBJECT', 'ARMATURE'): _inventory_dirty = True
+                if bone is None:
+                    _inventory_dirty = True
+                elif _metadata_snapshot(bone.ppf_bone_physics) != _snapshots.get(key):
+                    CACHE.dirty(key, now, geometry=False)
+        if kind == 'OBJECT' and item.type == 'ARMATURE' and not keys:
+            _inventory_dirty = True
 
 
 @persistent
 def mass_context_reset(*_args):
-    global _inventory_dirty, _identity_rebuilding, _modes, _settle_until
+    global _inventory_dirty, _identity_rebuilding, _modes, _settle_until, _inventory_shape, _identity_names
     CACHE.entries.clear(); _indexes.clear(); _snapshots.clear(); _inventory_dirty = True
     _identity_rebuilding = False
     _modes = None
+    _inventory_shape = None
+    _identity_names = {}
     _settle_until = time.monotonic() + .2
 
 
@@ -139,7 +155,7 @@ def mass_before_identity_rebuild(*_args):
 
 
 def _stable_mass_context():
-    global _modes, _settle_until
+    global _modes, _settle_until, _inventory_dirty
     if _identity_rebuilding: return False
     # Object/Armature IDs survive ordinary mode transitions; Bone RNA does not.
     # Observe only IDs/modes first, and reacquire Bone/PG handles on a later tick.
@@ -150,6 +166,7 @@ def _stable_mass_context():
         _modes = modes
         _settle_until = now + .2
         CACHE.entries.clear(); _indexes.clear(); _snapshots.clear()
+        _inventory_dirty = True
         return False
     return now >= _settle_until and not any(row[2] == 'EDIT' for row in modes)
 
@@ -225,7 +242,6 @@ def _density_plan(settings, group, density, *, authored=False):
     key = 'solid_density' if group.object_type == 'SOLID' else 'pdrd_density'
     _validate_rna(group, key, density)
     # Compute the stored E/rho from the density RNA will actually retain.
-    import struct
     density = struct.unpack('<f', struct.pack('<f', density))[0]
     writes = {key: density}; author = {}
     if group.object_type == 'SOLID':
@@ -246,11 +262,22 @@ def _density_plan(settings, group, density, *, authored=False):
 
 def _apply_density(settings, group, density, *, authored=False):
     writes, author = _density_plan(settings, group, density, authored=authored)
-    old_s = _property_snapshot(settings, ('density', *author))
+    settings_values = {'density': next(iter(writes.values())), **author}
+    # A refresh can produce the same material. Assigning equal RNA values
+    # still tags the scene and wakes every viewport and author observer.
+    def matches(owner, values):
+        for key, value in values.items():
+            stored = struct.unpack('<f', struct.pack('<f', value))[0] if isinstance(value, float) else value
+            if not owner.is_property_set(key) or getattr(owner, key) != stored:
+                return False
+        return True
+    if matches(settings, settings_values) and matches(group, writes):
+        return
+    old_s = _property_snapshot(settings, settings_values)
     old_g = _property_snapshot(group, writes)
     with material_write_guard():
         try:
-            settings.density = next(iter(writes.values()))
+            settings.density = settings_values['density']
             for key, value in writes.items(): setattr(group, key, value)
             # RNA stores binary32. Synchronize authors from the committed values.
             from ..models.bone_bindings import effective_solid_material
@@ -262,22 +289,49 @@ def _apply_density(settings, group, density, *, authored=False):
 
 
 def mass_timer():
-    global _indexes, _inventory_dirty
+    global _indexes, _inventory_dirty, _inventory_shape, _identity_names
     try:
         if not _stable_mass_context(): return .1
-        rows = _live(); now = time.monotonic(); CACHE.retain(rows)
-        for key in set(_snapshots)-set(rows): del _snapshots[key]
-        indexes = {}
-        for key, (scene, arm, bone) in rows.items():
-            s = bone.ppf_bone_physics; proxy = s.proxy
-            for ident in (('SCENE', scene.name), ('OBJECT', arm.name), ('OBJECT', proxy.name), ('MESH', proxy.data.name), ('ARMATURE', arm.data.name)):
-                indexes.setdefault(ident, set()).add(key)
-            if key not in CACHE.entries: CACHE.dirty(key, now)
-        _indexes = indexes; _inventory_dirty = False
+        now = time.monotonic()
+        scene_shapes = tuple((scene.as_pointer(), scene.name, len(scene.objects),
+                              float(scene.unit_settings.scale_length)) for scene in bpy.data.scenes)
+        shape = (len(bpy.data.objects), len(bpy.data.armatures), len(bpy.data.meshes),
+                 scene_shapes,
+                 tuple((arm.as_pointer(), arm.name, arm.data.name, len(arm.data.bones))
+                       for arm in bpy.data.objects if arm.type == 'ARMATURE'))
+        if shape != _inventory_shape:
+            _inventory_dirty = True
+        if _inventory_dirty:
+            prior_units = {row[0]: row[3] for row in _inventory_shape[3]} if _inventory_shape else {}
+            changed_units = {name for uid, name, _count, units in scene_shapes
+                             if prior_units.get(uid, units) != units}
+            rows = _live(); CACHE.retain(rows)
+            for key in set(_snapshots)-set(rows): del _snapshots[key]
+            indexes = {}
+            names = {}
+            for key, (scene, arm, bone) in rows.items():
+                s = bone.ppf_bone_physics; proxy = s.proxy
+                for ident in (('SCENE', scene.name), ('OBJECT', arm.name), ('OBJECT', proxy.name), ('MESH', proxy.data.name), ('ARMATURE', arm.data.name)):
+                    indexes.setdefault(ident, set()).add(key)
+                for kind, block in (('SCENE', scene), ('OBJECT', arm), ('OBJECT', proxy),
+                                    ('MESH', proxy.data), ('ARMATURE', arm.data)):
+                    names[(kind, block.as_pointer())] = block.name
+                if key not in CACHE.entries: CACHE.dirty(key, now)
+                elif scene.name in changed_units: CACHE.dirty(key, now, geometry=False)
+            _indexes = indexes; _identity_names = names; _inventory_shape = shape; _inventory_dirty = False
         # One complete body per tick bounds multi-body authoring work. A failed
         # generation is cached too, and won't rescan until another edit/reset.
-        for key in CACHE.ready(now)[:1]:
-            scene, arm, bone = rows[key]; s = bone.ppf_bone_physics
+        for key in CACHE.ready(now):
+            bone = _resolve(key)
+            if bone is None:
+                _inventory_dirty = True
+                continue
+            scene = bpy.data.scenes[key[0]]; arm = bpy.data.objects[key[1]]
+            s = bone.ppf_bone_physics
+            # Blender owns the active BMesh until Return. Keep this row dirty
+            # for its final geometry and keep processing other bodies.
+            if s.proxy.mode == 'EDIT' and s.proxy.get('ppf_bone_proxy_visibility_editing'):
+                continue
             entry = CACHE.entries[key]; measured_geometry = None
             signature = None
             try:
@@ -302,6 +356,7 @@ def mass_timer():
             except (ValueError, RuntimeError, ReferenceError) as error:
                 _diagnostics(s, error=error); CACHE.store(key, {'error': str(error)}, geometry=measured_geometry, geometry_signature=signature)
             _snapshots[key] = _metadata_snapshot(s)
+            break
     except (ReferenceError, RuntimeError):
         mass_context_reset()
     return .1
@@ -330,7 +385,12 @@ def prepare_mass_batch(scene, overrides=()):
         # the proxy transaction and receive their group only after this batch.
         group = _owned(scene, arm, bone) if s.proxy else None
         result = _measure(scene, s, mesh, matrix)
-        density, mass = resolve_mass(s.mass_mode, density, s.target_mass_kg, result['volume_m3'])
+        try:
+            density, mass = resolve_mass(s.mass_mode, density, s.target_mass_kg, result['volume_m3'])
+        except DensityOutOfRange as error:
+            error.armature_name = arm.name
+            error.bone_name = bone.name
+            raise
         if group is not None: _density_plan(s, group, density)
         prepared.append((arm, bone, group, density, dict(result, mass_kg=mass)))
     return prepared

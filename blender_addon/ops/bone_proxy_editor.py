@@ -153,11 +153,16 @@ def in_editor_window(editor,context,event):
     return any(r.type=='WINDOW' and r.x<=event.mouse_x<r.x+r.width and r.y<=event.mouse_y<r.y+r.height for r in context.area.regions)
 
 def pending_mesh_proxy(editor):
-    from ..core.bone_geometry_edit import token_for
+    from ..core.bone_geometry_edit import leased_proxies
+    leased = leased_proxies(kind='MESH')
+    if not leased:
+        return None
     try:
+        candidates = {proxy.as_pointer(): proxy for proxy in leased}
         for bone in editor._arm.data.bones:
             proxy=bone.ppf_bone_physics.proxy
-            if proxy is not None and token_for(proxy,kind='MESH') is not None:return proxy
+            if proxy is not None and proxy.as_pointer() in candidates:
+                return proxy
     except ReferenceError:pass
     return None
 
@@ -196,7 +201,8 @@ def scale_factors(values):
 
 def scaled_coordinates(coordinates,factors):
     factors=scale_factors(factors)
-    result=[tuple(float(co[i])*factors[i] for i in range(3)) for co in coordinates]
+    x,y,z=factors
+    result=[(float(co[0])*x,float(co[1])*y,float(co[2])*z) for co in coordinates]
     if any(not math.isfinite(v) for co in result for v in co):raise ValueError('缩放后代理坐标超出有限范围')
     return result
 
@@ -244,9 +250,38 @@ def restore_geometry(snapshots):
     from ..models.groups import invalidate_overlays
     invalidate_all();invalidate_overlays()
 
-def apply_geometry(snapshots,factors,orientation='LOCAL',matrices=None):
+def apply_geometry(snapshots,factors,orientation='LOCAL',matrices=None,*,preview=False,view_layer=None,preview_arrays=None):
     # Precompute the complete batch before any vertex mutation.
     factors=scale_factors(factors)
+    if preview and preview_arrays is not None:
+        import numpy as np
+        packed=[]
+        for index,((proxy,_),coords) in enumerate(zip(snapshots,preview_arrays)):
+            if orientation=='WORLD':
+                a=(matrices[index] if matrices is not None else proxy.matrix_world.to_3x3()).copy()
+                if any(not math.isfinite(v) for row in a for v in row):raise ValueError('代理世界矩阵无效')
+                try:transform=a.inverted() @ Matrix.Diagonal(Vector(factors)) @ a
+                except ValueError:raise ValueError('代理世界矩阵不可逆')
+                with np.errstate(over='ignore',invalid='ignore'):
+                    values=np.asarray(coords,dtype=np.float32) @ np.asarray(transform,dtype=np.float32).T
+            else:
+                with np.errstate(over='ignore',invalid='ignore'):
+                    values=np.asarray(coords * np.asarray(factors,dtype=np.float64),dtype=np.float32)
+            if not np.isfinite(values).all():raise ValueError('缩放后代理坐标超出有限范围')
+            packed.append((proxy,np.ascontiguousarray(values).ravel()))
+        try:
+            for proxy,values in packed:
+                proxy.data.vertices.foreach_set('co',values)
+                proxy.data.update()
+                proxy.update_tag(refresh={'DATA'})
+            if view_layer is not None:view_layer.update()
+            from ..core.bone_mass import invalidate_all
+            from ..models.groups import invalidate_overlays
+            invalidate_all();invalidate_overlays()
+        except Exception:
+            restore_geometry(snapshots)
+            raise
+        return
     candidates=[]
     for index,(proxy,coords) in enumerate(snapshots):
         if orientation=='WORLD':
@@ -258,6 +293,29 @@ def apply_geometry(snapshots,factors,orientation='LOCAL',matrices=None):
             if any(not math.isfinite(v) for co in result for v in co):raise ValueError('缩放后代理坐标超出有限范围')
         else:result=scaled_coordinates(coords,factors)
         candidates.append((proxy,result))
+    if preview:
+        # Convert the entire batch before touching authored meshes: float32
+        # overflow and non-finite results must not leave a partial edit.
+        from array import array
+        packed=[]
+        for proxy,coords in candidates:
+            try: values=array('f',(value for co in coords for value in co))
+            except (OverflowError,ValueError):raise ValueError('缩放后代理坐标超出有限范围')
+            if any(not math.isfinite(v) for v in values):raise ValueError('缩放后代理坐标超出有限范围')
+            packed.append((proxy,values))
+        try:
+            for proxy,values in packed:
+                proxy.data.vertices.foreach_set('co',values)
+                proxy.data.update()
+                proxy.update_tag(refresh={'DATA'})
+            if view_layer is not None:view_layer.update()
+            from ..core.bone_mass import invalidate_all
+            from ..models.groups import invalidate_overlays
+            invalidate_all();invalidate_overlays()
+        except Exception:
+            restore_geometry(snapshots)
+            raise
+        return
     from .bone_proxy import validate_closed_mesh
     for proxy,coords in candidates:
         candidate=proxy.data.copy()
@@ -299,13 +357,30 @@ class PPF_OT_BoneProxyScale(bpy.types.Operator):
         self._lease=None
         try:self._snapshots=[(p,[tuple(v.co) for v in p.data.vertices]) for p in targets(context)]
         except (ValueError,RuntimeError) as exc:self.report({'ERROR'},iface_(str(exc)));return {'CANCELLED'}
+        import numpy as np
+        self._preview_arrays=[np.asarray(coords,dtype=np.float64) for _proxy,coords in self._snapshots]
+        if any(not np.isfinite(coords).all() for coords in self._preview_arrays):
+            self.report({'ERROR'},iface_('代理坐标超出有限范围'));return {'CANCELLED'}
         from bpy_extras.view3d_utils import location_3d_to_region_2d
-        center=sum((p.matrix_world.translation for p,_ in self._snapshots),Vector())/len(self._snapshots)
+        # Use the same placement that draws the proxy. Hidden proxy object
+        # matrices can lag behind a posed or animated bone.
+        from ..ui import bone_overlay
+        depsgraph=context.evaluated_depsgraph_get()
+        pose_matrices=bone_overlay._pose_display_matrices(context,depsgraph)
+        centers=[]
+        for proxy,coords in self._snapshots:
+            token=pose_matrices.get(proxy.as_pointer())
+            if token is None:
+                token=bone_overlay._model_matrix(context,proxy,depsgraph)
+            matrix=Matrix(tuple(token[i:i+4] for i in range(0,16,4)))
+            local_center=sum((Vector(co) for co in coords),Vector())/len(coords) if coords else Vector()
+            centers.append(matrix @ local_center)
+        center=sum(centers,Vector())/len(centers)
         self._center=location_3d_to_region_2d(context.region,context.region_data,center)
         if self._center is None:self.report({'ERROR'},iface_('请将选中骨骼移到视图内'));return {'CANCELLED'}
         self._origin=Vector((context.region.x,context.region.y))
-        self._distance=max(20.,(Vector((event.mouse_x,event.mouse_y))-self._origin-self._center).length)
-        self._factor=1.;self._axes={0,1,2};self._axis_key=None;self.orientation='LOCAL';self._matrices=[p.matrix_world.to_3x3().copy() for p,_ in self._snapshots];self._numeric='';self._area=context.area;self._cancelled=False
+        self._distance=(Vector((event.mouse_x,event.mouse_y))-self._origin-self._center).length or 1.
+        self._factor=1.;self.factors=(1.,1.,1.);self._axes={0,1,2};self._axis_key=None;self.orientation='LOCAL';self._matrices=[p.matrix_world.to_3x3().copy() for p,_ in self._snapshots];self._numeric='';self._area=context.area;self._cancelled=False
         from ..core.bone_geometry_edit import acquire
         try:
             self._lease=acquire(context,[proxy for proxy,_coords in self._snapshots],kind='SCALE')
@@ -340,7 +415,9 @@ class PPF_OT_BoneProxyScale(bpy.types.Operator):
         if event.type in {'ESC','RIGHTMOUSE'} and event.value=='PRESS':
             self.cancel(context);return {'CANCELLED'}
         if event.type in {'LEFTMOUSE','RET','NUMPAD_ENTER'} and event.value=='PRESS':
-            try:self._finish(commit=True)
+            try:
+                apply_geometry(self._snapshots,self.factors,self.orientation,self._matrices)
+                self._finish(commit=True)
             except (ValueError,RuntimeError) as exc:
                 self.cancel(context);self.report({'ERROR'},iface_(str(exc)));return {'CANCELLED'}
             except BaseException:
@@ -360,10 +437,15 @@ class PPF_OT_BoneProxyScale(bpy.types.Operator):
         elif event.value=='PRESS' and event.ascii and event.ascii in '0123456789.':self._numeric+=event.ascii
         elif event.type=='MOUSEMOVE' and not self._numeric:
             self._factor=max(.000001,(Vector((event.mouse_x,event.mouse_y))-self._origin-self._center).length/self._distance)
+        else:
+            # Key releases and unrelated events do not change the requested
+            # geometry. Avoid revalidating every mesh and flushing every view
+            # layer for those events (including mouse moves during numeric input).
+            return {'RUNNING_MODAL'}
         try:
             factor=float(self._numeric) if self._numeric else self._factor
             self.factors=scale_factors(tuple(factor if i in self._axes else 1. for i in range(3)))
-            apply_geometry(self._snapshots,self.factors,self.orientation,self._matrices)
+            apply_geometry(self._snapshots,self.factors,self.orientation,self._matrices,preview=True,view_layer=context.view_layer,preview_arrays=self._preview_arrays)
         except ValueError as exc:
             if self.orientation=='WORLD' and '矩阵' in str(exc):
                 self.cancel(context);self.report({'ERROR'},iface_(str(exc)));return {'CANCELLED'}

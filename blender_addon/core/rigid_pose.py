@@ -306,7 +306,9 @@ def _targets(scene, receipt, *, current=True):
         if len(bones) != 1 or (current and (not bones[0].bone.ppf_bone_physics.enabled or bones[0].bone.ppf_bone_physics.body_uuid != row["body_uuid"])):
             raise ValueError("bone pose: author binding changed; transfer again")
         pb = bones[0]
-        parent = pb.parent.bone.ppf_bone_physics.bone_uuid if pb.parent and pb.parent.bone.ppf_bone_physics.enabled else None
+        has_physical_parent = (pb.bone.ppf_bone_physics.use_hierarchy_joint and pb.parent is not None
+                               and pb.parent.bone.ppf_bone_physics.enabled)
+        parent = pb.parent.bone.ppf_bone_physics.bone_uuid if has_physical_parent else None
         if current and parent != row.get("parent_bone_uuid"):
             raise ValueError("bone pose: parent binding changed")
         if current and any(c.mute is False for c in pb.constraints):
@@ -1103,6 +1105,7 @@ def _authored_flags(scene, targets, index=None):
         record = (records.get(_armature_key(arm)) or {}).get(row['bone_uuid'])
         connected = _author_connection(records, legacy, arm, row, pb)
         connected = bool(pb.bone.use_connect) if connected is None else connected
+        connected = bool(connected and pb.bone.ppf_bone_physics.use_hierarchy_joint)
         if (connected and (not isinstance(record, dict) or 'inherit_scale' not in record)
                 and scene.get(CACHE_KEY) and pb.bone.inherit_scale == 'NONE'):
             raise ValueError('connected bone pose: legacy author inherit_scale is unknown: '+pb.name)

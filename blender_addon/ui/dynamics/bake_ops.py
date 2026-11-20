@@ -1260,6 +1260,13 @@ def _begin_created_mesh_keys(obj, entry):
     rest = numpy.empty(len(basis.data) * 3, dtype=numpy.float32)
     basis.data.foreach_get("co", rest)
     key = obj.data.shape_keys
+    # Blender may otherwise reuse the object's Action when inserting the first
+    # Shape Key keyframe, adding a KEY slot to the protected source Action.
+    # Give the newly created Key its own Action before any insertion.
+    working = bpy.data.actions.new(obj.name + " Bake Shape Keys")
+    tx["action"] = working
+    _assign_curve_action(key, working, None)
+    tx["slot"] = _curve_action_slot(key)
     key.use_relative = False
     tx["encoding"] = "ABSOLUTE_STEP_V1"
     tx["expected_curves"] = {}

@@ -128,7 +128,7 @@ def _proxy_collection(scene, arm, *, created_collections=None):
     return collection
 
 
-def manage_proxy(scene, arm, bone, proxy, *, preserve_local=False, created_objects=None, created_collections=None, owned_container=None):
+def manage_proxy(scene, arm, bone, proxy, *, preserve_local=False, created_objects=None, created_collections=None, owned_container=None, _defer_layers=False):
     """Group owned proxies under one scene root; hide only their real mesh."""
     if not owned_proxy(scene, arm, bone, proxy):
         raise ValueError('BONE_PROXY_OWNER_INVALID')
@@ -160,12 +160,27 @@ def manage_proxy(scene, arm, bone, proxy, *, preserve_local=False, created_objec
     # Object.copy does not preserve per-view-layer hide_set state.  This also
     # covers a copied owned_container and newly added view layers without
     # disabling evaluation of its children via hide_viewport/exclude.
-    container.hide_render = True
-    for layer in scene.view_layers:
-        layer.update()
-        if container.name in layer.objects:
-            container.hide_set(True, view_layer=layer)
+    if not container.hide_render: container.hide_render = True
+    if not _defer_layers:
+        for layer in scene.view_layers:
+            layer.update()
+            if container.name in layer.objects and not container.hide_get(view_layer=layer):
+                container.hide_set(True, view_layer=layer)
     if proxy.parent == arm and proxy.parent_type == 'OBJECT':
+        if _defer_layers and not preserve_local:
+            from mathutils import Matrix
+            identity = Matrix.Identity(4)
+            if (container.parent_type == 'OBJECT' and
+                    not any(not constraint.mute and constraint.influence for constraint in container.constraints)
+                    and container.matrix_parent_inverse == identity and container.matrix_basis == identity):
+                # An identity intermediate parent has exactly the same local
+                # space as the armature, even before depsgraph evaluation.
+                preserve_local = True
+            else:
+                # Existing authored container transforms need a fresh world
+                # matrix before Blender can preserve the proxy's world pose.
+                for layer in scene.view_layers:
+                    layer.update()
         world = proxy.matrix_world.copy() if not preserve_local else None
         inverse = proxy.matrix_parent_inverse.copy() if preserve_local else None
         basis = proxy.matrix_basis.copy() if preserve_local else None
@@ -191,15 +206,16 @@ def manage_proxy(scene, arm, bone, proxy, *, preserve_local=False, created_objec
                 or (old.get(COLLECTION) == arm.ppf_armature_uuid
                     and old in scene_collections and old not in other_collections)):
             old.objects.unlink(proxy)
-    for layer in scene.view_layers:
-        layer.update()
-    proxy[MANAGED] = True
-    proxy.hide_render = True
-    if not _edit_layer(proxy):
-        proxy.hide_select = True
-    if not proxy.get(EDITING):
+    if not _defer_layers:
         for layer in scene.view_layers:
-            if proxy.name in layer.objects:
+            layer.update()
+    if not proxy.get(MANAGED): proxy[MANAGED] = True
+    if not proxy.hide_render: proxy.hide_render = True
+    if not _edit_layer(proxy) and not proxy.hide_select:
+        proxy.hide_select = True
+    if not _defer_layers and not proxy.get(EDITING):
+        for layer in scene.view_layers:
+            if proxy.name in layer.objects and not proxy.hide_get(view_layer=layer):
                 proxy.hide_set(True, view_layer=layer)
     from .bone_proxy_outliner import request_root_collapse
     request_root_collapse(scene, collection)
@@ -264,12 +280,18 @@ def _collection_visible(node, collections, parent_visible=True):
     return any(_collection_visible(child, collections, visible) for child in node.children)
 
 
-def overlay_visible(context, proxy):
+def overlay_visible(context, proxy, *, collection_visibility=None):
     """Bypass only our object hide_set; retain collection and viewport disables."""
     if not proxy.get(MANAGED):
         return proxy.visible_get(view_layer=context.view_layer, viewport=context.space_data)
-    return (not proxy.hide_viewport and
-            _collection_visible(context.view_layer.layer_collection, tuple(proxy.users_collection)))
+    if proxy.hide_viewport:
+        return False
+    collections = tuple(proxy.users_collection)
+    if collection_visibility is None:
+        return _collection_visible(context.view_layer.layer_collection, collections)
+    if collections not in collection_visibility:
+        collection_visibility[collections] = _collection_visible(context.view_layer.layer_collection, collections)
+    return collection_visibility[collections]
 
 
 def _edit_layer(proxy):
@@ -318,13 +340,26 @@ def protect_scene_layers(scene):
 
 def sync_scene(scene):
     """Explicit startup/load migration; never called from drawing or a depsgraph loop."""
+    managed = []
     for arm in tuple(scene.objects):
         if arm.type != 'ARMATURE':
             continue
         for bone in arm.data.bones:
             proxy = bone.ppf_bone_physics.proxy
             if owned_proxy(scene, arm, bone, proxy):
-                manage_proxy(scene, arm, bone, proxy)
+                collection = manage_proxy(scene, arm, bone, proxy, _defer_layers=True)
+                container = next((obj for obj in collection.objects if obj.type == 'EMPTY'
+                                  and obj.parent == arm and obj.get('ppf_bone_proxy_object_container') == arm.ppf_armature_uuid), None)
+                managed.append((container, proxy))
+    if managed:
+        for layer in scene.view_layers:
+            layer.update()
+        for layer in scene.view_layers:
+            for container, proxy in managed:
+                if container and container.name in layer.objects and not container.hide_get(view_layer=layer):
+                    container.hide_set(True, view_layer=layer)
+                if not proxy.get(EDITING) and proxy.name in layer.objects and not proxy.hide_get(view_layer=layer):
+                    proxy.hide_set(True, view_layer=layer)
 
 
 def snapshot_proxy(proxy, scene=None):

@@ -45,10 +45,12 @@ def _selected_physical_model_counts(context, rows):
     No RNA or result survives this draw; author/write gates are unchanged.
     """
     from collections import Counter
-    from ..models.bone_bindings import proxy_parent_armature
+    from ..models.bone_bindings import proxy_parent_armature, armature_data_owner_counts
     from ..models.groups import iterate_object_groups
     scene = context.scene
     body_counts = Counter(obj.get('_solver_uuid') for obj in scene.objects)
+    scene_users = Counter(obj.as_pointer() for candidate in bpy.data.scenes for obj in candidate.objects)
+    data_owners = armature_data_owner_counts()
     arm_counts = Counter(getattr(obj, 'ppf_armature_uuid', '')
                          for obj in scene.objects if obj.type == 'ARMATURE')
     global_arm_counts = Counter(getattr(obj, 'ppf_armature_uuid', '')
@@ -66,11 +68,12 @@ def _selected_physical_model_counts(context, rows):
         actual = None
         try:
             group = groups.get(s.group_uuid) if s.group_uuid else None
+            parent_armature = proxy_parent_armature(proxy) if proxy is not None else None
             valid = (proxy is not None and proxy.type == 'MESH'
                      and scene.objects.get(proxy.name) == proxy
                      and scene.objects.get(arm.name) == arm
-                     and len(proxy.users_scene) == 1 and len(arm.users_scene) == 1
-                     and not arm.library and not arm.data.library and arm.data.users == 1
+                     and scene_users[proxy.as_pointer()] == 1 and scene_users[arm.as_pointer()] == 1
+                     and not arm.library and not arm.data.library and data_owners[arm.data.as_pointer()] == 1
                      and bool(s.body_uuid) and bool(s.bone_uuid) and bool(arm.ppf_armature_uuid)
                      and proxy.get('ppf_bone_proxy_owned')
                      and proxy.get('_solver_uuid') == s.body_uuid
@@ -78,9 +81,8 @@ def _selected_physical_model_counts(context, rows):
                      and proxy.get('ppf_armature_uuid') == arm.ppf_armature_uuid
                      and body_counts[s.body_uuid] == 1 and proxy_counts[proxy.as_pointer()] == 1
                      and arm_counts[arm.ppf_armature_uuid] == 1
-                     and proxy_parent_armature(proxy) in (None, arm)
-                     and (proxy_parent_armature(proxy) is not None
-                          or global_arm_counts[arm.ppf_armature_uuid] == 1)
+                     and parent_armature in (None, arm)
+                     and (parent_armature is not None or global_arm_counts[arm.ppf_armature_uuid] == 1)
                      and group is not None and group.active
                      and len(group.assigned_objects) == 1
                      and group.assigned_objects[0].uuid == s.body_uuid)
@@ -184,9 +186,8 @@ def _draw_generation(layout,context,settings):
 
 
 def _has_joint_parent(bone):
-    if not bone.parent:return False
-    parent_physics=bone.parent.ppf_bone_physics
-    return bool(parent_physics.enabled or getattr(bone.ppf_bone_physics,'auto_follow_parent',True))
+    from ..models.bone_bindings import has_physical_joint_parent
+    return has_physical_joint_parent(bone)
 
 
 def _draw_empty_bone_sections(layout):
@@ -393,6 +394,14 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
         except ValueError:count=0
         editor.label(text=f'{bone.name if bone else "未选骨骼"} · 选中 {selected} · 范围 {count}',icon='BONE_DATA',translate=False)
         editor.operator('ppf.bone_proxy_editor',text='退出代理编辑' if editor_active(context) else '进入代理编辑',icon='EDITMODE_HLT')
+        selection = editor.row(align=True)
+        selection.operator('ppf.select_physics_bones', text='选物理骨骼', icon='BONE_DATA')
+        selection.operator('ppf.select_collision_group_bones', text='按碰撞组选骨', icon='RESTRICT_SELECT_OFF')
+        authoring = editor.column(align=True)
+        authoring.enabled = context.mode in {'POSE', 'OBJECT'} and bool(selected)
+        authoring.operator_context = 'INVOKE_DEFAULT'
+        authoring.operator('ppf.import_mmd_physics', text='导入选中骨骼的 MMD 物理', icon='IMPORT')
+        authoring.operator('ppf.fit_bone_proxies_to_weights', text='按蒙皮权重拟合代理', icon='MOD_ARMATURE')
         if not editor_active(context):
             op=editor.operator('ppf.bone_editor_action',text='添加 / 更新代理' if count else '添加 / 更新整个骨架',icon='FILE_REFRESH')
             op.action='UPDATE';op.scope=scope if count else 'ALL'
@@ -694,9 +703,11 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
 
     def _draw_basic_control(self,control,s,bone,model):
         """Basic movement controls plus explicit removal of saved invalid events."""
-        physical_parent=bool(bone.parent and bone.parent.ppf_bone_physics.enabled)
-        follows_parent=bool(bone.parent and not physical_parent and getattr(s,'auto_follow_parent',False))
-        if bone.parent and not physical_parent:
+        physical_parent=bool(s.use_hierarchy_joint and bone.parent and bone.parent.ppf_bone_physics.enabled)
+        follows_parent=bool(s.use_hierarchy_joint and bone.parent and not physical_parent and s.auto_follow_parent)
+        if bone.parent:
+            control.prop(s, 'use_hierarchy_joint', text='连接父骨物理')
+        if s.use_hierarchy_joint and bone.parent and not physical_parent:
             control.prop(s,'auto_follow_parent',text='跟随父骨骼')
         restricted=follows_parent or (model=='SOFT' and physical_parent)
         if restricted:
@@ -718,10 +729,10 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
     def _draw_control(self, control, s, bone, model=None):
         """Read-only capability surface; saved invalid values require explicit edits."""
         model = self._effective_model(s) if model is None else model
-        physical_parent = bool(bone.parent and bone.parent.ppf_bone_physics.enabled)
-        follows_parent = bool(bone.parent and not physical_parent and getattr(s, 'auto_follow_parent', False))
+        physical_parent = bool(s.use_hierarchy_joint and bone.parent and bone.parent.ppf_bone_physics.enabled)
+        follows_parent = bool(s.use_hierarchy_joint and bone.parent and not physical_parent and s.auto_follow_parent)
         connected_soft = model == 'SOFT' and (physical_parent or follows_parent)
-        if bone.parent and not physical_parent and hasattr(s, 'auto_follow_parent'):
+        if s.use_hierarchy_joint and bone.parent and not physical_parent:
             control.prop(s, 'auto_follow_parent', text='跟随非物理父骨骼')
         restricted = connected_soft or follows_parent
         if restricted:

@@ -137,21 +137,28 @@ def _max_keyframe_in_action(action) -> int | None:
     builds. Returns ``None`` when the action has no keyframes.
     """
     max_f = None
+
+    def consider_curve(fc):
+        nonlocal max_f
+        points = fc.keyframe_points
+        if not points:
+            return
+        # Keyframes can be edited out of order; inspect every frame in bulk.
+        coords = np.empty(len(points) * 2, dtype=np.float32)
+        points.foreach_get("co", coords)
+        f = int(np.max(coords[::2]))
+        if max_f is None or f > max_f:
+            max_f = f
+
     layers = getattr(action, "layers", None) or []
     for layer in layers:
         for strip in layer.strips:
             for bag in strip.channelbags:
                 for fc in bag.fcurves:
-                    for kp in fc.keyframe_points:
-                        f = int(kp.co[0])
-                        if max_f is None or f > max_f:
-                            max_f = f
+                    consider_curve(fc)
     # Pre-Baklava flat fcurves (in case some build still emits them).
     for fc in getattr(action, "fcurves", []) or []:
-        for kp in fc.keyframe_points:
-            f = int(kp.co[0])
-            if max_f is None or f > max_f:
-                max_f = f
+        consider_curve(fc)
     return max_f
 
 

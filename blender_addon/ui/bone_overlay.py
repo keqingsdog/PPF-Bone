@@ -17,6 +17,7 @@ _rebuilding = False
 _generation = 0
 _snapshots = {}  # Primitive viewport keys -> immutable primitive draw data.
 _geometry_snapshots = {}  # Viewport -> primitive proxy tokens and copied geometry.
+_known_proxy_meshes = set()
 _geometry_serial = 0
 _mesh_revisions = {}  # Mesh ID pointers -> monotonic dirtiness, shared by all viewports.
 _object_revisions = {}  # Evaluated deformation dirtiness; never consumed by one viewport.
@@ -138,6 +139,7 @@ def bindings(context):
         return
     from collections import Counter
     from ..core.bone_proxy_visibility import overlay_visible
+    collection_visibility = {}
     body_counts = Counter(obj.get('_solver_uuid') for obj in context.scene.objects if obj.get('_solver_uuid'))
     proxy_counts = Counter(
         bone.ppf_bone_physics.proxy.as_pointer()
@@ -165,7 +167,7 @@ def bindings(context):
                             or display.get('body_uuid') != proxy.get('_solver_uuid')
                             or display.get('bone_uuid') != proxy.get('ppf_bone_uuid')
                             or body_counts[display['body_uuid']] != 1
-                            or not overlay_visible(context, proxy)):
+                            or not overlay_visible(context, proxy, collection_visibility=collection_visibility)):
                         continue
                     selected = bool(edit.select or edit.select_head or edit.select_tail)
                     yield proxy, display['physical_model'], selected, SimpleNamespace(**display)
@@ -179,7 +181,7 @@ def bindings(context):
                     or (proxy.mode=='EDIT' and proxy.get('ppf_bone_proxy_visibility_editing'))
                     or proxy.name not in context.scene.objects
                     or proxy.name not in context.view_layer.objects
-                    or not overlay_visible(context, proxy)
+                    or not overlay_visible(context, proxy, collection_visibility=collection_visibility)
                     or not proxy.get('ppf_bone_proxy_owned')
                     or not s.body_uuid or not s.bone_uuid or not arm.ppf_armature_uuid
                     or body_counts[s.body_uuid] != 1
@@ -959,6 +961,10 @@ def _refresh_snapshots(generation):
         for key in tuple(_gpu_views):
             if key not in staged:
                 _gpu_views.pop(key, None)
+        _known_proxy_meshes.clear()
+        _known_proxy_meshes.update(
+            cached[0][3] for viewport in _geometry_snapshots.values() for cached in viewport.values()
+        )
 
 
 def gpu_cache_metrics(reset=False):
@@ -1254,6 +1260,7 @@ def _invalidate_snapshots(*, geometry=True):
     _snapshots = {}
     if geometry:
         _geometry_snapshots.clear()
+        _known_proxy_meshes.clear()
         _gpu_views.clear()
         _mesh_revisions.clear()
         _object_revisions.clear()
@@ -1286,9 +1293,9 @@ def _subscribe_layer_window():
 def _depsgraph_changed(_scene, depsgraph):
     """Primitive dirtiness only; mesh reads remain in the stable producer."""
     global _snapshot_dirty
-    _snapshot_dirty = True
     if not _identity_ready():
         _geometry_snapshots.clear()
+        _known_proxy_meshes.clear()
         _gpu_views.clear()
         return
     scene_key = _scene.as_pointer()
@@ -1296,6 +1303,7 @@ def _depsgraph_changed(_scene, depsgraph):
     if _layer_signatures.get(scene_key) != signature:
         _layer_signatures[scene_key] = signature
         _layer_pending.add(scene_key)
+        _snapshot_dirty = True
         _ensure_producer()
     for update in depsgraph.updates:
         item = update.id.original
@@ -1303,11 +1311,24 @@ def _depsgraph_changed(_scene, depsgraph):
         # consumed, so every viewport independently observes the same update.
         if isinstance(item, bpy.types.Mesh):
             identity = item.as_pointer()
-            _mesh_revisions[identity] = _mesh_revisions.get(identity, 0) + 1
-        elif (isinstance(item, bpy.types.Object) and item.type == 'MESH'
-              and update.is_updated_geometry):
-            identity = item.as_pointer()
-            _object_revisions[identity] = _object_revisions.get(identity, 0) + 1
+            if identity in _known_proxy_meshes:
+                _mesh_revisions[identity] = _mesh_revisions.get(identity, 0) + 1
+                _snapshot_dirty = True
+        elif isinstance(item, bpy.types.Object):
+            if item.type == 'MESH' and item.get('ppf_bone_proxy_owned'):
+                # The leased Edit mesh is rendered by Blender, and bindings()
+                # excludes it. Its vertices cannot change any overlay row.
+                if item.mode == 'EDIT' and item.get('ppf_bone_proxy_visibility_editing'):
+                    continue
+                if update.is_updated_geometry:
+                    identity = item.as_pointer()
+                    _object_revisions[identity] = _object_revisions.get(identity, 0) + 1
+                _snapshot_dirty |= update.is_updated_geometry or update.is_updated_transform
+            elif item.type == 'ARMATURE':
+                _snapshot_dirty |= update.is_updated_geometry or update.is_updated_transform
+        elif isinstance(item, bpy.types.Collection) or (
+                isinstance(item, bpy.types.Armature) and update.is_updated_geometry):
+            _snapshot_dirty = True
 
 
 def _display_interval():
@@ -1336,13 +1357,13 @@ def _display_signature():
                     # Preview color callbacks request redraw only, with no ID
                     # geometry tag. Read scalars, never mesh or evaluated data.
                     scene_rows[scene_key] = tuple(
-                        (arm.as_pointer(), bone.name, bool(bone.hide),
-                         bool(bone.ppf_bone_physics.enabled),
-                         bone.ppf_bone_physics.physical_model,
-                         bool(bone.ppf_bone_physics.preview_color_custom),
-                         tuple(bone.ppf_bone_physics.preview_color))
+                        (arm.as_pointer(), bone.name, bool(bone.hide), bool(settings.enabled),
+                         settings.physical_model, bool(settings.preview_color_custom),
+                         tuple(settings.preview_color), bool(settings.collision_filter_enabled),
+                         tuple(settings.collision_group_layers), bool(settings.proxy.hide_viewport))
                         for arm in context.scene.objects if arm.type == 'ARMATURE' and arm.mode != 'EDIT'
-                        for bone in arm.data.bones)
+                        for bone in arm.data.bones for settings in (bone.ppf_bone_physics,)
+                        if settings.proxy is not None)
                     scene_rows[scene_key] += tuple(
                         (arm.as_pointer(), bone.name, bool(bone.hide),
                          tuple(bone.head), tuple(bone.tail), float(bone.roll),
@@ -1359,11 +1380,23 @@ def _display_signature():
                          getattr(context, 'selected_bones', None) or ())
                 viewport = _viewport_key(context)
                 frame = None if _fast_views.get(viewport) == _generation else float(context.scene.frame_current_final)
+                arm_visibility = tuple(
+                    (arm.as_pointer(), arm.visible_get(view_layer=context.view_layer, viewport=context.space_data))
+                    for arm in context.view_layer.objects if arm.type == 'ARMATURE'
+                )
+                layer_visibility = []
+                layers = [context.view_layer.layer_collection]
+                while layers:
+                    layer = layers.pop()
+                    layer_visibility.append((layer.as_pointer(), layer.exclude, layer.hide_viewport,
+                                             layer.collection.hide_viewport))
+                    layers.extend(layer.children)
                 rows.append((viewport, context.mode, frame,
                              obj.as_pointer() if obj else 0,
                              tuple(item.as_pointer() for item in context.selected_objects),
                              tuple(bone.name for bone in bones),
-                             bool(context.space_data.local_view), scene_rows[scene_key]))
+                             bool(context.space_data.local_view), arm_visibility, tuple(layer_visibility),
+                             scene_rows[scene_key]))
     return tuple(rows)
 
 
