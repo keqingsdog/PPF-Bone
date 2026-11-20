@@ -16,7 +16,6 @@ from ..core.compat import pose_bone_selected
 from ..core.encoder.pmx_joints import parent_joint_pair, parent_joint_pairs
 from ..models.bone_bindings import active_armature, active_bone, collect_body_controls_contract, has_physical_joint_parent, soft_material_refusal
 from ..models.groups import has_addon_data, get_group_by_uuid, iterate_active_object_groups
-from .bone_pmx_joint import PPF_OT_BonePMXJointEdit, draw_parent_joint
 
 
 def _draw_collision_filter(layout, settings, context):
@@ -433,7 +432,7 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
         has_joint_parent=has_physical_joint_parent(bone, arm=arm)
         header,body=layout.panel('ppf_bone_essentials',default_closed=False)
         header.label(text='常用物理参数')
-        if body and native_parent is None:
+        if body:
             restoring=bone.ppf_bone_restoring_controls
             direct=body.column(align=True)
             from ..ops.bone_chain_presets import _joint_parent_status
@@ -441,7 +440,8 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
             direct.enabled=bool(context.mode in {'OBJECT','POSE'} and s.enabled and s.proxy and valid_parent and s.joint_mode == 'SOFT')
             target_loaded=bool(getattr(restoring,'draft_loaded',False) and getattr(restoring,'loaded_bone_uuid','')==getattr(s,'bone_uuid','') and getattr(restoring,'loaded_joint_uuid','')==getattr(s,'joint_uuid',''))
             direct.label(text='回正力矩（每度）',icon='CONSTRAINT_BONE')
-            if not valid_parent:direct.label(text='无父关节；使用下方根控制',icon='INFO')
+            if native_parent:direct.label(text='当前父关节使用 PMX 参数',icon='INFO')
+            elif not valid_parent:direct.label(text='无父关节；使用下方根控制',icon='INFO')
             physical_loaded=bool(restoring.physical_draft_loaded and target_loaded)
             if physical_loaded and restoring.physical_status:
                 direct.label(text=restoring.physical_status,icon='INFO')
@@ -464,9 +464,7 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
             body.prop(s,'mass_mode',text='质量')
             body.prop(s,'target_mass_kg' if s.mass_mode=='MASS' else 'density',text='质量 kg' if s.mass_mode=='MASS' else '密度 kg/m³')
             group=get_group_by_uuid(context.scene,s.group_uuid) if s.group_uuid else None
-            if native_parent is not None:
-                draw_parent_joint(body, arm, native_parent)
-            elif bone.parent and s.joint_mode == 'SOFT':
+            if bone.parent and s.joint_mode == 'SOFT':
                 if has_joint_parent:
                     body.label(text='柔性关节')
                 try:
@@ -844,7 +842,7 @@ class PPF_PT_ObjectCollisionGroups(bpy.types.Panel):
         layout.label(text='此处用于网格；解析墙和球使用原生设置', icon='INFO')
 
 
-classes = (PPF_OT_BonePMXJointEdit, PPF_PT_BonePhysics, PPF_PT_ObjectCollisionGroups)
+classes = (PPF_PT_BonePhysics, PPF_PT_ObjectCollisionGroups)
 
 
 def register():
