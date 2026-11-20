@@ -13,9 +13,10 @@ import bpy
 from ..i18n import pgettext_iface as iface
 from ..core.utils import get_category_name
 from ..core.compat import pose_bone_selected
+from ..core.encoder.pmx_joints import parent_joint_pair, parent_joint_pairs
 from ..models.bone_bindings import active_armature, active_bone, collect_body_controls_contract, has_physical_joint_parent, soft_material_refusal
 from ..models.groups import has_addon_data, get_group_by_uuid, iterate_active_object_groups
-from .bone_pmx_joint import PPF_OT_BonePMXJointEdit, draw_joints
+from .bone_pmx_joint import PPF_OT_BonePMXJointEdit, draw_parent_joint
 
 
 def _draw_collision_filter(layout, settings, context):
@@ -194,15 +195,17 @@ def _draw_empty_bone_sections(layout):
     empty.label(text='自定颜色  —')
     for key, title, closed in (
         ('ppf_bone_essentials', '常用物理参数', False),
-        ('ppf_bone_joints', '关节', False),
         ('ppf_bone_all_presets', '骨骼预设', True),
         ('ppf_bone_collision', '碰撞组', True),
+        ('ppf_bone_simple_limits', '软角度范围', True),
     ):
         header, body = layout.panel(key, default_closed=closed)
         header.label(text=title)
         if body:
             if key == 'ppf_bone_essentials':
                 empty = body.column(); empty.enabled = False
+                empty.label(text='回正力矩（每度）', icon='CONSTRAINT_BONE')
+                empty.label(text='无父关节；使用下方根控制', icon='INFO')
                 empty.label(text='物理体  —')
                 section, generation = body.panel('ppf_bone_simple_generation', default_closed=False)
                 section.label(text='代理形状与面数')
@@ -226,7 +229,8 @@ def _draw_empty_bone_sections(layout):
                 empty.label(text='启用碰撞组过滤  —')
                 empty.label(text='所属组 / 允许组  —')
             else:
-                body.label(text='选中骨骼或其代理以查看关节', icon='INFO')
+                empty = body.column(); empty.enabled = False
+                empty.label(text='当前骨骼无适用软关节  —')
 
 
 class _FrozenPropertyLayout:
@@ -326,6 +330,7 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
                     s=source[1].ppf_bone_physics
                     if actual=='SOFT':_draw_soft_material_choice(layout,context,s,owned_group)
                     layout.label(text=f'多选 {count} 项 · 显示活动项；修改即统一',icon='BONE_DATA')
+                    layout.prop(s,'collide_connected',text='允许相邻骨骼碰撞')
                     layout.prop(s,'mass_mode',text='质量输入')
                     layout.prop(s,'target_mass_kg' if s.mass_mode=='MASS' else 'density')
                     group=get_group_by_uuid(context.scene,s.group_uuid) if s.group_uuid else None
@@ -344,7 +349,6 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
                     error=context.window_manager.ppf_selection_parameters.error
                     if error:layout.label(text=error,icon='ERROR')
             else:layout.label(text='正在编辑真实代理网格 · Tab/E 返回',icon='EDITMODE_HLT')
-            self._draw_joint_section(layout, context, *(source if context.mode=='OBJECT' and source else (None, None)))
             _draw_edit_display(layout,context)
             layout.operator('ppf.bone_proxy_return', text='返回绑定骨骼', icon='BONE_DATA')
             return
@@ -424,8 +428,25 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
         from ..models.new_binding_defaults import uses_new_binding_preset,new_binding_plan
         first=uses_new_binding_preset(s);plan=new_binding_plan(s)
         model=plan.get('physical_model',s.physical_model)
+        arm=active_armature(context)
+        native_parent=parent_joint_pair(bone, parent_joint_pairs(arm)) if arm else None
+        has_joint_parent=has_physical_joint_parent(bone, arm=arm)
         header,body=layout.panel('ppf_bone_essentials',default_closed=False)
         header.label(text='常用物理参数')
+        if body and native_parent is None:
+            restoring=bone.ppf_bone_restoring_controls
+            direct=body.column(align=True)
+            from ..ops.bone_chain_presets import _joint_parent_status
+            valid_parent,_parent_reason=_joint_parent_status(bone, arm)
+            direct.enabled=bool(context.mode in {'OBJECT','POSE'} and s.enabled and s.proxy and valid_parent and s.joint_mode == 'SOFT')
+            target_loaded=bool(getattr(restoring,'draft_loaded',False) and getattr(restoring,'loaded_bone_uuid','')==getattr(s,'bone_uuid','') and getattr(restoring,'loaded_joint_uuid','')==getattr(s,'joint_uuid',''))
+            direct.label(text='回正力矩（每度）',icon='CONSTRAINT_BONE')
+            if not valid_parent:direct.label(text='无父关节；使用下方根控制',icon='INFO')
+            physical_loaded=bool(restoring.physical_draft_loaded and target_loaded)
+            if physical_loaded and restoring.physical_status:
+                direct.label(text=restoring.physical_status,icon='INFO')
+            from ..ops.bone_physical_controls import draw_inline
+            draw_inline(direct,context,bone,restoring,physical_loaded)
         if body:
             from ..ops.bone_proxy_editor import editor_active,editor_scope
             unified=editor_active(context)
@@ -443,9 +464,24 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
             body.prop(s,'mass_mode',text='质量')
             body.prop(s,'target_mass_kg' if s.mass_mode=='MASS' else 'density',text='质量 kg' if s.mass_mode=='MASS' else '密度 kg/m³')
             group=get_group_by_uuid(context.scene,s.group_uuid) if s.group_uuid else None
+            if native_parent is not None:
+                draw_parent_joint(body, arm, native_parent)
+            elif bone.parent and s.joint_mode == 'SOFT':
+                if has_joint_parent:
+                    body.label(text='柔性关节')
+                try:
+                    controlled = _selected_anchor_curve_active(context, bone)
+                except (ValueError, KeyError, TypeError):
+                    controlled = True
+                    body.label(text='恢复曲线状态无效，请检查曲线', icon='ERROR')
+                anchor = body.row()
+                anchor.enabled = not controlled
+                anchor.prop(s, 'anchor_stiffness', text='连接刚度（N/m）')
+                if controlled: body.label(text='连接由恢复曲线控制，请使用曲线编辑入口', icon='INFO')
             if group and group.active:body.prop(group,'friction',text='摩擦系数')
-            self._draw_basic_control(body,s,bone,model,active_armature(context))
-        self._draw_joint_section(layout, context, active_armature(context), bone)
+            self._draw_basic_control(body,s,bone,model,native_parent is not None)
+            if has_joint_parent:
+                self._draw_joint_choice(body,s,model)
         header,presets=layout.panel('ppf_bone_all_presets',default_closed=True)
         header.label(text='骨骼预设',icon='PRESET')
         if presets:
@@ -488,93 +524,37 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
             else:
                 op=apply_row.operator('ppf.bone_user_preset_apply',text='应用预设',icon='CHECKMARK')
                 op.scope_override=editor_scope(context) if unified else 'STATE'
+        follows_parent=bool(bone.parent and not bone.parent.ppf_bone_physics.enabled and getattr(s,'auto_follow_parent',False))
+        has_joint_parent=bool(native_parent is None and ((bone.parent and bone.parent.ppf_bone_physics.enabled) or follows_parent))
         header,collision=layout.panel('ppf_bone_collision',default_closed=True)
         header.label(text='碰撞组')
         if collision:
             _draw_collision_filter(collision,s,context)
-
-    def _draw_joint_section(self, layout, context, arm, bone):
-        from ..core.bone_selection_parameters import hierarchy_joint_enabled, resolve_selected_authors
-        from ..core.encoder.pmx_joints import parent_joint_pair, parent_joint_pairs
-        from ..ops.bone_chain_presets import _joint_parent_status
-        from ..ops.bone_physical_controls import draw_inline
-
-        header, joint = layout.panel('ppf_bone_joints', default_closed=False)
-        header.label(text='关节', icon='CONSTRAINT_BONE')
-        if joint is None:
-            return
-        if arm is None or bone is None:
-            joint.label(text='选中骨骼或其代理以查看关节', icon='INFO')
-            return
-
-        s = bone.ppf_bone_physics
-        parent_enabled = hierarchy_joint_enabled(arm, bone)
-        if bone.parent or any(selected.parent for _arm, selected in resolve_selected_authors(context)):
-            joint.prop(s, 'use_hierarchy_joint', text='连接父骨物理')
-        native_parent = parent_joint_pair(bone, parent_joint_pairs(arm))
-        has_pmx = draw_joints(joint, arm, bone)
-        if native_parent:
-            return
-        if bone.parent is None:
-            if not has_pmx:
-                joint.label(text='当前骨骼无父关节', icon='INFO')
-            return
-        parent = bone.parent.ppf_bone_physics
-        if parent_enabled and not parent.enabled:
-            joint.prop(s, 'auto_follow_parent', text='跟随父骨骼')
-        valid_parent, _ = _joint_parent_status(bone, arm)
-        if not parent_enabled:
-            joint.label(text='父关节已关闭，启用后使用下方参数', icon='INFO')
-        elif not valid_parent:
-            joint.label(text='未建立 PPF 父关节，请检查父骨物理或跟随设置', icon='INFO')
+            if has_joint_parent and s.joint_mode == 'SOFT':
+                if follows_parent:collision.label(text='内部锚点不参与碰撞',icon='INFO')
+                else:collision.prop(s,'collide_connected',text='允许相邻骨骼碰撞')
+        if has_joint_parent and s.joint_mode == 'SOFT':
+            header,limits=layout.panel('ppf_bone_simple_limits',default_closed=True)
+            header.label(text='软角度范围')
+            if limits:
+                limits.prop(s,'soft_limit_mode',text='摆动范围')
+                limits.prop(s,'soft_limit_policy',text='力度')
+                if s.soft_limit_mode=='CONE':
+                    limits.prop(s,'swing_cone_half_angle',text='圆锥半角')
+                    if s.soft_limit_policy=='ABSOLUTE_SI':limits.prop(s,'swing_cone_stiffness_degree',text='圆锥 N·mm/°')
+                if s.soft_limit_policy=='AUTO_INERTIA':limits.prop(s,'soft_limit_strength',text='强度倍率')
+                for index,label in enumerate(('X 扭转','Y 弯曲','Z 弯曲')):
+                    if s.soft_limit_mode=='CONE' and index>0:continue
+                    row=limits.row(align=True);row.prop(s,'soft_limits_enabled',index=index,text=label)
+                    row=limits.row(align=True);row.enabled=s.soft_limits_enabled[index]
+                    row.prop(s,'soft_lower',index=index,text='下限');row.prop(s,'soft_upper',index=index,text='上限')
+                    if s.soft_limit_policy=='ABSOLUTE_SI':limits.prop(s,'soft_stiffness_degree',index=index,text=label+' N·mm/°')
         else:
-            joint.label(text=f'PPF 父关节 · {bone.parent.name}', icon='CONSTRAINT_BONE', translate=False)
-        self._draw_joint_choice(joint, s, self._effective_model(s))
-        if s.joint_mode != 'SOFT':
-            return
-
-        if parent.enabled:
-            joint.prop(s, 'collide_connected', text='允许相邻骨骼碰撞')
-        elif valid_parent:
-            joint.label(text='内部锚点不参与碰撞', icon='INFO')
-        try:
-            controlled = _selected_anchor_curve_active(context, bone)
-        except (ValueError, KeyError, TypeError):
-            controlled = True
-            joint.label(text='恢复曲线状态无效，请检查曲线', icon='ERROR')
-        anchor = joint.row()
-        anchor.enabled = not controlled
-        anchor.prop(s, 'anchor_stiffness', text='连接刚度（N/m）')
-        if controlled:
-            joint.label(text='连接由恢复曲线控制，请使用曲线编辑入口', icon='INFO')
-
-        restoring = bone.ppf_bone_restoring_controls
-        direct = joint.column(align=True)
-        direct.enabled = bool(s.enabled and s.proxy and valid_parent)
-        target_loaded = (restoring.draft_loaded and restoring.loaded_bone_uuid == s.bone_uuid
-                         and restoring.loaded_joint_uuid == s.joint_uuid)
-        direct.label(text='回正力矩（每度）', icon='CONSTRAINT_BONE')
-        physical_loaded = bool(restoring.physical_draft_loaded and target_loaded)
-        if physical_loaded and restoring.physical_status:
-            direct.label(text=restoring.physical_status, icon='INFO')
-        # Restore draft controls belong to the active bone, even in proxy selection.
-        draw_inline(direct, context, bone, restoring, physical_loaded)
-
-        header, limits = joint.panel('ppf_bone_simple_limits', default_closed=True)
-        header.label(text='软角度范围')
-        if limits:
-            limits.prop(s,'soft_limit_mode',text='摆动范围')
-            limits.prop(s,'soft_limit_policy',text='力度')
-            if s.soft_limit_mode=='CONE':
-                limits.prop(s,'swing_cone_half_angle',text='圆锥半角')
-                if s.soft_limit_policy=='ABSOLUTE_SI':limits.prop(s,'swing_cone_stiffness_degree',text='圆锥 N·mm/°')
-            if s.soft_limit_policy=='AUTO_INERTIA':limits.prop(s,'soft_limit_strength',text='强度倍率')
-            for index,label in enumerate(('X 扭转','Y 弯曲','Z 弯曲')):
-                if s.soft_limit_mode=='CONE' and index>0:continue
-                row=limits.row(align=True);row.prop(s,'soft_limits_enabled',index=index,text=label)
-                row=limits.row(align=True);row.enabled=s.soft_limits_enabled[index]
-                row.prop(s,'soft_lower',index=index,text='下限');row.prop(s,'soft_upper',index=index,text='上限')
-                if s.soft_limit_policy=='ABSOLUTE_SI':limits.prop(s,'soft_stiffness_degree',index=index,text=label+' N·mm/°')
+            header,limits=layout.panel('ppf_bone_simple_limits',default_closed=True)
+            header.label(text='软角度范围')
+            if limits:
+                empty=limits.column();empty.enabled=False
+                empty.label(text='当前骨骼无适用软关节  —')
 
     def _draw_body_switch(self, layout, context, s):
         """Explicit RIGID <-> SOFT switch for the bone's EXISTING proxy.
@@ -724,13 +704,16 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
         from ..models.new_binding_defaults import new_binding_plan
         return new_binding_plan(s).get('physical_model', s.physical_model)
 
-    def _draw_basic_control(self,control,s,bone,model,arm):
+    def _draw_basic_control(self,control,s,bone,model,native_parent=False):
         """Basic movement controls plus explicit removal of saved invalid events."""
-        from ..core.encoder.pmx_joints import parent_joint_pair, parent_joint_pairs
-        generic_parent = (s.use_hierarchy_joint and bone.parent
-                          and not (arm and parent_joint_pair(bone, parent_joint_pairs(arm))))
-        physical_parent = bool(generic_parent and bone.parent.ppf_bone_physics.enabled)
-        follows_parent = bool(generic_parent and not physical_parent and s.auto_follow_parent)
+        generic_parent=bool(not native_parent and s.use_hierarchy_joint and bone.parent)
+        physical_parent=bool(generic_parent and bone.parent.ppf_bone_physics.enabled)
+        follows_parent=bool(generic_parent and not physical_parent and s.auto_follow_parent)
+        from ..core.bone_selection_parameters import resolve_selected_authors
+        if bone.parent or any(selected.parent for _arm,selected in resolve_selected_authors(bpy.context)):
+            control.prop(s, 'use_hierarchy_joint', text='连接父骨物理')
+        if generic_parent and not physical_parent:
+            control.prop(s,'auto_follow_parent',text='跟随父骨骼')
         restricted=follows_parent or (model=='SOFT' and physical_parent)
         if restricted:
             if s.root_mode!='FREE':
