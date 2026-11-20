@@ -378,6 +378,11 @@ fn root_final_budget_exhausted(step:u32,maximum:u32,final_step:bool,active_roots
     (!final_step||active_roots)&&maximum>0&&step>=maximum
 }
 fn initialize_final_clock(final_step:bool,initialized:bool)->bool {final_step&&!initialized}
+fn root_boundary_ready(preserve_boundary:bool,full_sweep_accepted:bool,step:u32,maximum:u32)->bool {
+    // The final iteration uses the same index and still runs its own
+    // shortened solve and CCD. Leave that slot available.
+    !preserve_boundary || full_sweep_accepted || step.saturating_add(1)>=maximum
+}
 // Experimental routing into the existing bounded, fully restored subdivision.
 // A rounded candidate refusal still refuses the entire uncommitted trial.
 fn root_acceptance_retry_enabled()->bool {
@@ -969,8 +974,8 @@ unsafe fn advance_trial<D: Device>(
     // STEP A5. The step size this advance aims at. Host arithmetic on two
     // scalars the scene already carries.
     super::roots::gate_runtime(data,state,prm.playback)?;
-    let root_plan = state.roots.plan_step(prm.time,prm.dt * prm.playback)?;
-    let root_plan = state.fem_roots.plan(prm.time,prm.dt*prm.playback,root_plan)?;
+    let authored_root_plan = state.roots.plan_step(prm.time,prm.dt * prm.playback)?;
+    let root_plan = state.fem_roots.plan(prm.time,prm.dt*prm.playback,authored_root_plan)?;
     let root_plan = if kinematics_shortened.is_some() {
         prepared.ok_or_else(|| Fatal::invariant("KINEMATICS_PLAN: missing prepared endpoint"))?
     } else {
@@ -982,6 +987,11 @@ unsafe fn advance_trial<D: Device>(
     if state.fem_roots.runtime.is_some()&&prm.playback!=1. {return Err(Fatal::invariant("FEM event physical clock requires unit playback"));}
     let mut dt = root_plan.integration_dt_s;
     let mut root_attempt=if state.fem_roots.runtime.is_some(){state.roots.begin_shared(device,root_plan)?}else{state.roots.begin(device,root_plan)?};
+    // Preserve an exact authored root boundary within the existing bounded
+    // Newton loop. B3 otherwise shortens every accepted prefix and can leave
+    // a geometric series of ever smaller trials before the same key.
+    let preserve_root_boundary=prm.max_newton_steps>0 && authored_root_plan.lands_on_boundary
+        && root_plan.end_s==authored_root_plan.end_s && root_attempt.is_some();
     state.fem_roots.begin(root_plan)?;
     state.fem_roots.gate_shared_clock(root_attempt.as_ref())?;
     if state.fem_roots.prepared_end!=Some(root_plan.end_s){state.fem_roots.retarget(device,&mut state.fix)?;}
@@ -1225,6 +1235,7 @@ unsafe fn advance_trial<D: Device>(
     let mut sand_offset_trace=SandOffsetTrace::new(prm.time,vertices);
     if sand_offset_trace.enabled {sand_offset_trace.capture(device,"accepted-current",0,false,dt,0.0,1.0,1.0,state.positions.handle(),state.positions.handle(),None);}
     let mut toi_advanced: f64 = 0.0;
+    let mut full_remaining_sweep_accepted = false;
     let mut step: u32 = 1;
     let mut final_step = false;
     let mut final_clock_initialized = false;
@@ -3316,6 +3327,7 @@ unsafe fn advance_trial<D: Device>(
         // double, because it accumulates across every Newton iteration.
         if !final_step {
             toi_advanced += (1.0 - toi_advanced).max(0.0) * f64::from(toi_recale * toi);
+            full_remaining_sweep_accepted |= toi_recale == 1.0 && toi == 1.0;
         }
         // PRINTED AT EVERY NEWTON ITERATION, so it is a bare transcript line
         // rather than a debug one. It
@@ -3753,7 +3765,8 @@ unsafe fn advance_trial<D: Device>(
             }
             break;
         }
-        if toi_advanced >= f64::from(prm.target_toi) && step >= prm.min_newton_steps {
+        if toi_advanced >= f64::from(prm.target_toi) && step >= prm.min_newton_steps
+            && root_boundary_ready(preserve_root_boundary,full_remaining_sweep_accepted,step,prm.max_newton_steps) {
             final_step = true;
         } else {
             step += 1;
@@ -4224,6 +4237,15 @@ unsafe fn compute_target<D: Device>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn authored_root_boundary_leaves_the_last_iteration_for_shorter_recertification() {
+        assert!(!super::root_boundary_ready(true, false, 2, 4));
+        assert!(super::root_boundary_ready(true, false, 3, 4));
+        assert!(!super::root_final_budget_exhausted(3, 4, true, true));
+        assert!(super::root_boundary_ready(true, true, 2, 4));
+        assert!(super::root_boundary_ready(false, false, 2, 4));
+    }
+
     #[test]
     fn the_step_delay_defaults_to_zero_and_parses_milliseconds() {
         use std::time::Duration;

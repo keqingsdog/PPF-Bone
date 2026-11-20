@@ -99,6 +99,7 @@ impl Attempt { pub fn sequence(&self)->u64 {self.sequence} }
 pub struct NativeStep {
     pub start_s: f64, pub end_s: f64, pub integration_dt_s: f32,
     requested_dt_s: f32,
+    pub lands_on_boundary: bool,
 }
 // Shared physical-clock/f32-representation contract. This is representation
 // error only, not permission to enlarge a certified physical sweep.
@@ -155,7 +156,7 @@ pub fn native_step_before_boundary(start_s:f64,requested_dt_s:f32,next_key:Optio
     if !native_duration_matches(elapsed,integration_dt_s) {
         return Err(fail(CODE_TIME,"native event duration exceeds normal f32 representation error"));
     }
-    Ok(NativeStep{start_s,end_s,integration_dt_s,requested_dt_s})
+    Ok(NativeStep{start_s,end_s,integration_dt_s,requested_dt_s,lands_on_boundary:next_key==Some(end_s)})
 }
 
 /// Plan ordinary kinematics in scene time while integrating in physical time.
@@ -214,15 +215,25 @@ mod event_clock_tests {
     #[test]
     fn decimal_key_uses_four_normal_steps_without_roundoff_microsteps() {
         let mut state=RootState::new(1,vec![moving(0),moving(1)]).unwrap();
-        for _ in 0..4 {
+        for i in 0..4 {
             let plan=state.native_step(0.0025).unwrap();
             assert!(plan.integration_dt_s>0.0024);
+            assert_eq!(plan.lands_on_boundary,i==3);
             let a=state.begin_native(plan).unwrap();
             state.commit(&a,a.end_s,&a.target,0.0,1e-6).unwrap();
         }
         assert_eq!(state.committed_time_s,0.01);
         assert!(state.native_step(0.0025).unwrap().integration_dt_s>0.0024);
         assert_eq!(state.commit_sequence,4);
+    }
+    #[test]
+    fn two_clock_ticks_before_root_key_plan_keeps_the_exact_boundary() {
+        let key = 11.0_f64 / 30.0;
+        let start = f64::from_bits(key.to_bits() - 2);
+        let plan = native_step_before_boundary(start, 0.005, Some(key), true).unwrap();
+        assert!(plan.lands_on_boundary);
+        assert_eq!(plan.end_s, key);
+        assert_eq!(f64::from(plan.integration_dt_s), key - start);
     }
     #[test]
     fn native_rebuild_preserves_exact_event_and_shortening_refreezes_target() {
@@ -428,6 +439,7 @@ impl RootState {
         if angle>cap {
             let duration=(step.end_s-step.start_s)*(cap/angle)*(1.0-4.0*f64::from(f32::EPSILON));
             step.end_s=step.start_s+duration;step.integration_dt_s=(step.end_s-step.start_s) as f32;
+            step.lands_on_boundary=false;
             if step.end_s<=step.start_s || step.integration_dt_s<=0.0 {return Err(fail(CODE_TIME,"angular substep cannot advance the physical clock"));}
         }
         Ok(step)
