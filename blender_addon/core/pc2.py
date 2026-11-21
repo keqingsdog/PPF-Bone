@@ -81,8 +81,15 @@ def write_pc2(filepath, frames, start=0.0, sampling=1.0):
         f.write(struct.pack("<f", start))
         f.write(struct.pack("<f", sampling))
         f.write(struct.pack("<i", n_frames))
-        for positions in frames:
-            f.write(numpy.asarray(positions, dtype="<f").tobytes())
+        if (type(frames) is numpy.ndarray
+                and frames.ndim == 3 and n_verts > 0 and frames.shape[2] == 3
+                and frames.dtype == numpy.dtype("<f") and frames.flags.c_contiguous):
+            # Capture already supplies a packed little-endian Float32 array.
+            # Avoid allocating a Python bytes copy of each frame.
+            f.write(memoryview(frames).cast("B"))
+        else:
+            for positions in frames:
+                f.write(numpy.asarray(positions, dtype="<f").tobytes())
 
 
 def create_pc2_file(filepath, n_verts, start=0.0, sampling=1.0):
@@ -1868,6 +1875,8 @@ def _owned_capture_keys(scene=None, *, static_cache_only=False):
 
 
 def _clear_capture_keys(keys, scene=None, *, include_missing=False):
+    from . import capture_provenance as provenance
+    provenance._assert_group_idle(get_pc2_dir())
     scene = _capture_scene(scene)
     allowed = _owned_capture_keys(scene)
     records = _capture_records(scene)

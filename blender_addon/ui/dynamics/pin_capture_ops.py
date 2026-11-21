@@ -281,7 +281,6 @@ def _build_entry(scene, group_index, pin_index, error_collector: list, *, alloca
 def _resolve_capture_pin(scene, entry, *, identity_only=False):
     """Resolve the captured author item, never whichever item occupies its index."""
     from ...core.uuid_registry import plan_pin_reference
-    from ...core.encoder.pin import _get_pin_indices
     group = get_group_from_index(scene, entry["group_index"])
     if group is None or group.as_pointer() != entry["group_pointer"]:
         raise RuntimeError("Captured Pin group changed; capture cancelled")
@@ -293,12 +292,49 @@ def _resolve_capture_pin(scene, entry, *, identity_only=False):
         plan = plan_pin_reference(item)
         if (plan is not None and plan[0].as_pointer() == entry["obj_pointer"]
                 and plan[0].name == entry["obj_name"] and plan[2] == entry["vg_name"]
-                and sum(1 for row in group.assigned_objects if row.uuid == entry["obj_uuid"]) == 1
-                and (identity_only or np.array_equal(entry["pin_indices"], _get_pin_indices(plan[0], plan[2])))):
-            return (item, plan[0]) if identity_only else item
+                and sum(1 for row in group.assigned_objects if row.uuid == entry["obj_uuid"]) == 1):
+            obj, vg_name = plan[0], plan[2]
+            if identity_only:
+                return item, obj
+            if obj.type == "MESH" and hasattr(obj.data, "vertices"):
+                vg = obj.vertex_groups.get(vg_name)
+                index = vg.index if vg else None
+                indices = _mesh_pin_memberships(obj, (index,))[index] if index is not None else []
+            else:
+                from ...core.encoder.pin import _get_pin_indices
+                indices = _get_pin_indices(obj, vg_name)
+            if np.array_equal(entry["pin_indices"], indices):
+                return item
         break
     raise RuntimeError("Captured Pin was removed or retargeted; capture cancelled")
 
+
+
+def _mesh_pin_memberships(obj, group_indices):
+    """One ordered live membership scan, keeping zero-weight memberships.
+
+    Most vertices in a large mesh have no vertex groups in sparse authoring.
+    Avoid iterator/set allocation there; for dense rigging only collect rows
+    matching a selected Pin.  Each result list is already in vertex order.
+    Duplicate memberships (normally impossible in RNA) still count once.
+    The caller performs this scan at the existing guard points; no generation,
+    pointer or depsgraph heuristic is being used to infer membership.
+    """
+    rows = {group_index: [] for group_index in group_indices}
+    if not rows:
+        return rows
+    get_row = rows.get
+    for vertex in obj.data.vertices:
+        groups = vertex.groups
+        if not groups:
+            continue
+        for membership in groups:
+            row = get_row(membership.group)
+            if row is not None:
+                index = vertex.index
+                if not row or row[-1] != index:
+                    row.append(index)
+    return rows
 
 
 def _resolve_capture_pins(scene, entries):
@@ -307,26 +343,22 @@ def _resolve_capture_pins(scene, entries):
         return [_resolve_capture_pin(scene, entries[0])]
     resolved = [_resolve_capture_pin(scene, entry, identity_only=True) for entry in entries]
     objects = {}
+    group_indices = []
     for entry, (_, obj) in zip(entries, resolved):
         key = obj.as_pointer()
-        if key not in objects:
-            objects[key] = (obj, {})
-        groups = objects[key][1]
+        targets = objects.setdefault(key, (obj, set()))[1]
         vg = obj.vertex_groups.get(entry["vg_name"])
-        if vg:
-            groups.setdefault(vg.index, [])
-    for obj, groups in objects.values():
-        if hasattr(obj.data, "vertices"):
-            for vertex in obj.data.vertices:
-                seen = set()
-                for membership in vertex.groups:
-                    index = membership.group
-                    if index in groups and index not in seen:
-                        groups[index].append(vertex.index)
-                        seen.add(index)
-    for entry, (_, obj) in zip(entries, resolved):
-        vg = obj.vertex_groups.get(entry["vg_name"])
-        indices = objects[obj.as_pointer()][1].get(vg.index, []) if vg else []
+        index = vg.index if vg else None
+        group_indices.append(index)
+        if index is not None:
+            targets.add(index)
+    memberships = {
+        key: _mesh_pin_memberships(obj, targets)
+        for key, (obj, targets) in objects.items()
+        if hasattr(obj.data, "vertices")
+    }
+    for entry, (_, obj), index in zip(entries, resolved, group_indices):
+        indices = memberships.get(obj.as_pointer(), {}).get(index, [])
         if not np.array_equal(entry["pin_indices"], indices):
             raise RuntimeError("Captured Pin was removed or retargeted; capture cancelled")
     return [item for item, _ in resolved]
@@ -395,14 +427,15 @@ def _process_one_frame(scene, depsgraph, entry, frame: int) -> tuple[bool, str]:
     return True, ""
 
 
-def _start_job(context, entries: list) -> tuple[bool, str]:
+def _start_job(context, entries: list, *, _joint_owner=None) -> tuple[bool, str]:
     if _capture_job["active"]:
         return False, iface_("Another Capture Deformation job is in progress")
     # Refuse to start if a STATIC capture is in flight: the two share
     # the depsgraph + frame_set side effects and would corrupt each
     # other's running frame cursor.
     from .static_deform_ops import is_capture_running as _static_running
-    if _static_running():
+    from . import static_deform_ops as sibling
+    if _static_running() and (_joint_owner is None or sibling._capture_job.get("owner") is not _joint_owner):
         return False, iface_("Static-collider capture is in progress; wait for it to finish")
     if not entries:
         return False, iface_("No eligible pins to capture")
@@ -411,7 +444,7 @@ def _start_job(context, entries: list) -> tuple[bool, str]:
     _capture_job.update({
         "active": True,
         "token": object(),
-        "owner": None,
+        "owner": _joint_owner,
         "aborted": False,
         "stop_save_failed": False,
         "entries": entries,
@@ -857,6 +890,13 @@ class SOLVER_OT_PinCaptureAbort(Operator):
     save_partial: _ppf_props.BoolProperty(default=True, options={'HIDDEN'})  # pyright: ignore
 
     def execute(self, context):
+        owner = _capture_job.get("owner")
+        if getattr(owner, "_combined_capture_owner", False):
+            # A joint run cannot publish Pin-only prefixes.
+            _capture_job["aborted"] = True
+            _capture_job["status"] = iface_("Aborting...")
+            redraw_all_areas(context)
+            return {"FINISHED"}
         saved = []
         if self.save_partial:
             try:

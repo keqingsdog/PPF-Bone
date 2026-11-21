@@ -7,6 +7,7 @@ from ..core.pin_reference import decode_stored_pin_identifier, PinReferenceError
 
 from .. import i18n as _ppf_i18n
 import os
+import textwrap
 
 import bpy  # pyright: ignore
 
@@ -109,7 +110,7 @@ def _ascii_bar(factor: float) -> str:
     return "[" + "#" * filled + "." * (_ASCII_BAR_WIDTH - filled) + "]"
 
 
-def _draw_progress(layout, done, total, status_text, icon, abort_op):
+def _draw_progress(layout, done, total, status_text, icon, abort_op, *, capture_samples=False):
     """Draw one progress block (status label, native ``progress`` bar with an
     ASCII fallback, and an abort operator) into a fresh sub-box of ``layout``.
 
@@ -119,13 +120,69 @@ def _draw_progress(layout, done, total, status_text, icon, abort_op):
     factor = (done / total) if total > 0 else 0.0
     prog_box = layout.box()
     prog_box.label(text=status_text, icon=icon)
-    label_text = f"{int(factor * 100)}% ({done}/{total})"
+    label_text = (iface_("Samples: {done}/{total}").format(done=done, total=total)
+                  if capture_samples else f"{int(factor * 100)}% ({done}/{total})")
     try:
         prog_box.progress(factor=factor, type="BAR", text=label_text)
     except (AttributeError, TypeError):
         bar = _ascii_bar(factor)
         prog_box.label(text=f"{bar} {label_text}")
     prog_box.operator(abort_op, icon="X")
+
+
+# Session-only, single most recent bulk run (no data saved in the .blend).
+_bulk_capture_display = {}
+
+
+def _bulk_capture_scene_key(context):
+    scene = context.scene
+    return (scene.session_uid, bpy.data.filepath)
+
+
+def _bulk_capture_phase(context, kind):
+    if _bulk_capture_display.get("scene") == _bulk_capture_scene_key(context):
+        return _bulk_capture_display["phases"].get(kind)
+    return None
+
+
+def _draw_bulk_capture_modes(box, context):
+    if _bulk_capture_display.get("scene") != _bulk_capture_scene_key(context):
+        return
+    phases = _bulk_capture_display["phases"]
+    if not phases:
+        return
+    col = box.column(align=True)
+    running = any(phase["active"] for phase in phases.values())
+    col.label(text=iface_("Bulk capture methods") if running else iface_("Last bulk capture"), icon="INFO")
+    region_width = getattr(getattr(context, "region", None), "width", 260)
+    ui_scale = bpy.context.preferences.system.ui_scale or 1.0
+    reason_width = max(16, int((region_width / ui_scale - 45) / 7))
+    if _bulk_capture_display.get("joint") and len(phases) > 1:
+        col.label(text=iface_("Capture modes share one timeline pass"), translate=False)
+    for kind, phase in phases.items():
+        title = iface_("Static deformation") if kind == "STATIC" else iface_("Pin capture")
+        mode = (iface_("Frame batch") if phase["batch"] else iface_("Sequential"))
+        col.label(text=f"{title}: {mode}", translate=False)
+        count = iface_("Objects: {count}").format(count=phase["objects"])
+        if kind == "PIN":
+            count += " | " + iface_("Pin groups: {count}").format(count=phase["targets"])
+        col.label(text=count, translate=False)
+        if phase["reason"]:
+            reason = iface_("Stopped: {reason}").format(reason=phase["reason"])
+            # Fullwidth/CJK labels consume roughly twice the width of Latin.
+            width = max(10, reason_width // 2) if any(ord(c) > 0x2E80 for c in reason) else reason_width
+            for line in textwrap.wrap(reason, width=width):
+                col.label(text=line, translate=False)
+
+
+def _bulk_capture_frame_label(phase, *, is_pin):
+    if phase["frame"] is None:
+        return iface_("Preparing Pin capture...") if is_pin else iface_("Preparing Static capture...")
+    if phase["batch"]:
+        return iface_("Scene frame {frame} | {count} objects").format(
+            frame=phase["frame"], count=phase["frame_objects"],
+        )
+    return iface_("Scene frame {frame}").format(frame=phase["frame"])
 
 
 def _find_missing_pc2_paths(context) -> list[str]:
@@ -627,8 +684,29 @@ class SOLVER_PT_SolverPanel(Panel):
                 box, done, total, status or "Baking...", "TIME", "solver.bake_abort"
             )
 
-        if is_capture_running():
+        joint = (_bulk_capture_display.get("joint") if
+                 _bulk_capture_display.get("scene") == _bulk_capture_scene_key(context) else None)
+        joint_active = bool(joint and joint.get("active"))
+        if joint_active:
+            frame = joint["frame"]
+            title = (iface_("Preparing combined capture...") if frame is None else
+                     iface_("Scene frame {frame} | shared pass").format(frame=frame))
+            _draw_progress(box, joint["done"], joint["total"], title, "REC",
+                           "solver.capture_abort" if joint["st_total"] else "solver.pin_capture_abort",
+                           capture_samples=True)
+            if joint["st_total"]:
+                box.label(text=iface_("Static samples: {done}/{total}").format(
+                    done=joint["st_done"], total=joint["st_total"]), translate=False)
+            if joint["pin_total"]:
+                box.label(text=iface_("Pin samples: {done}/{total}").format(
+                    done=joint["pin_done"], total=joint["pin_total"]), translate=False)
+
+        if is_capture_running() and not joint_active:
             done, total, status, _ = capture_progress_snapshot()
+            phase = _bulk_capture_phase(context, "STATIC")
+            active = bool(phase and phase["active"])
+            if active:
+                status = _bulk_capture_frame_label(phase, is_pin=False)
             _draw_progress(
                 box,
                 done,
@@ -636,10 +714,15 @@ class SOLVER_PT_SolverPanel(Panel):
                 status or "Capturing...",
                 "REC",
                 "solver.capture_abort",
+                capture_samples=active,
             )
 
-        if is_pin_capture_running():
+        if is_pin_capture_running() and not joint_active:
             done, total, status, _ = pin_capture_progress_snapshot()
+            phase = _bulk_capture_phase(context, "PIN")
+            active = bool(phase and phase["active"])
+            if active:
+                status = _bulk_capture_frame_label(phase, is_pin=True)
             _draw_progress(
                 box,
                 done,
@@ -647,6 +730,7 @@ class SOLVER_PT_SolverPanel(Panel):
                 status or "Capturing pin...",
                 "REC",
                 "solver.pin_capture_abort",
+                capture_samples=active,
             )
             if pin_capture_stop_save_failed():
                 box.operator("solver.pin_capture_abort", text="丢弃未完成进度", icon="X").save_partial = False
@@ -694,10 +778,14 @@ class SOLVER_PT_SolverPanel(Panel):
         # out when there is nothing to capture / clear.
         box = layout.box()
         box.label(text="Deformations", icon="MOD_SIMPLEDEFORM")
+        batch_control = box.row()
+        batch_control.enabled = not (is_capture_running() or is_pin_capture_running())
+        batch_control.prop(context.window_manager, "ppf_capture_frame_batch")
         box.operator(
             SOLVER_OT_RecaptureAllDeformations.bl_idname, icon="FILE_REFRESH"
         )
         box.operator(SOLVER_OT_ClearAllDeformations.bl_idname, icon="TRASH")
+        _draw_bulk_capture_modes(box, context)
 
         # Export the simulated mesh sequence to a USD / Alembic cache: a
         # lighter alternative to the shape-key bake for long/heavy animations.
@@ -1694,10 +1782,9 @@ def _recapture_pin_queue_identity(scene, specs):
 
 class SOLVER_OT_RecaptureAllDeformations(Operator):
     """Re-capture deformation for every deforming STATIC collider and every
-    animated pin in one pass, so you don't have to capture each one by hand
-    before Transfer. Runs the static-collider captures first, then the pin
-    captures (the two share the depsgraph and can't run at once); progress
-    and an Abort button appear below while it runs."""
+    animated pin with one action, so you don't have to capture each one by hand
+    before Transfer. When batching is enabled, one timeline pass samples both
+    Static and Pin. Shows the actual capture mode, progress and an Abort button."""
 
     bl_idname = "solver.recapture_all_deformations"
     bl_label = "Re-capture All Deformations"
@@ -1727,6 +1814,23 @@ class SOLVER_OT_RecaptureAllDeformations(Operator):
         self._capture_cancelled = False
         self._capture_sampling_targets = None
         self._capture_ranges = None
+        # Snapshot the UI choice once, so it cannot change an active capture.
+        self._capture_frame_batch_requested = bool(
+            getattr(context.window_manager, "ppf_capture_frame_batch", False)
+        )
+        self._capture_frame_batch_active = False
+        self._joint_capture = None
+        if self._capture_frame_batch_requested:
+            if not bpy.data.filepath:
+                self.report({"ERROR"}, iface_("Save the project before using mixed capture"))
+                return {"CANCELLED"}
+            try:
+                from ..core.capture_provenance import _assert_group_idle
+                from ..core.pc2 import get_pc2_dir
+                _assert_group_idle(get_pc2_dir())
+            except (OSError, RuntimeError, ValueError) as exc:
+                self.report({"ERROR"}, str(exc))
+                return {"CANCELLED"}
         from .dynamics.static_deform_ops import collect_capturable_static_objects
         from .dynamics.pin_capture_ops import collect_capturable_pins, validate_pin_capture_specs
 
@@ -1774,9 +1878,32 @@ class SOLVER_OT_RecaptureAllDeformations(Operator):
             return {"CANCELLED"}
         self._phase = None
         self._summary = {"objs": 0, "pins": 0}
-        if not self._start_next(context):
+        self._bulk_display = {"scene": _bulk_capture_scene_key(context), "phases": {}}
+        _bulk_capture_display.clear()
+        _bulk_capture_display.update(self._bulk_display)
+        if self._capture_frame_batch_requested:
+            try:
+                from .dynamics.capture_joint_schedule import JointCapture
+                self._joint_capture = JointCapture(context, static_objs, pin_specs)
+                self._joint_capture._timer_owner = self
+                self._queue = []
+                self._capture_frame_batch_active = True
+                self._phase = "JOINT"
+                for kind, _, _, _, rows in self._joint_capture.jobs:
+                    self._bulk_display["phases"][kind] = {
+                        "active": True, "batch": True, "reason": "", "targets": len(rows),
+                        "objects": len({row["obj_uuid"] for row in rows}),
+                        "frame": None, "frame_objects": 0,
+                    }
+                self._update_joint_capture_display()
+            except Exception as exc:
+                self._cleanup_active(context)
+                self.report({"ERROR"}, iface_("Frame batch could not start: {error}").format(error=exc))
+                return self._end_timer(context, {"CANCELLED"})
+        elif not self._start_next(context):
             self._capture_sampling_targets = None
-            self.report({"WARNING"}, iface_("Nothing to capture"))
+            if not self._capture_cancelled:
+                self.report({"WARNING"}, iface_("Nothing to capture"))
             return {"CANCELLED"}
         wm = context.window_manager
         self._capture_wm = wm
@@ -1827,19 +1954,64 @@ class SOLVER_OT_RecaptureAllDeformations(Operator):
                     self._phase = None
                     self.report({"WARNING"}, "Queued capture Pin changed; capture cancelled")
                     return False
-            if kind == self._PHASE_STATIC:
-                ok, err = sd.start_capture_for_objects(context, payload)
-            else:
-                ok, err = pc.start_capture_for_pins(context, payload, strict=True)
+            module = sd if kind == self._PHASE_STATIC else pc
+            old_token = module._capture_job.get("token")
+            try:
+                if kind == self._PHASE_STATIC:
+                    ok, err = sd.start_capture_for_objects(context, payload)
+                else:
+                    ok, err = pc.start_capture_for_pins(context, payload, strict=True)
+            except Exception as exc:
+                if not self._capture_frame_batch_requested:
+                    raise
+                self._capture_cancelled = True
+                self._queue = []
+                job = module._capture_job
+                if job.get("active") and job.get("token") is not old_token and job.get("owner") is None:
+                    self._capture_module = module
+                    self._capture_token = job["token"]
+                    job["owner"] = self
+                    self._phase = kind
+                    self._cleanup_active(context)
+                self._phase = None
+                self._bulk_display["phases"][kind] = {
+                    "active": False, "batch": True, "reason": str(exc), "objects": 0,
+                    "targets": 0, "frame": None, "frame_objects": 0,
+                }
+                self.report({"ERROR"}, iface_("Frame batch could not start: {error}").format(error=exc))
+                return False
             if ok:
-                self._capture_module = sd if kind == self._PHASE_STATIC else pc
+                self._capture_module = module
                 self._capture_token = self._capture_module._capture_job["token"]
                 self._capture_module._capture_job["owner"] = self
                 self._phase = kind
+                self._capture_frame_batch_active = False
+                job = self._capture_module._capture_job
+                entries = job["entries" if kind == self._PHASE_PIN else "objects"]
+                phase = self._bulk_display["phases"][kind] = {
+                    "active": True, "batch": self._capture_frame_batch_requested,
+                    "reason": "", "targets": len(entries),
+                    "objects": len({row["obj_uuid"] for row in entries}),
+                    "frame": None, "frame_objects": 0,
+                }
+                if self._capture_frame_batch_requested:
+                    try:
+                        from .dynamics import capture_frame_batch
+                        if not capture_frame_batch.admit(context, self._capture_module):
+                            raise RuntimeError(iface_("No valid capture work to start"))
+                        self._capture_frame_batch_active = True
+                    except Exception as exc:
+                        phase["reason"] = str(exc)
+                        phase["active"] = False
+                        self._capture_cancelled = True
+                        self._queue = []
+                        self._cleanup_active(context)
+                        self.report({"ERROR"}, iface_("Frame batch could not start: {error}").format(error=exc))
+                        return False
                 return True
             if err:
                 self.report({"WARNING"}, err)
-            if kind == self._PHASE_PIN:
+            if kind == self._PHASE_PIN or self._capture_frame_batch_requested:
                 self._capture_cancelled = True
                 self._queue = []
                 self._phase = None
@@ -1847,7 +2019,73 @@ class SOLVER_OT_RecaptureAllDeformations(Operator):
         self._phase = None
         return False
 
+    def _advance_phase(self, context, module, legacy_advance):
+        job = module._capture_job
+        before = job["total_frames_processed"]
+        if self._capture_frame_batch_requested:
+            if not self._capture_frame_batch_active:
+                raise RuntimeError(iface_("Frame batch lost its active job"))
+            from .dynamics import capture_frame_batch
+            result = capture_frame_batch.tick(context, module)
+        else:
+            result = legacy_advance(context)
+        if job["total_frames_processed"] > before:
+            phase = self._bulk_display["phases"][self._phase]
+            frame = context.scene.frame_current
+            phase["frame"] = frame
+            if phase["batch"]:
+                entries = job["entries" if self._phase == self._PHASE_PIN else "objects"]
+                phase["frame_objects"] = len({row["obj_uuid"] for row in entries
+                                              if row["frame_start"] <= frame <= row["frame_end"]})
+        if not result[0] or result[1]:
+            self._bulk_display["phases"][self._phase]["active"] = False
+        return result
+
+    def _update_joint_capture_display(self):
+        joint = self._joint_capture
+        counters = {"STATIC": (0, 0), "PIN": (0, 0)}
+        for kind, _, job, _, _ in joint.jobs:
+            counters[kind] = (job["total_frames_processed"], job["total_frames"])
+        sd, st = counters["STATIC"]
+        pd, pt = counters["PIN"]
+        self._bulk_display["joint"] = {
+            "active": True, "frame": joint.seeded, "done": sd + pd, "total": st + pt,
+            "st_done": sd, "st_total": st, "pin_done": pd, "pin_total": pt,
+        }
+        _bulk_capture_display["joint"] = self._bulk_display["joint"]
+
+    def _modal_joint_capture(self, context, event):
+        if event.type != "TIMER" or getattr(event, "timer", self._timer) != self._timer:
+            return {"PASS_THROUGH"}
+        joint = self._joint_capture
+        try:
+            more = joint.tick(context)
+            self._update_joint_capture_display()
+            if more:
+                redraw_all_areas(context)
+                return {"RUNNING_MODAL"}
+            from ..core.capture_batch_commit import commit_batch_capture
+            tasks = joint.tasks(context)
+            commit_batch_capture(context.scene, tasks, recheck=lambda: joint.tasks(context))
+            self._summary["objs"] = sum(kind == "STATIC" for kind, *_ in tasks)
+            self._summary["pins"] = sum(kind == "PIN" for kind, *_ in tasks)
+            self._cleanup_active(context)
+            return self._finish(context)
+        except Exception as exc:
+            for phase in self._bulk_display["phases"].values():
+                phase["reason"] = str(exc)
+            try:
+                self._cleanup_active(context)
+            finally:
+                self.report({"ERROR"}, iface_("Re-capture failed: {error}").format(error=exc))
+                self._end_timer(context, {"CANCELLED"})
+            redraw_all_areas(context)
+            return {"CANCELLED"}
+
     def modal(self, context, event):
+        joint = getattr(self, '_joint_capture', None)
+        if joint is not None:
+            return self._modal_joint_capture(context, event)
         from ..core.capture_origin import owns_capture_job
         module = getattr(self, '_capture_module', None)
         if module is None or not owns_capture_job(module._capture_job, getattr(self, '_capture_token', None)):
@@ -1861,7 +2099,7 @@ class SOLVER_OT_RecaptureAllDeformations(Operator):
 
         try:
             if self._phase == self._PHASE_STATIC:
-                more, aborted, err = sd.advance_capture(context)
+                more, aborted, err = self._advance_phase(context, sd, sd.advance_capture)
                 if aborted:
                     return self._abort(context, err)
                 if not more:
@@ -1873,7 +2111,7 @@ class SOLVER_OT_RecaptureAllDeformations(Operator):
                 redraw_all_areas(context)
                 return {"RUNNING_MODAL"}
             elif self._phase == self._PHASE_PIN:
-                more, aborted, err = pc.advance_pin_capture(context)
+                more, aborted, err = self._advance_phase(context, pc, pc.advance_pin_capture)
                 if aborted:
                     return self._abort(context, err)
                 if not more:
@@ -1886,12 +2124,21 @@ class SOLVER_OT_RecaptureAllDeformations(Operator):
                 return {"RUNNING_MODAL"}
             return self._finish(context)
         except Exception as exc:  # noqa: BLE001 — must restore state
+            phase = self._bulk_display["phases"].get(self._phase)
+            if phase:
+                phase["reason"] = str(exc)
             self._cleanup_active(context)
             redraw_all_areas(context)
             self.report({"ERROR"}, iface_("Re-capture failed: {error}").format(error=exc))
             return self._end_timer(context, {"CANCELLED"})
 
     def _cleanup_active(self, context):
+        joint = getattr(self, '_joint_capture', None)
+        if joint is not None:
+            self._joint_capture = None
+            self._phase = None
+            joint.close()
+            return
         from ..core.capture_origin import owns_capture_job
         module = getattr(self, '_capture_module', None)
         if module is None or not owns_capture_job(module._capture_job, getattr(self, '_capture_token', None)):
@@ -1907,6 +2154,9 @@ class SOLVER_OT_RecaptureAllDeformations(Operator):
         self._phase = None
 
     def _abort(self, context, err):
+        phase = self._bulk_display["phases"].get(self._phase)
+        if phase and err:
+            phase["reason"] = str(err)
         self._cleanup_active(context)
         redraw_all_areas(context)
         if err:
@@ -1932,6 +2182,10 @@ class SOLVER_OT_RecaptureAllDeformations(Operator):
         from ..core.capture_origin import detach_capture_timer
         self._capture_sampling_targets = None
         self._capture_ranges = None
+        for phase in self._bulk_display["phases"].values():
+            phase["active"] = False
+        if self._bulk_display.get("joint"):
+            self._bulk_display["joint"]["active"] = False
         detach_capture_timer(self, context)
         return retval
 
@@ -2415,10 +2669,21 @@ classes = (
 
 
 def register():
+    bpy.types.WindowManager.ppf_capture_frame_batch = BoolProperty(
+        name="Batch capture by frame",
+        description=(
+            "On: sample Static and Pin in one timeline pass; errors stop capture. "
+            "Off: sample sequentially. Stateful scenes may differ; keep a project copy"
+        ),
+        default=False,
+        options={"SKIP_SAVE"},
+    )
     for cls in classes:
         _ppf_i18n.register_class(cls)
 
 
 def unregister():
+    _bulk_capture_display.clear()
+    del bpy.types.WindowManager.ppf_capture_frame_batch
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)

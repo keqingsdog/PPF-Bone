@@ -82,6 +82,9 @@ def abort_before_save(job):
     if not job.get('active'):
         return
     owner = job.get('owner')
+    if getattr(owner, '_combined_capture_owner', False):
+        owner.abort_for_save()
+        return
     if owner is not None:
         owner._capture_cancelled = True
         if hasattr(owner, '_queue'):
@@ -188,6 +191,7 @@ def cancel_capture_jobs(*, restore=True):
     """Invalidate modal owners before teardown; Undo must not re-evaluate RNA."""
     from ..ui.dynamics import static_deform_ops, pin_capture_ops
     errors = []
+    combined_seen = set()
     for module in (static_deform_ops, pin_capture_ops):
         job = module._capture_job
         token = job.get('token')
@@ -197,7 +201,18 @@ def cancel_capture_jobs(*, restore=True):
             if hasattr(owner, '_queue'):
                 owner._queue = []
         try:
-            if job.get('active') and restore:
+            if getattr(owner, '_combined_capture_owner', False):
+                if id(owner) not in combined_seen:
+                    combined_seen.add(id(owner))
+                    if restore:
+                        owner._restore_once()
+                    else:
+                        owner.restored = True
+                    operator = getattr(owner, '_timer_owner', None)
+                    if operator is not None:
+                        operator._end_timer(None, {"CANCELLED"})
+                        operator._cleanup_active(None)
+            elif job.get('active') and restore:
                 module._restore_frame(None)
         except Exception as exc:
             errors.append(exc)

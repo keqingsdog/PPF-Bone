@@ -265,16 +265,18 @@ def _effective_frame_range(scene, obj, *, legacy_uncapped=False) -> tuple[int, i
     # draw paths that can run during register / fresh load_post.
     from ...core.encoder import resolve_start_frame_or_default
     frame_start = resolve_start_frame_or_default(scene)
-    actions = _collect_influencing_actions(obj)
     max_kf = None
-    for act in actions:
-        f = _max_keyframe_in_action(act)
-        if f is not None and (max_kf is None or f > max_kf):
-            max_kf = f
-    if max_kf is None or _motion_end_uncertain(obj):
-        # No detectable keyframes: procedural motion (Geometry Nodes
-        # on Scene Time, drivers, constraints). Bound the capture by the
-        # solver's frame count, not the viewport timeline's frame_end.
+    # These influences always use the simulation horizon. Walking all
+    # armature/parent actions in that branch would compute an unused maximum
+    # at every capture integrity check.
+    if not _motion_end_uncertain(obj):
+        for act in _collect_influencing_actions(obj):
+            f = _max_keyframe_in_action(act)
+            if f is not None and (max_kf is None or f > max_kf):
+                max_kf = f
+    if max_kf is None:
+        # Unknown end or no keyframes: keep the simulation horizon rather
+        # than relying on a viewport timeline when solver state is available.
         n_sim = _sim_frame_count(scene)
         if n_sim is not None and n_sim > 0:
             frame_end = frame_start + n_sim - 1
@@ -387,7 +389,7 @@ def _process_one_frame(context, depsgraph, entry, frame: int) -> tuple[bool, str
     return True, ""
 
 
-def _start_job(context, entries: list) -> tuple[bool, str]:
+def _start_job(context, entries: list, *, _joint_owner=None) -> tuple[bool, str]:
     if _capture_job["active"]:
         return False, iface_("Another Capture Deformation job is in progress")
     # Refuse to start if a pin-deformation capture is in flight: the two
@@ -395,7 +397,8 @@ def _start_job(context, entries: list) -> tuple[bool, str]:
     # other's running frame cursor (mirrors the symmetric guard in
     # pin_capture_ops._start_job).
     from .pin_capture_ops import is_pin_capture_running as _pin_running
-    if _pin_running():
+    from . import pin_capture_ops as sibling
+    if _pin_running() and (_joint_owner is None or sibling._capture_job.get("owner") is not _joint_owner):
         return False, iface_("Pin-deformation capture is in progress; wait for it to finish")
     if not entries:
         return False, iface_("No deforming STATIC objects to capture")
@@ -404,7 +407,7 @@ def _start_job(context, entries: list) -> tuple[bool, str]:
     _capture_job.update({
         "active": True,
         "token": object(),
-        "owner": None,
+        "owner": _joint_owner,
         "aborted": False,
         "objects": entries,
         "object_cursor": 0,

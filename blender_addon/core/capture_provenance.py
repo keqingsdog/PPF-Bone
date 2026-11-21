@@ -20,6 +20,12 @@ SCHEMA = 'ppf.capture-input.v1'
 BINDINGS = 'ppf_capture_proof_bindings_v1'
 PROOF_SUFFIX = '.capture.json'
 PENDING_SUFFIX = '.capture.pending'
+GROUP_PENDING_NAME = '.ppf-capture-group.pending'
+
+
+def _assert_group_idle(parent):
+    if os.path.lexists(os.path.join(os.fspath(parent), GROUP_PENDING_NAME)):
+        raise ValueError('A mixed capture transaction is incomplete or uncertain; cache directory is blocked')
 
 
 def _canonical(value):
@@ -85,6 +91,7 @@ def _commit_pair(path, writer, proof_bytes, publish=None, rollback=None):
     for target in (path, proof_path, pending):
         _regular_or_absent(target)
     parent = os.path.dirname(path)
+    _assert_group_idle(parent)
     os.makedirs(parent, exist_ok=True)
     staged = backups = None
     created_pending = False
@@ -170,6 +177,7 @@ def commit_capture(path, frames, proof=None, *, publish=None, rollback=None):
 def read_bound_proof(path, frames=None):
     """Read/verify only this actual input pair; never manufacture missing proof."""
     path = os.fspath(path)
+    _assert_group_idle(os.path.dirname(path))
     if os.path.exists(path + PENDING_SUFFIX):
         raise ValueError('capture commit is incomplete or uncertain')
     try:
@@ -247,6 +255,8 @@ def validate_capture(scene, obj, frames, kind, vg_name=None, pin_item=None):
 def copy_pair(source, destination):
     """Save As copies a known pair verbatim; never re-stamps current settings."""
     source, destination = os.fspath(source), os.fspath(destination)
+    _assert_group_idle(os.path.dirname(source))
+    _assert_group_idle(os.path.dirname(destination))
     if os.path.realpath(source) == os.path.realpath(destination):
         return
     if os.path.exists(source + PENDING_SUFFIX):
