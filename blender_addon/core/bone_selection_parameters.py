@@ -16,7 +16,7 @@ FIELDS=('collide_connected','collision_filter_enabled','collision_group_layers',
     'shape','proxy_quality','new_proxy_quality','proxy_face_mode','radius','length_ratio','box_width','box_depth',
     'new_binding_physical_model','mass_mode','target_mass_kg','density','material_preset',
     'solid_model','solid_young_modulus','solid_young_mpa','solid_poisson_ratio','solid_deformation_damping',
-    'use_hierarchy_joint','auto_follow_parent','root_mode','root_motion_source','anchor_stiffness','angular_stiffness','angular_damping',
+    'joint_control_mode','use_hierarchy_joint','auto_follow_parent','root_mode','root_motion_source','anchor_stiffness','angular_stiffness','angular_damping',
     'angular_restoring_mode','swing_restoring_stiffness','swing_restoring_damping',
     'swing_restoring_stiffness_degree','swing_restoring_damping_degree',
     'soft_limits_enabled','soft_lower','soft_upper','soft_stiffness','soft_stiffness_degree',
@@ -157,8 +157,8 @@ def _value_owner(context,field):
 
 
 def hierarchy_joint_field(arm, bone):
-    from .encoder.pmx_joints import parent_joint_pair, parent_joint_pairs
-    if parent_joint_pair(bone, parent_joint_pairs(arm)) is not None:
+    from .encoder.pmx_joints import effective_parent_joint_pair, parent_joint_pairs
+    if effective_parent_joint_pair(bone, parent_joint_pairs(arm)) is not None:
         return 'pmx_parent_joint_enabled'
     return 'use_hierarchy_joint'
 
@@ -290,6 +290,20 @@ def set_selected_parameter(context,field,value,*,assign=None,_indices=None):
     changed=[entry for entry in entries
              if not entry[3][AUTHOR_FIELDS.get(entry[5],entry[5])][0] or not _equal(current(entry),entry[4])]
     if not changed:return 0
+    topology_changed = any(
+        entry[5] in {'joint_control_mode', 'pmx_parent_joint_enabled'}
+        and not _equal(current(entry), entry[4]) for entry in changed
+    )
+    if topology_changed:
+        from .bone_geometry_edit import assert_solver_available
+        from .single_bake_restore import invalidate, suspended_meshes_cover_scene
+        from ..ops.bone_proxy import stale_simulation_output
+        assert_solver_available()
+        reasons = stale_simulation_output(context)
+        if reasons == ['solver mesh cache'] and suspended_meshes_cover_scene(context.scene):
+            reasons.remove('solver mesh cache')
+        if reasons:
+            raise ValueError('请先清除已有模拟帧再切换关节控制或修改 PMX 父骨连接：' + ', '.join(reasons))
     assign=assign or setattr;_busy=True
     try:
         with collision_edit_batch():
@@ -307,7 +321,7 @@ def set_selected_parameter(context,field,value,*,assign=None,_indices=None):
                         bindings.apply_solid_material_patch(settings,{key: _target_value * 1e6 if field=='solid_young_mpa' else _target_value})
                     elif field in DIMENSIONS:bindings._cancel_recreate_geometry_intent(settings,context)
                     elif field in {'mass_mode','target_mass_kg'}:mark_settings(settings,context)
-                    if target_field in {'root_mode','root_motion_source','auto_follow_parent','use_hierarchy_joint'}:
+                    if target_field in {'root_mode','root_motion_source','auto_follow_parent','use_hierarchy_joint','joint_control_mode'}:
                         check_soft_supported(settings,bone.name,has_physical_joint_parent(bone,arm=arm))
             except Exception:
                 with material_write_guard():
@@ -319,6 +333,9 @@ def set_selected_parameter(context,field,value,*,assign=None,_indices=None):
                     for group,snapshot in group_snapshots:restore_rna(group,snapshot)
                 raise
     finally:_busy=False
+    if topology_changed:
+        invalidate(context.scene)
+        communicator.bone_physical_body_changed()
     return len(changed)
 
 

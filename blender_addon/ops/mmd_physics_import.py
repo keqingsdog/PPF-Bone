@@ -5,7 +5,7 @@ import struct
 import uuid
 from contextlib import contextmanager
 import bpy
-from bpy.props import FloatProperty, StringProperty
+from bpy.props import FloatProperty, StringProperty, EnumProperty
 from mathutils import Matrix, Vector
 from . import bone_proxy
 from ..models.bone_bindings import bone_world_matrix
@@ -174,7 +174,7 @@ def _helper_scope(context, keep=False):
             mmd_helper_bones.remove(context, arm, list(created.values()))
 
 
-def _plan(context, helpers=None):
+def _plan(context, helpers=None, *, include_joints=True, matched=None):
     arm, bones = bone_proxy.selected_bones(context)
     root = _root(arm)
     if not root:
@@ -196,8 +196,10 @@ def _plan(context, helpers=None):
             if name in bodies:
                 raise ValueError('多个刚体缺少独立辅助骨骼：' + name)
             bodies[name] = obj
-        elif typ == 'JOINT' and obj.rigid_body_constraint:
+        elif include_joints and typ == 'JOINT' and obj.rigid_body_constraint:
             joints.append(obj)
+    if matched is not None:
+        matched.update(bodies.keys())
     missing = original_names - bodies.keys()
     bones = [b for b in bones if b.name in bodies]
     if not bones:
@@ -206,7 +208,7 @@ def _plan(context, helpers=None):
     for bone in bones:
         s = bone.ppf_bone_physics
         if s.proxy or s.enabled:
-            if not (s.proxy and s.proxy.get('ppf_mmd_source') and s.custom_object == bodies[bone.name]):
+            if not s.proxy:
                 raise ValueError('Existing PPF proxy conflicts with MMD body: ' + bone.name)
             existing.append(bone.name)
     bones = [b for b in bones if b.name not in existing]
@@ -313,7 +315,7 @@ def _pending_parent_source(bone, joint):
     return bool(sources and joint in sources.values())
 
 
-def _apply(context, arm, bones, rows, plans):
+def _apply(context, arm, bones, rows, plans, mode_targets=()):
     from ..core import cross_links
     stored = json.loads(arm.get('ppf_mmd_joints_v1', '[]'))
     sources = dict(arm.get('ppf_mmd_joint_sources_v1', {}).items())
@@ -329,13 +331,10 @@ def _apply(context, arm, bones, rows, plans):
         joint_id = source_ids.get(joint)
         record = _mmd_joint_record(joint, ba, bb, frames, joint_id or str(uuid.uuid4()))
         if joint_id in indices:
-            stored[indices[joint_id]] = record
             continue
         child = arm.data.bones[child_name] if child_name else None
         pending = bool(child and _pending_parent_source(child, joint))
         unchanged = bool(pending and child.ppf_bone_physics.proxy.get('ppf_mmd_pending_parent_snapshot') == _parent_default_snapshot(context, child.ppf_bone_physics))
-        if child and child_name not in {bone.name for bone in bones} and child.ppf_bone_physics.use_hierarchy_joint and not unchanged:
-            raise ValueError('骨骼“' + child_name + '”已有层级关节，无法判断是否包含手工修改。请先备份场景；如需保留修改，请保留旧设置并暂不导入该关节；如需按 MMD 原关节重建，请在 PPF 骨骼物理中关闭该骨骼的层级关节后重新导入。')
         if pending and not child.ppf_bone_physics.use_hierarchy_joint:
             disable_parent.append(child.ppf_bone_physics)
         migrated_pairs.add(frozenset(pair))
@@ -351,7 +350,14 @@ def _apply(context, arm, bones, rows, plans):
     old_joint_json = arm.get('ppf_mmd_joints_v1')
     old_sources = dict(arm.get('ppf_mmd_joint_sources_v1', {}).items())
     old_parent = [(s, s.pmx_parent_joint_enabled, s.is_property_set('pmx_parent_joint_enabled')) for s in disable_parent]
+    old_modes = [(s, s.joint_control_mode, s.is_property_set('joint_control_mode')) for s in mode_targets if s.enabled and s.proxy]
+    mode_changed = any(value != 'MMD' for _, value, _ in old_modes)
+    changed = bool(additions or len(retained) != len(old_links) or disable_parent or mode_changed)
+    if not changed:
+        return {'hierarchy': 0, 'cross': 0, 'skipped': len(plans), 'changed': False}
     try:
+        for settings, _, _ in old_modes:
+            if settings.joint_control_mode != 'MMD': settings.joint_control_mode = 'MMD'
         for settings, _, _ in old_parent:
             settings.pmx_parent_joint_enabled = False
         if len(retained) != len(old_links):
@@ -359,6 +365,9 @@ def _apply(context, arm, bones, rows, plans):
         arm['ppf_mmd_joints_v1'] = json.dumps(stored + additions, ensure_ascii=False)
         arm['ppf_mmd_joint_sources_v1'] = sources
     except Exception:
+        for settings, value, was_set in old_modes:
+            settings.joint_control_mode = value
+            if not was_set: settings.property_unset('joint_control_mode')
         for settings, value, was_set in old_parent:
             if was_set: settings.pmx_parent_joint_enabled = value
             else: settings.property_unset('pmx_parent_joint_enabled')
@@ -373,7 +382,7 @@ def _apply(context, arm, bones, rows, plans):
         if len(retained) != len(old_links):
             cross_links._replace(arm, old_links)
         raise
-    return {'hierarchy': 0, 'cross': len(additions), 'skipped': len(plans) - len(additions)}
+    return {'hierarchy': 0, 'cross': len(additions), 'skipped': len(plans) - len(additions), 'changed': changed}
 
 def _mass_analysis(context, rows):
     """Use the same strict closed-shell measurement as the proxy transaction."""
@@ -456,6 +465,7 @@ class PPF_OT_ImportMMDPhysics(bpy.types.Operator):
     bl_label = '导入选中骨骼的 MMD 物理'
     bl_options = {'REGISTER', 'UNDO'}
 
+    import_mode: EnumProperty(items=[('NATIVE', '原生', ''), ('MMD', 'MMD Joint', '')], default='NATIVE', options={'SKIP_SAVE'})
     mass_multiplier: FloatProperty(name='统一质量倍率', default=1., min=1.e-20, max=1.e20, precision=8, options={'SKIP_SAVE'},
         description='按同一倍率调整本次导入的 MMD 质量；源刚体和代理几何不变')
     mass_warning: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
@@ -471,7 +481,7 @@ class PPF_OT_ImportMMDPhysics(bpy.types.Operator):
             return {'CANCELLED'}
         try:
             with _helper_scope(context) as helpers:
-                arm, _bones, rows, _plans, _existing, _missing = _plan(context, helpers)
+                arm, _bones, rows, _plans, _existing, _missing = _plan(context, helpers, include_joints=self.import_mode == 'MMD')
                 if failure.armature_name != arm.name or failure.bone_name not in rows:
                     raise ValueError(str(failure))
                 lower, upper, details = _mass_analysis(context, rows)
@@ -505,12 +515,25 @@ class PPF_OT_ImportMMDPhysics(bpy.types.Operator):
             return self._run_impl(context, preflight, helpers)
 
     def _run_impl(self, context, preflight, helpers):
-        arm, bones, rows, plans, existing, missing = _plan(context, helpers)
+        matched = set()
+        arm, bones, rows, plans, existing, missing = _plan(context, helpers, include_joints=self.import_mode == 'MMD', matched=matched)
         expected = getattr(self, '_mmd_selection_identity', None)
         if expected is not None and _selection_identity(context, arm, rows) != expected:
             raise ValueError('确认期间骨架、选中骨骼或 MMD 刚体已变化；请重新导入')
+        mode_targets = [arm.data.bones[name].ppf_bone_physics for name in matched]
         if not rows:
-            result = _apply(context, arm, [], {}, plans)
+            if self.import_mode == 'MMD':
+                com = bone_proxy._facade_communicator()
+                com.assert_bone_body_switch_idle()
+                if bone_proxy.stale_simulation_output(context):
+                    raise ValueError('请先 Clear 已有模拟帧，再导入 MMD 关节')
+                result = _apply(context, arm, [], {}, plans, mode_targets)
+                if result['changed']:
+                    from ..core.single_bake_restore import invalidate
+                    invalidate(context.scene)
+                    com.bone_physical_body_changed()
+            else:
+                result = {'cross': 0, 'skipped': 0}
             self.report({'INFO'}, f"{existing} existing bodies; {result['cross']} joints added, {result['skipped']} already present")
             return {'FINISHED'}
         if preflight:
@@ -526,17 +549,35 @@ class PPF_OT_ImportMMDPhysics(bpy.types.Operator):
                 settings['target_mass_kg'] *= self.mass_multiplier
         result = {}
         def after_apply(a, bs):
-            _mark_parent_defaults(context, a, bs, rows)
-            result.update(_apply(context, a, bs, rows, plans))
+            if self.import_mode == 'MMD':
+                result.update(_apply(context, a, bs, rows, plans, mode_targets))
+            else:
+                result.update({'cross': 0, 'skipped': 0})
         authoring = {name: {'settings': row['settings'], 'geometry': row['geometry']} for name, row in rows.items()}
         from ..core import cross_links
-        old_link_count = len(arm.ppf_cross_links)
+        old_links = cross_links._records(arm)
+        old_json = arm.get('ppf_mmd_joints_v1')
+        old_sources = dict(arm.get('ppf_mmd_joint_sources_v1', {}).items())
+        old_modes = [(s, s.joint_control_mode, s.is_property_set('joint_control_mode'),
+                      s.pmx_parent_joint_enabled, s.is_property_set('pmx_parent_joint_enabled')) for s in mode_targets]
         try:
             bone_proxy.update_proxies(context, all_bones=bool(helpers), rebuild=True, authoring_rows=authoring, after_apply=after_apply)
         except Exception:
-            while len(arm.ppf_cross_links) > old_link_count:
-                arm.ppf_cross_links.remove(len(arm.ppf_cross_links) - 1)
+            cross_links._replace(arm, old_links)
+            if old_json is None:
+                if 'ppf_mmd_joints_v1' in arm: del arm['ppf_mmd_joints_v1']
+            else: arm['ppf_mmd_joints_v1'] = old_json
+            if old_sources: arm['ppf_mmd_joint_sources_v1'] = old_sources
+            elif 'ppf_mmd_joint_sources_v1' in arm: del arm['ppf_mmd_joint_sources_v1']
+            for settings, mode, mode_set, enabled, enabled_set in old_modes:
+                settings.joint_control_mode = mode
+                if not mode_set: settings.property_unset('joint_control_mode')
+                settings.pmx_parent_joint_enabled = enabled
+                if not enabled_set: settings.property_unset('pmx_parent_joint_enabled')
             raise
+        if self.import_mode == 'MMD':
+            from ..core.single_bake_restore import invalidate
+            invalidate(context.scene)
         hybrid = sum(row['hybrid'] for row in rows.values())
         self.report({'INFO'}, f"MMD: {len(bones)} bodies, {result['cross']} joints, {result['skipped']} existing joints, {hybrid} hybrid, {existing} existing bodies, {missing} unmatched bones; mass multiplier {self.mass_multiplier:.8g}")
         return {'FINISHED'}
@@ -547,7 +588,7 @@ class PPF_OT_ImportMMDPhysics(bpy.types.Operator):
         except DensityOutOfRange as exc:
             try:
                 with _helper_scope(context) as helpers:
-                    arm, _bones, rows, _plans, _existing, _missing = _plan(context, helpers)
+                    arm, _bones, rows, _plans, _existing, _missing = _plan(context, helpers, include_joints=self.import_mode == 'MMD')
                     if exc.armature_name != arm.name or exc.bone_name not in rows:
                         raise ValueError(str(exc))
                     lower, upper, details = _mass_analysis(context, rows)

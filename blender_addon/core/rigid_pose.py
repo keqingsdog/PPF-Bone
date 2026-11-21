@@ -289,7 +289,7 @@ def _resolve_armatures(scene, receipt, *, current):
 
 def _targets(scene, receipt, *, current=True):
     from .fem_pose import binding_kind, FEM
-    from .encoder.pmx_joints import parent_joint_pair, parent_joint_pairs
+    from .encoder.pmx_joints import effective_parent_joint_pair, parent_joint_pairs
     arms=_resolve_armatures(scene,receipt,current=current)
     # Resolve once within this read-only call. No RNA reference survives the
     # call, so Edit-mode rebuilds/Undo and later author changes still revalidate.
@@ -313,7 +313,7 @@ def _targets(scene, receipt, *, current=True):
         if current:
             has_physical_parent = (pb.bone.ppf_bone_physics.use_hierarchy_joint and pb.parent is not None
                                    and pb.parent.bone.ppf_bone_physics.enabled
-                                   and parent_joint_pair(pb.bone, pmx_pairs_by_arm[row["armature_uuid"]]) is None)
+                                   and effective_parent_joint_pair(pb.bone, pmx_pairs_by_arm[row["armature_uuid"]]) is None)
             parent = pb.parent.bone.ppf_bone_physics.bone_uuid if has_physical_parent else None
             if parent != row.get("parent_bone_uuid"):
                 raise ValueError("bone pose: parent binding changed")
@@ -1104,7 +1104,7 @@ def _fem_parent_anchor_target(target, material_tail, parent_matrix, parent_rest_
 
 
 def _authored_flags(scene, targets, index=None):
-    from .encoder.pmx_joints import parent_joint_pair, parent_joint_pairs
+    from .encoder.pmx_joints import effective_parent_joint_pair, parent_joint_pairs
     records = _connect_records(scene)
     legacy = (index or {}).get(CONNECT_KEY) or {}
     flags = {}
@@ -1113,7 +1113,7 @@ def _authored_flags(scene, targets, index=None):
         connected = _author_connection(records, legacy, arm, row, pb)
         connected = bool(pb.bone.use_connect) if connected is None else connected
         connected = bool(connected and pb.bone.ppf_bone_physics.use_hierarchy_joint
-                         and parent_joint_pair(pb.bone, parent_joint_pairs(arm)) is None)
+                         and effective_parent_joint_pair(pb.bone, parent_joint_pairs(arm)) is None)
         if (connected and (not isinstance(record, dict) or 'inherit_scale' not in record)
                 and scene.get(CACHE_KEY) and pb.bone.inherit_scale == 'NONE'):
             raise ValueError('connected bone pose: legacy author inherit_scale is unknown: '+pb.name)

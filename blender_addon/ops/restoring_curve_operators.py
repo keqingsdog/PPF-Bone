@@ -3,6 +3,7 @@ from .. import i18n as _ppf_i18n
 import copy
 import hashlib
 import json
+from functools import lru_cache
 import bpy
 from ..i18n import pgettext_iface as iface
 from ..i18n.props import BoolProperty,EnumProperty
@@ -13,11 +14,41 @@ from . import restoring_curve_presets as presets
 PANEL_SCOPES=[('AUTO','Direct API','Use the explicit raw channel'),('BONE','Bone Panel','Current joint and remembered joint channel'),('STITCH','Stitch Panel','Current merge pair only')]
 
 
+def _read_document(raw):
+    return model.validate_author_map(json.loads(raw, object_pairs_hook=presets._object_pairs))
+
+
 def read_state(scene):
-    owner=scene.ppf_restoring_curves
-    if not owner.document_json:return {'mode':owner.mode,'document':None}
-    document=json.loads(owner.document_json,object_pairs_hook=presets._object_pairs)
-    return {'mode':owner.mode,'document':model.validate_author_map(document)}
+    owner = scene.ppf_restoring_curves
+    raw = owner.document_json
+    return {'mode': owner.mode, 'document': _read_document(raw) if raw else None}
+
+
+@lru_cache(maxsize=4)
+def _anchor_curve_index(raw):
+    enabled = set()
+    seen = set()
+    ambiguous = set()
+    for binding in _read_document(raw)['bindings']:
+        target = binding['target']
+        if target['kind'] != 'JOINT' or target['channel'] != 'anchor':
+            continue
+        joint_uuid = target['joint_uuid']
+        if joint_uuid in seen:
+            ambiguous.add(joint_uuid)
+        seen.add(joint_uuid)
+        if binding['enabled']:
+            enabled.add(joint_uuid)
+    return frozenset(enabled), frozenset(ambiguous)
+
+
+def anchor_curve_index(scene):
+    """Read immutable display data keyed by the current document contents."""
+    owner = scene.ppf_restoring_curves
+    if owner.mode == 'LEGACY':
+        return None
+    raw = owner.document_json
+    return _anchor_curve_index(raw) if raw else None
 
 
 def write_state(scene,state):

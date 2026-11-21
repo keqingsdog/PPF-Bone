@@ -13,7 +13,7 @@ import bpy
 from ..i18n import pgettext_iface as iface
 from ..core.utils import get_category_name
 from ..core.compat import pose_bone_selected
-from ..core.encoder.pmx_joints import parent_joint_pair, parent_joint_pairs
+from ..core.encoder.pmx_joints import effective_parent_joint_pair, parent_joint_pairs
 from ..models.bone_bindings import active_armature, active_bone, collect_body_controls_contract, has_physical_joint_parent, soft_material_refusal
 from ..models.groups import has_addon_data, get_group_by_uuid, iterate_active_object_groups
 
@@ -137,14 +137,19 @@ def _draw_soft_material_choice(layout,context,settings,group):
 
 def _selected_anchor_curve_active(context, fallback_bone):
     from ..core.bone_selection_parameters import resolve_selected_authors
-    from ..ops.bone_physical_controls import _channel_state
-    from ..ops.restoring_curve_operators import read_state
-    state = read_state(context.scene)
-    if state['mode'] == 'LEGACY': return False
+    from ..models.restoring_curves import canonical_uuid
+    from ..ops.restoring_curve_operators import anchor_curve_index
+    curves = anchor_curve_index(context.scene)
+    if curves is None:
+        return False
+    enabled, ambiguous = curves
     bones = [bone for _arm, bone in resolve_selected_authors(context)] or [fallback_bone]
     for bone in bones:
-        saved = _channel_state(state, bone.ppf_bone_physics.joint_uuid, 'anchor')
-        if saved and saved['binding']['enabled']: return True
+        joint_uuid = canonical_uuid(bone.ppf_bone_physics.joint_uuid, 'target.joint_uuid')
+        if joint_uuid in ambiguous:
+            raise ValueError('当前恢复通道重复，不能载入物理刚度')
+        if joint_uuid in enabled:
+            return True
     return False
 
 
@@ -194,9 +199,9 @@ def _draw_empty_bone_sections(layout):
     empty.label(text='自定颜色  —')
     for key, title, closed in (
         ('ppf_bone_essentials', '常用物理参数', False),
-        ('ppf_bone_all_presets', '骨骼预设', True),
         ('ppf_bone_collision', '碰撞组', True),
         ('ppf_bone_simple_limits', '软角度范围', True),
+        ('ppf_bone_all_presets', '骨骼预设', True),
     ):
         header, body = layout.panel(key, default_closed=closed)
         header.label(text=title)
@@ -365,6 +370,7 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
         if error:layout.label(text=error,icon='ERROR')
         layout.label(text=bone.name, icon='BONE_DATA', translate=False)
         _draw_actual_physics(layout,context,active_armature(context),bone)
+        layout.prop(s, 'joint_control_mode', text='', expand=True)
         layout.prop(s, "enabled", text='参与骨骼物理')
         color = layout.row(align=True)
         color.prop(s, 'preview_color_custom', text='自定颜色')
@@ -396,7 +402,9 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
         authoring = editor.column(align=True)
         authoring.enabled = context.mode in {'POSE', 'OBJECT'} and bool(selected)
         authoring.operator_context = 'INVOKE_DEFAULT'
-        authoring.operator('ppf.import_mmd_physics', text='导入选中骨骼的 MMD 物理', icon='IMPORT')
+        row = authoring.row(align=True)
+        row.operator('ppf.import_mmd_physics', text='导入代理').import_mode = 'NATIVE'
+        row.operator('ppf.import_mmd_physics', text='导入代理 + Joint').import_mode = 'MMD'
         authoring.operator('ppf.fit_bone_proxies_to_weights', text='按蒙皮权重拟合代理', icon='MOD_ARMATURE')
         if not editor_active(context):
             op=editor.operator('ppf.bone_editor_action',text='添加 / 更新代理' if count else '添加 / 更新整个骨架',icon='FILE_REFRESH')
@@ -428,7 +436,7 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
         first=uses_new_binding_preset(s);plan=new_binding_plan(s)
         model=plan.get('physical_model',s.physical_model)
         arm=active_armature(context)
-        native_parent=parent_joint_pair(bone, parent_joint_pairs(arm)) if arm else None
+        native_parent=effective_parent_joint_pair(bone, parent_joint_pairs(arm)) if arm else None
         has_joint_parent=has_physical_joint_parent(bone, arm=arm)
         header,body=layout.panel('ppf_bone_essentials',default_closed=False)
         header.label(text='常用物理参数')
@@ -480,48 +488,6 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
             self._draw_basic_control(body,s,bone,model,native_parent is not None)
             if has_joint_parent:
                 self._draw_joint_choice(body,s,model)
-        header,presets=layout.panel('ppf_bone_all_presets',default_closed=True)
-        header.label(text='骨骼预设',icon='PRESET')
-        if presets:
-            state=context.window_manager.ppf_bone_preset_library
-            presets.prop(state,'source',text='来源',expand=True)
-            builtin=state.source=='BUILTIN'
-            restoring_owner=context.scene.ppf_restoring_curves
-            if builtin:
-                presets.prop(restoring_owner,'bone_chain_preset',text='骨链')
-                presets.label(text='恢复力按质量和惯量自动适配',icon='INFO')
-                from ..models.bone_chain_presets import PRESETS as chain_presets
-                from ..models.bone_material_presets import PRESETS as material_presets
-                material=material_presets[chain_presets[restoring_owner.bone_chain_preset].material_id]
-                presets.label(text=iface('预设密度：{density} kg/m³').format(density=f'{material.density_kg_m3:g}'),translate=False)
-                actual,_,_=actual_physical_model(context,active_armature(context),bone)
-                if actual=='SOFT':presets.label(text=iface('预设软体硬度：{young} MPa').format(young=f'{material.young_pa/1e6:g}'),translate=False)
-            else:
-                from ..ops.bone_presets import draw_user_presets
-                draw_user_presets(presets,context,embedded=True,controls=False)
-            presets.label(text='应用内容')
-            row=presets.row(align=True)
-            row.prop(state,'apply_restoring',text='关节/恢复')
-            row.prop(state,'apply_material',text='材质')
-            row.prop(state,'apply_mass',text='质量 / 密度')
-            if not builtin:
-                row=presets.row(align=True)
-                row.prop(state,'apply_shape',text='形状')
-                row.prop(state,'apply_collision',text='碰撞')
-                row.prop(state,'apply_display',text='显示')
-            from ..ops.bone_proxy_editor import editor_active,editor_scope
-            unified=editor_active(context)
-            row=presets.row(align=True)
-            if not unified:row.prop(state,'scope',text='范围')
-            if not builtin:row.prop(state,'size_mode',text='')
-            apply_row=presets.row();apply_row.enabled=builtin or bool(state.entries)
-            if builtin:
-                op=apply_row.operator('ppf.bone_chain_preset_apply',text='应用预设',icon='CHECKMARK')
-                op.preset=restoring_owner.bone_chain_preset
-                op.scope=editor_scope(context) if unified else state.scope
-            else:
-                op=apply_row.operator('ppf.bone_user_preset_apply',text='应用预设',icon='CHECKMARK')
-                op.scope_override=editor_scope(context) if unified else 'STATE'
         follows_parent=bool(bone.parent and not bone.parent.ppf_bone_physics.enabled and getattr(s,'auto_follow_parent',False))
         has_joint_parent=bool(native_parent is None and ((bone.parent and bone.parent.ppf_bone_physics.enabled) or follows_parent))
         header,collision=layout.panel('ppf_bone_collision',default_closed=True)
@@ -569,6 +535,49 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
             if limits:
                 empty=limits.column();empty.enabled=False
                 empty.label(text='当前骨骼无适用软关节  —')
+
+        header,presets=layout.panel('ppf_bone_all_presets',default_closed=True)
+        header.label(text='骨骼预设',icon='PRESET')
+        if presets:
+            state=context.window_manager.ppf_bone_preset_library
+            presets.prop(state,'source',text='来源',expand=True)
+            builtin=state.source=='BUILTIN'
+            restoring_owner=context.scene.ppf_restoring_curves
+            if builtin:
+                presets.prop(restoring_owner,'bone_chain_preset',text='骨链')
+                presets.label(text='恢复力按质量和惯量自动适配',icon='INFO')
+                from ..models.bone_chain_presets import PRESETS as chain_presets
+                from ..models.bone_material_presets import PRESETS as material_presets
+                material=material_presets[chain_presets[restoring_owner.bone_chain_preset].material_id]
+                presets.label(text=iface('预设密度：{density} kg/m³').format(density=f'{material.density_kg_m3:g}'),translate=False)
+                actual,_,_=actual_physical_model(context,active_armature(context),bone)
+                if actual=='SOFT':presets.label(text=iface('预设软体硬度：{young} MPa').format(young=f'{material.young_pa/1e6:g}'),translate=False)
+            else:
+                from ..ops.bone_presets import draw_user_presets
+                draw_user_presets(presets,context,embedded=True,controls=False)
+            presets.label(text='应用内容')
+            row=presets.row(align=True)
+            row.prop(state,'apply_restoring',text='关节/恢复')
+            row.prop(state,'apply_material',text='材质')
+            row.prop(state,'apply_mass',text='质量 / 密度')
+            if not builtin:
+                row=presets.row(align=True)
+                row.prop(state,'apply_shape',text='形状')
+                row.prop(state,'apply_collision',text='碰撞')
+                row.prop(state,'apply_display',text='显示')
+            from ..ops.bone_proxy_editor import editor_active,editor_scope
+            unified=editor_active(context)
+            row=presets.row(align=True)
+            if not unified:row.prop(state,'scope',text='范围')
+            if not builtin:row.prop(state,'size_mode',text='')
+            apply_row=presets.row();apply_row.enabled=builtin or bool(state.entries)
+            if builtin:
+                op=apply_row.operator('ppf.bone_chain_preset_apply',text='应用预设',icon='CHECKMARK')
+                op.preset=restoring_owner.bone_chain_preset
+                op.scope=editor_scope(context) if unified else state.scope
+            else:
+                op=apply_row.operator('ppf.bone_user_preset_apply',text='应用预设',icon='CHECKMARK')
+                op.scope_override=editor_scope(context) if unified else 'STATE'
 
     def _draw_body_switch(self, layout, context, s):
         """Explicit RIGID <-> SOFT switch for the bone's EXISTING proxy.

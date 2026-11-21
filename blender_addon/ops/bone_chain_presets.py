@@ -49,8 +49,8 @@ def _joint_parent_status(bone, arm=None):
     parent_settings = parent.ppf_bone_physics
     settings = bone.ppf_bone_physics
     if arm is not None:
-        from ..core.encoder.pmx_joints import parent_joint_pair, parent_joint_pairs
-        if parent_joint_pair(bone, parent_joint_pairs(arm)):
+        from ..core.encoder.pmx_joints import effective_parent_joint_pair, parent_joint_pairs
+        if effective_parent_joint_pair(bone, parent_joint_pairs(arm)):
             return False, 'parent uses an imported MMD joint'
     if not settings.use_hierarchy_joint:
         return False, 'parent joint is disabled'
