@@ -1461,13 +1461,17 @@ def _bone_internal_group_uuids(scene):
     """
     from collections import Counter
     result = set()
-    body_counts = Counter(obj.get('_solver_uuid') for obj in scene.objects if obj.get('_solver_uuid'))
+    objects = tuple(scene.objects)
+    # Scene.objects resolves names by walking the scene. Index the names once
+    # for this draw so every proxy membership check sees the same live objects.
+    scene_object_names = {obj.name for obj in objects}
+    body_counts = Counter(uid for obj in objects if (uid := obj.get('_solver_uuid')))
     proxy_counts = Counter(
         bone.ppf_bone_physics.proxy.as_pointer()
-        for arm in scene.objects if arm.type == 'ARMATURE'
+        for arm in objects if arm.type == 'ARMATURE'
         for bone in arm.data.bones if bone.ppf_bone_physics.proxy is not None)
     groups = {g.uuid: g for g in iterate_all_active_groups(scene)}
-    for arm in scene.objects:
+    for arm in objects:
         if arm.type != 'ARMATURE':
             continue
         for bone in arm.data.bones:
@@ -1476,7 +1480,7 @@ def _bone_internal_group_uuids(scene):
             proxy = s.proxy
             expected_type = 'SOLID' if s.physical_model == 'SOFT' else 'PDRD'
             if (s.enabled and group and group.object_type == expected_type and proxy
-                    and proxy.name in scene.objects
+                    and proxy.name in scene_object_names
                     and proxy.get('ppf_bone_proxy_owned')
                     and proxy.get('_solver_uuid') == s.body_uuid
                     and proxy.get('ppf_bone_uuid') == s.bone_uuid

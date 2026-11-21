@@ -49,15 +49,20 @@ def _selected_physical_model_counts(context, rows):
     from ..models.bone_bindings import proxy_parent_armature, armature_data_owner_counts
     from ..models.groups import iterate_object_groups
     scene = context.scene
-    body_counts = Counter(obj.get('_solver_uuid') for obj in scene.objects)
+    scene_objects = tuple(scene.objects)
+    scene_objects_by_name = {}
+    for obj in scene_objects:
+        # Linked objects can share names. Keep Scene.objects.get's first hit.
+        scene_objects_by_name.setdefault(obj.name, obj)
+    body_counts = Counter(obj.get('_solver_uuid') for obj in scene_objects)
     scene_users = Counter(obj.as_pointer() for candidate in bpy.data.scenes for obj in candidate.objects)
     data_owners = armature_data_owner_counts()
     arm_counts = Counter(getattr(obj, 'ppf_armature_uuid', '')
-                         for obj in scene.objects if obj.type == 'ARMATURE')
+                         for obj in scene_objects if obj.type == 'ARMATURE')
     global_arm_counts = Counter(getattr(obj, 'ppf_armature_uuid', '')
                                 for obj in bpy.data.objects if obj.type == 'ARMATURE')
     proxy_counts = Counter(b.ppf_bone_physics.proxy.as_pointer()
-                           for obj in scene.objects if obj.type == 'ARMATURE'
+                           for obj in scene_objects if obj.type == 'ARMATURE'
                            for b in obj.data.bones if b.ppf_bone_physics.proxy is not None)
     groups = {}
     for group in iterate_object_groups(scene):
@@ -71,8 +76,8 @@ def _selected_physical_model_counts(context, rows):
             group = groups.get(s.group_uuid) if s.group_uuid else None
             parent_armature = proxy_parent_armature(proxy) if proxy is not None else None
             valid = (proxy is not None and proxy.type == 'MESH'
-                     and scene.objects.get(proxy.name) == proxy
-                     and scene.objects.get(arm.name) == arm
+                     and scene_objects_by_name.get(proxy.name) == proxy
+                     and scene_objects_by_name.get(arm.name) == arm
                      and scene_users[proxy.as_pointer()] == 1 and scene_users[arm.as_pointer()] == 1
                      and not arm.library and not arm.data.library and data_owners[arm.data.as_pointer()] == 1
                      and bool(s.body_uuid) and bool(s.bone_uuid) and bool(arm.ppf_armature_uuid)

@@ -1311,6 +1311,8 @@ def _apply_in_scope(scene, receipt, pose, *, prepared=None):
                 flags = _authored_flags(scene, targets, item[1])
         _commit_pose_display(scene, targets, desired, diagnostics, plan, flags)
         _publish_pose_completion(scene, receipt, pose, targets, plan)
+        if item:
+            _scene_cache_keys.setdefault(scene.as_pointer(), set()).add(item[0])
     except BaseException:
         rollback = {}
         for arm, name, connected, _inherit, _basis in previous:
@@ -1732,10 +1734,60 @@ def migrate_bone_poses_on_save(*_args):
 
 
 @contextmanager
+def _preserve_author_start_pose():
+    """Keep an idle Pose Mode edit through the encoder's frame sampling."""
+    import bpy
+    from .encoder import resolve_start_frame_or_default
+    from .playback import is_playing, is_scrubbing
+
+    context = bpy.context
+    scene = context.scene
+    if (scene is None or context.mode != 'POSE' or scene.frame_subframe
+            or scene.frame_current != resolve_start_frame_or_default(scene)
+            or has_bone_pose_cache(scene) or _detached_display_pending(scene)
+            or is_playing(context) or is_scrubbing(context)):
+        yield
+        return
+    start = scene.frame_current
+    channels = [(pb, _capture_native_channels(pb))
+                for arm in context.objects_in_mode if arm.type == 'ARMATURE'
+                for pb in arm.pose.bones]
+
+    def restore(evaluated_scene, _depsgraph=None):
+        if (evaluated_scene != scene or scene.frame_current != start
+                or scene.frame_subframe):
+            return
+        changed = False
+        for pb, saved in channels:
+            if _capture_native_channels(pb) != saved:
+                _restore_native_channels(pb, saved)
+                changed = True
+        if changed:
+            context.view_layer.update()
+
+    handlers = bpy.app.handlers.frame_change_post
+    handlers.append(restore)
+    try:
+        yield
+    finally:
+        handlers.remove(restore)
+        restore(scene)
+
+
+@contextmanager
 def suspend_playback():
+    """Restore source bases while transfer samples authored motion."""
+    if _suspended:
+        yield
+        return
+    with _preserve_author_start_pose(), _suspend_playback():
+        yield
+
+
+@contextmanager
+def _suspend_playback():
     from .frame_time import set_scene_frame
     clear_pose_completion()
-    """Restore source bases while transfer samples authored motion."""
     import bpy
     from mathutils import Matrix
     global _suspended
@@ -1744,6 +1796,7 @@ def suspend_playback():
     try:
         if _suspended == 1:
             for scene in bpy.data.scenes:
+                had_cache = has_bone_pose_cache(scene)
                 item = _index(scene)
                 # The display matrices are captured BEFORE any Edit-mode work, so
                 # the pose that resumes after the suspension is the one the
@@ -1764,14 +1817,10 @@ def suspend_playback():
                     restore_authored_connections(scene, index, targets)
                     for row, _arm, pb in targets:
                         _restore_author_pose(pb, index, row["bone_uuid"])
-                else:
-                    # NO USABLE EXTERNAL INDEX. A live Transfer samples the rig
-                    # right now, and the durable local records are the authored
-                    # state, so they are restored here as well: otherwise the
-                    # display pose would be encoded as if it were the source.
-                    # Nothing is recorded for restoration, because there is no
-                    # display pose left to resume from.
-                    restore_records_now(scene)
+                elif not had_cache and not _restore_detached_display(scene):
+                    # Recovery records can outlive playback. Reusing them on
+                    # an already-authored rig would replace newer pose edits.
+                    continue
                 set_scene_frame(scene, scene.frame_current, scene.frame_subframe)
         yield
     finally:
@@ -1854,19 +1903,16 @@ def flush_cached_refresh():
             _reevaluate_current_frame(scene)
     return None
 
+def _detached_display_pending(scene):
+    return bool(_scene_cache_keys.get(scene.as_pointer()))
+
+
 def _restore_detached_display(scene):
-    if scene.get(CACHE_KEY):
-        return
-    records = _connect_records(scene)
-    pending = bool(_scene_cache_keys.get(scene.as_pointer()))
-    for arm in (obj for obj in scene.objects if obj.type == 'ARMATURE'):
-        for entry in (records.get(_armature_key(arm)) or {}).values():
-            if isinstance(entry, dict) and 'inherit_scale' in entry:
-                bone = arm.data.bones.get(entry.get('name', ''))
-                pending = pending or (bone is not None and bone.inherit_scale != entry['inherit_scale'])
-    if pending:
-        restore_records_now(scene)
-        _scene_cache_keys.pop(scene.as_pointer(), None)
+    if scene.get(CACHE_KEY) or not _detached_display_pending(scene):
+        return False
+    restore_records_now(scene)
+    _scene_cache_keys.pop(scene.as_pointer(), None)
+    return True
 
 
 def bone_pose_undo_redo(*_args):

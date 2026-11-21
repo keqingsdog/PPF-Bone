@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from itertools import pairwise
 import json
 import math
 
@@ -89,19 +90,71 @@ def _select_joint_coordinate_model(row, physical_ids, rigid_ids=None):
 def _action_curves(action, slot=None):
     if action is None:
         return
-    yield from getattr(action, 'fcurves', ())
+    if getattr(action, 'is_action_layered', False):
+        if slot is None:
+            return
+    else:
+        yield from getattr(action, 'fcurves', ())
+        return
     for layer in getattr(action, 'layers', ()):
         for strip in layer.strips:
             for bag in getattr(strip, 'channelbags', ()):
-                if slot is None or bag.slot_handle == slot.handle:
+                if bag.slot_handle == slot.handle:
                     yield from bag.fcurves
+
+
+def _has_unsupported_scale_animation(ad, paths):
+    def affects_scale(curve):
+        return not curve.mute and curve.data_path in paths
+
+    if any(affects_scale(curve) for curve in ad.drivers):
+        return True
+
+    def strip_keys_scale(strip):
+        return (any(affects_scale(curve) for curve in
+                    _action_curves(strip.action, getattr(strip, 'action_slot', None)))
+                or any(strip_keys_scale(child) for child in strip.strips))
+
+    if any(strip_keys_scale(strip) for track in ad.nla_tracks for strip in track.strips):
+        return True
+
+    action = ad.action
+    curves = [curve for curve in _action_curves(action, getattr(ad, 'action_slot', None))
+              if affects_scale(curve)]
+    if not curves:
+        return False
+    if (ad.use_tweak_mode or ad.action_blend_type != 'REPLACE' or ad.action_influence != 1.
+            or ad.action_extrapolation != 'HOLD'
+            or (ad.use_nla and any(not track.mute and track.strips for track in ad.nla_tracks))):
+        return True
+    layers = getattr(action, 'layers', ())
+    if len(layers) > 1 or any(len(layer.strips) != 1 for layer in layers):
+        return True
+    return any(not _is_constant_positive_scale_curve(curve) for curve in curves)
+
+
+def _is_constant_positive_scale_curve(curve):
+    """Prove constancy between keys as well as outside the keyed range."""
+    keys = curve.keyframe_points
+    if not keys or curve.sampled_points or curve.modifiers or curve.extrapolation != 'CONSTANT':
+        return False
+    value = keys[0].co.y
+    if not math.isfinite(value) or value <= 0. or any(key.co.y != value for key in keys):
+        return False
+    for left, right in pairwise(keys):
+        if left.interpolation == 'BEZIER':
+            if left.handle_right.y != value or right.handle_left.y != value:
+                return False
+        elif left.interpolation not in {'CONSTANT', 'LINEAR'}:
+            return False
+    return True
 
 
 def _pose_scale_sources(context, *, explicit_only=False):
     """Collect the frozen scale references needed by the frame sampler.
 
     Check FREE and STATIC bodies too, including ancestors that are not physical.
-    Explicit scale curves/drivers fail before sampling, including subframe curves.
+    Reject curves that can change scale between samples, including at subframes.
     """
     from ...models.bone_bindings import bone_world_frame_scale
     sources = {}
@@ -119,11 +172,7 @@ def _pose_scale_sources(context, *, explicit_only=False):
         ad = arm.animation_data
         paths = {arm.pose.bones[name].path_from_id('scale') for name in names} | {'scale', 'delta_scale'}
         if ad is not None:
-            actions = [(ad.action, getattr(ad, 'action_slot', None))]
-            actions.extend((strip.action, getattr(strip, 'action_slot', None)) for track in ad.nla_tracks for strip in track.strips if strip.action)
-            curves = [curve for action, slot in actions for curve in _action_curves(action, slot)]
-            curves.extend(ad.drivers)
-            if any(not curve.mute and curve.data_path in paths for curve in curves):
+            if _has_unsupported_scale_animation(ad, paths):
                 raise ValueError(f'{arm.name}: animated pose/object scale is unsupported; use a static positive uniform pose scale')
             sample_needed = True
         sample_needed |= bool(arm.constraints) or any(arm.pose.bones[name].constraints for name in names)
@@ -133,12 +182,8 @@ def _pose_scale_sources(context, *, explicit_only=False):
             # even when the armature has no action of its own.
             sample_needed = True
             ad = ancestor.animation_data
-            if ad is not None:
-                actions = [(ad.action, getattr(ad, 'action_slot', None))]
-                actions.extend((strip.action, getattr(strip, 'action_slot', None)) for track in ad.nla_tracks for strip in track.strips if strip.action)
-                curves = [curve for action, slot in actions for curve in _action_curves(action, slot)] + list(ad.drivers)
-                if any(not curve.mute and curve.data_path in {'scale', 'delta_scale'} for curve in curves):
-                    raise ValueError(f'{ancestor.name}: animated ancestor object scale is unsupported')
+            if ad is not None and _has_unsupported_scale_animation(ad, {'scale', 'delta_scale'}):
+                raise ValueError(f'{ancestor.name}: animated ancestor object scale is unsupported')
             ancestor = ancestor.parent
         if explicit_only:
             continue

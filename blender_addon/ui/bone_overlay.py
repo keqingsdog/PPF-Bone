@@ -41,6 +41,9 @@ _reported_errors = set()
 _REFRESH_INTERVAL = 1. / 30.  # Normal display sampling cadence, not an Undo cooldown.
 _snapshot_dirty = True
 _ui_signature = None
+_signature_checked_at = 0.0
+_signature_context = None
+_SIGNATURE_INTERVAL = 0.1
 
 
 def _redraw():
@@ -1400,6 +1403,24 @@ def _display_signature():
     return tuple(rows)
 
 
+def _display_context_key():
+    """Cheap identities and frame state that must bypass signature throttling."""
+    rows = []
+    for window in bpy.context.window_manager.windows:
+        for area in window.screen.areas:
+            if area.type != 'VIEW_3D':
+                continue
+            region = next((r for r in area.regions if r.type == 'WINDOW'), None)
+            if region is None:
+                continue
+            with bpy.context.temp_override(window=window, area=area, region=region):
+                context = bpy.context
+                viewport = _viewport_key(context)
+                frame = None if _fast_views.get(viewport) == _generation else context.scene.frame_current_final
+                rows.append((viewport, context.scene.as_pointer(), context.view_layer.as_pointer(), context.mode, frame))
+    return tuple(rows)
+
+
 @persistent
 def _identity_pre(*_args):
     global _rebuilding
@@ -1451,6 +1472,7 @@ def _sync_visibility():
 
 def _startup_sync():
     global _producer_running, _visibility_pending, _snapshot_dirty, _ui_signature, _full_layer_sync_pending
+    global _signature_checked_at, _signature_context
     if not _registered:
         return None
     if _producer_running or not _identity_ready():
@@ -1488,7 +1510,15 @@ def _startup_sync():
             _snapshots.clear()
             _gpu_views.clear()
             return None  # Disabled displays sleep until their property callback wakes us.
-        signature = _display_signature()
+        context_key = _display_context_key()
+        now = perf_counter()
+        check_signature = (_snapshot_dirty or context_key != _signature_context
+                           or any(row[3].startswith('EDIT') for row in context_key)
+                           or now - _signature_checked_at >= _SIGNATURE_INTERVAL)
+        signature = _display_signature() if check_signature else _ui_signature
+        if check_signature:
+            _signature_checked_at = now
+            _signature_context = context_key
         if _snapshot_dirty or signature != _ui_signature:
             # Clear before sampling so a new event during evaluation survives.
             _snapshot_dirty = False
