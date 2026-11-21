@@ -1,7 +1,11 @@
-"""Fit new PPF bone proxies to weighted source vertices."""
+"""Fit PPF bone proxies to weighted source vertices."""
+import math
+
 import bpy
+from mathutils import Matrix
 from bpy.props import FloatProperty
-from .bone_proxy import selected_bones, update_proxies, box_geometry
+from .bone_proxy import selected_bones, update_proxies, box_geometry, capsule_geometry, sphere_geometry
+from ..models.proxy_generation import effective_proxy_quality, effective_proxy_face_mode
 from ..models.bone_bindings import bone_world_frame_scale
 
 
@@ -17,7 +21,9 @@ class PPF_OT_FitBoneProxiesToWeights(bpy.types.Operator):
             arm, bones = selected_bones(context)
             sources = [obj for obj in context.scene.objects if obj.type == 'MESH'
                        and any(m.type == 'ARMATURE' and m.object == arm for m in obj.modifiers)]
-            bounds = {}
+            round_bones = {bone.name for bone in bones
+                           if bone.ppf_bone_physics.shape in {'CAPSULE', 'SPHERE'}}
+            bounds, points = {}, {}
             arm_inverse = arm.matrix_world.inverted()
             for obj in sources:
                 groups = {vg.index: bone for bone in bones
@@ -34,6 +40,8 @@ class PPF_OT_FitBoneProxiesToWeights(bpy.types.Operator):
                             continue
                         bone = groups[index]
                         point = transforms[index] @ vertex.co
+                        if bone.name in round_bones:
+                            points.setdefault(bone.name, []).append(point)
                         if bone.name not in bounds:
                             bounds[bone.name] = ([float(v) for v in point], [float(v) for v in point])
                         else:
@@ -48,10 +56,35 @@ class PPF_OT_FitBoneProxiesToWeights(bpy.types.Operator):
                     continue
                 lo, hi = bounds[bone.name]
                 center = [(a+b)/2 for a,b in zip(lo,hi)]
-                size = [max(b-a, 0.001) for a,b in zip(lo,hi)]
                 frame, scale = bone_world_frame_scale(arm, bone)
-                vertices, faces = box_geometry(*(value * scale for value in size))
-                vertices = [tuple(v[i]+center[i]*scale for i in range(3)) for v in vertices]
+                size = [max((b-a)*scale, 0.001) for a,b in zip(lo,hi)]
+                settings = bone.ppf_bone_physics
+                shape = settings.shape
+                quality = effective_proxy_quality(settings)
+                face_mode = effective_proxy_face_mode(settings)
+                if shape == 'CUSTOM':
+                    raise ValueError(f'{bone.name}: skin weight fitting does not support custom proxy shape')
+                if shape == 'BOX':
+                    vertices, faces = box_geometry(size[1], size[0], size[2], face_mode, quality)
+                elif shape == 'SPHERE':
+                    radius = max(0.0005, max(math.dist(point, center) * scale
+                                             for point in points[bone.name]))
+                    vertices, faces = sphere_geometry(radius, quality, face_mode)
+                elif shape == 'CAPSULE':
+                    cx, cy, cz = center
+                    samples = [(math.hypot(point.x-cx, point.z-cz) * scale,
+                                abs(point.y-cy) * scale) for point in points[bone.name]]
+                    radius = max(0.0005, max(radial for radial, _ in samples))
+                    # Each cap covers this far beyond the straight segment at
+                    # a given radial distance from the bone's local Y axis.
+                    radius_squared = radius * radius
+                    half_shaft = max(axial - math.sqrt(max(0., radius_squared - radial**2))
+                                     for radial, axial in samples)
+                    length = 2 * radius + max(2 * half_shaft, 0.001)
+                    vertices, faces = capsule_geometry(length, radius, quality, face_mode=face_mode)
+                else:
+                    raise ValueError(f'{bone.name}: unsupported proxy shape {shape}')
+                frame = frame @ Matrix.Translation(tuple(v*scale for v in center)) @ Matrix.Rotation(math.pi/2, 4, 'Z')
                 # Rest-frame samples are expressed in bone local coordinates;
                 # place the result in the current pose using the same bone frame.
                 rows[bone.name] = {'settings': {}, 'geometry': (vertices, faces, frame)}

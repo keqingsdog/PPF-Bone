@@ -8,14 +8,253 @@ the PDRD-only ones. The joint, angular control/limits, drives, frames, root
 control and batch sections are shared by both bodies, so nothing an author set
 disappears when the material changes.
 """
+import json
+import math
+
 from .. import i18n as _ppf_i18n
 import bpy
 from ..i18n import pgettext_iface as iface
+from ..i18n.props import EnumProperty, FloatProperty, StringProperty
 from ..core.utils import get_category_name
 from ..core.compat import pose_bone_selected
-from ..core.encoder.pmx_joints import effective_parent_joint_pair, parent_joint_pairs
+from ..core.encoder.pmx_joints import _body_pair, _mmd_endpoint, _read_rows, effective_parent_joint_pair, parent_joint_pairs
 from ..models.bone_bindings import active_armature, active_bone, collect_body_controls_contract, has_physical_joint_parent, soft_material_refusal
 from ..models.groups import has_addon_data, get_group_by_uuid, iterate_active_object_groups
+
+
+_PMX_FIELDS = (
+    ('translation', '位移', 'm', 'linear_spring_N_per_m', 'N/m'),
+    ('rotation', '转动', 'rad', 'angular_spring_Nm_per_rad', 'N·m/rad'),
+)
+_PMX_AXIS_MODES = (
+    ('free', '自由', ''),
+    ('locked', '锁定', ''),
+    ('limited', '限位', ''),
+)
+
+
+def _pmx_connections(arm, bone, rows):
+    if not _mmd_endpoint(bone) or bone.ppf_bone_physics.physical_model != 'RIGID':
+        return []
+    body = bone.ppf_bone_physics.body_uuid
+    if not body:
+        return []
+    endpoints = {
+        other.ppf_bone_physics.body_uuid: other
+        for other in arm.data.bones
+        if other != bone and _mmd_endpoint(other)
+        and other.ppf_bone_physics.physical_model == 'RIGID'
+        and other.ppf_bone_physics.body_uuid
+    }
+    connections = []
+    for record in rows:
+        pair = _body_pair(record)
+        if body not in pair or len(pair) != 2:
+            continue
+        other = endpoints.get(next(iter(pair - {body})))
+        if other is None:
+            continue
+        if other == bone.parent:
+            child, order, relation = bone, 0, '父骨'
+        elif other.parent == bone:
+            child, order, relation = other, 1, '子骨'
+        else:
+            child, order, relation = None, 2, '跨链'
+        if child is not None and not child.ppf_bone_physics.pmx_parent_joint_enabled:
+            continue
+        connections.append((order, relation, other, record))
+    return sorted(connections, key=lambda item: (item[0], item[2].name, item[3]['joint_uuid']))
+
+
+def _pmx_connection_label(arm, connection):
+    _, relation, other, record = connection
+    joint_id = record['joint_uuid']
+    source = arm.get('ppf_mmd_joint_sources_v1', {}).get(joint_id)
+    name = source.name if source is not None else joint_id[:8]
+    return f'{iface(relation)} · {other.name} · {name}'
+
+
+def _pmx_parameters(record):
+    for field, _label, _unit, spring_field, _spring_unit in _PMX_FIELDS:
+        for index, axis in enumerate('xyz'):
+            rule = record[field][axis]
+            spring = record[spring_field][index]
+            mode = rule['mode']
+            if mode == 'free':
+                lower = upper = 0.
+            elif mode == 'locked':
+                lower = upper = rule['value']
+            elif mode == 'limited':
+                lower, upper = rule['lower'], rule['upper']
+            else:
+                raise ValueError('PMX 关节轴模式无效')
+            if not all(math.isfinite(value) for value in (lower, upper, spring)):
+                raise ValueError('PMX 关节参数无效')
+            yield field, spring_field, index, axis, mode, lower, upper, spring
+
+
+def _draw_pmx_connection(layout, context, arm, bone):
+    try:
+        connections = _pmx_connections(arm, bone, _read_rows(arm.get('ppf_mmd_joints_v1', '[]')))
+        if not connections:
+            layout.label(text='当前骨骼无生效的导入 PMX 关节', icon='INFO')
+            return
+        selected = context.window_manager.ppf_display_pmx_joint
+        connection = next((item for item in connections if item[3]['joint_uuid'] == selected), connections[0])
+        record = connection[3]
+        parameters = list(_pmx_parameters(record))
+        label = _pmx_connection_label(arm, connection)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        layout.label(text='导入的 PMX 关节记录无效', icon='ERROR')
+        return
+    if len(connections) > 1:
+        layout.menu('PPF_MT_pmx_connection', text=label, translate=False)
+    else:
+        layout.label(text=label, translate=False)
+    for field, label, unit, _spring_field, spring_unit in _PMX_FIELDS:
+        layout.label(text=f'{iface(label)} ({unit}) · {iface("弹簧")} ({spring_unit})', translate=False)
+        for kind, _, _, axis, mode, lower, upper, spring in parameters:
+            if kind != field:
+                continue
+            mode_label = iface(next(label for value, label, _ in _PMX_AXIS_MODES if value == mode))
+            bounds = {'free': '', 'locked': f' {lower:.4g}', 'limited': f' {lower:.4g} ~ {upper:.4g}'}
+            layout.label(text=f'{axis.upper()}  {mode_label}{bounds[mode]}  ·  {spring:.4g}', translate=False)
+    edit = layout.row()
+    edit.operator_context = 'INVOKE_DEFAULT'
+    op = edit.operator('ppf.pmx_joint_parameters', text='编辑当前 PMX 关节')
+    op.joint_id = record['joint_uuid']
+
+
+class PPF_OT_PmxConnectionSelect(bpy.types.Operator):
+    bl_idname = 'ppf.pmx_connection_select'
+    bl_label = '选择 PMX 连接'
+
+    joint_id: StringProperty(options={'SKIP_SAVE'})
+
+    def execute(self, context):
+        context.window_manager.ppf_display_pmx_joint = self.joint_id
+        return {'FINISHED'}
+
+
+class PPF_MT_PmxConnection(bpy.types.Menu):
+    bl_idname = 'PPF_MT_pmx_connection'
+    bl_label = '选择 PMX 连接'
+
+    def draw(self, context):
+        arm, bone = active_armature(context), active_bone(context)
+        if arm is None or bone is None:
+            return
+        try:
+            connections = _pmx_connections(arm, bone, _read_rows(arm.get('ppf_mmd_joints_v1', '[]')))
+            for connection in connections:
+                op = self.layout.operator('ppf.pmx_connection_select',
+                                          text=_pmx_connection_label(arm, connection), translate=False)
+                op.joint_id = connection[3]['joint_uuid']
+        except (AttributeError, KeyError, TypeError, ValueError):
+            self.layout.label(text='导入的 PMX 关节记录无效', icon='ERROR')
+
+
+class PPF_OT_PmxJointParameters(bpy.types.Operator):
+    bl_idname = 'ppf.pmx_joint_parameters'
+    bl_label = '编辑当前 PMX 关节'
+    bl_options = {'UNDO'}
+
+    joint_id: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
+
+    def _target(self, context):
+        arm, bone = active_armature(context), active_bone(context)
+        if arm is None or bone is None or context.mode not in {'OBJECT', 'POSE'} or not arm.is_editable:
+            raise ValueError('当前骨骼无法编辑 PMX 关节')
+        rows = _read_rows(arm.get('ppf_mmd_joints_v1', '[]'))
+        joints = [item[3] for item in _pmx_connections(arm, bone, rows) if item[3]['joint_uuid'] == self.joint_id]
+        if len(joints) != 1:
+            raise ValueError('当前 PMX 关节已变更')
+        return arm, bone, rows, joints[0]
+
+    def invoke(self, context, event):
+        try:
+            arm, bone, _, record = self._target(context)
+            self._owner = (arm.as_pointer(), bone.ppf_bone_physics.body_uuid, record)
+            self._initial = {}
+            for field, _, _, axis, mode, lower, upper, spring in _pmx_parameters(record):
+                prefix = f'{field}_{axis}'
+                for attr, value in (('mode', mode), ('lower', lower), ('upper', upper), ('spring', spring)):
+                    name = f'{prefix}_{attr}'
+                    setattr(self, name, value)
+                    self._initial[name] = getattr(self, name)
+        except (AttributeError, KeyError, TypeError, ValueError) as error:
+            self.report({'ERROR'}, iface(str(error)))
+            return {'CANCELLED'}
+        return context.window_manager.invoke_props_dialog(self, width=560)
+
+    def draw(self, context):
+        for field, label, unit, _, spring_unit in _PMX_FIELDS:
+            self.layout.label(text=f'{iface(label)} ({unit}) · {iface("弹簧")} ({spring_unit})', translate=False)
+            for axis in 'xyz':
+                prefix = f'{field}_{axis}'
+                mode = getattr(self, prefix + '_mode')
+                row = self.layout.row(align=True)
+                row.prop(self, prefix + '_mode', text=axis.upper())
+                if mode != 'free':
+                    row.prop(self, prefix + '_lower', text='锁定值' if mode == 'locked' else '下限')
+                if mode == 'limited':
+                    row.prop(self, prefix + '_upper', text='上限')
+                row.prop(self, prefix + '_spring', text='弹簧')
+
+    def execute(self, context):
+        from ..core.bone_geometry_edit import preflight
+        from ..core.single_bake_restore import invalidate
+
+        try:
+            arm, bone, rows, record = self._target(context)
+            if getattr(self, '_owner', None) != (arm.as_pointer(), bone.ppf_bone_physics.body_uuid, record):
+                raise ValueError('当前 PMX 关节已变更，请重新打开编辑')
+            changed = False
+            for field, spring_field, index, axis, old_mode, old_lower, old_upper, old_spring in _pmx_parameters(record):
+                prefix = f'{field}_{axis}'
+                mode = getattr(self, prefix + '_mode')
+                lower, upper, spring = (
+                    getattr(self, prefix + '_' + attr)
+                    if getattr(self, prefix + '_' + attr) != self._initial[prefix + '_' + attr] else original
+                    for attr, original in (('lower', old_lower), ('upper', old_upper), ('spring', old_spring))
+                )
+                if not all(math.isfinite(value) for value in (lower, upper, spring)) or spring < 0:
+                    raise ValueError('PMX 限制须为有限数值，弹簧须为非负数值')
+                if mode == 'limited' and lower >= upper:
+                    raise ValueError('PMX 限位下限须小于上限')
+                if mode != old_mode or (mode != 'free' and lower != old_lower) or (mode == 'limited' and upper != old_upper):
+                    rule = {'mode': mode}
+                    if mode == 'locked':
+                        rule['value'] = lower
+                    elif mode == 'limited':
+                        rule.update(lower=lower, upper=upper)
+                    record[field][axis] = rule
+                    changed = True
+                if spring != old_spring:
+                    record[spring_field][index] = spring
+                    changed = True
+            if changed:
+                communicator = preflight(context)
+                old_json = arm['ppf_mmd_joints_v1']
+                arm['ppf_mmd_joints_v1'] = json.dumps(rows, ensure_ascii=False)
+                try:
+                    invalidate(context.scene)
+                    communicator.bone_physical_body_changed()
+                except (RuntimeError, ValueError):
+                    arm['ppf_mmd_joints_v1'] = old_json
+                    raise
+        except (AttributeError, KeyError, RuntimeError, TypeError, ValueError) as error:
+            self.report({'ERROR'}, iface(str(error)))
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+for _field, _, _, _, _ in _PMX_FIELDS:
+    for _axis in 'xyz':
+        _prefix = f'{_field}_{_axis}'
+        PPF_OT_PmxJointParameters.__annotations__[_prefix + '_mode'] = EnumProperty(items=_PMX_AXIS_MODES, options={'SKIP_SAVE'})
+        for _attr in ('lower', 'upper', 'spring'):
+            PPF_OT_PmxJointParameters.__annotations__[f'{_prefix}_{_attr}'] = FloatProperty(precision=5, options={'SKIP_SAVE'})
 
 
 def _draw_collision_filter(layout, settings, context):
@@ -375,7 +614,9 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
         if error:layout.label(text=error,icon='ERROR')
         layout.label(text=bone.name, icon='BONE_DATA', translate=False)
         actual_model, owned_group = _draw_actual_physics(layout, context, active_armature(context), bone)
-        layout.prop(s, 'joint_control_mode', text='', expand=True)
+        mode = layout.row(align=True)
+        mode.prop_enum(s, 'joint_control_mode', 'NATIVE', text='原生')
+        mode.prop_enum(s, 'joint_control_mode', 'MMD', text='MMD')
         layout.prop(s, "enabled", text='参与骨骼物理')
         color = layout.row(align=True)
         color.prop(s, 'preview_color_custom', text='自定颜色')
@@ -441,11 +682,14 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
         first=uses_new_binding_preset(s);plan=new_binding_plan(s)
         model=plan.get('physical_model',s.physical_model)
         arm=active_armature(context)
-        native_parent=effective_parent_joint_pair(bone, parent_joint_pairs(arm)) if arm else None
+        mmd = s.joint_control_mode == 'MMD'
+        pmx_parent = effective_parent_joint_pair(bone, parent_joint_pairs(arm)) if mmd else None
         has_joint_parent=has_physical_joint_parent(bone, arm=arm)
         header,body=layout.panel('ppf_bone_essentials',default_closed=False)
         header.label(text='常用物理参数')
-        if body:
+        if body and mmd:
+            _draw_pmx_connection(body.column(align=True), context, arm, bone)
+        elif body:
             restoring=bone.ppf_bone_restoring_controls
             direct=body.column(align=True)
             from ..ops.bone_chain_presets import _joint_parent_status
@@ -453,13 +697,12 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
             direct.enabled=bool(context.mode in {'OBJECT','POSE'} and s.enabled and s.proxy and valid_parent and s.joint_mode == 'SOFT')
             target_loaded=bool(getattr(restoring,'draft_loaded',False) and getattr(restoring,'loaded_bone_uuid','')==getattr(s,'bone_uuid','') and getattr(restoring,'loaded_joint_uuid','')==getattr(s,'joint_uuid',''))
             direct.label(text='回正力矩（每度）',icon='CONSTRAINT_BONE')
-            if native_parent:direct.label(text='当前父关节使用 PMX 参数',icon='INFO')
-            elif not valid_parent:direct.label(text='无父关节；使用下方根控制',icon='INFO')
+            if not valid_parent:direct.label(text='无父关节；使用下方根控制',icon='INFO')
             physical_loaded=bool(restoring.physical_draft_loaded and target_loaded)
             if physical_loaded and restoring.physical_status:
                 direct.label(text=restoring.physical_status,icon='INFO')
             from ..ops.bone_physical_controls import draw_inline
-            draw_inline(direct,context,bone,restoring,physical_loaded,show_swing_mode=native_parent is None)
+            draw_inline(direct,context,bone,restoring,physical_loaded)
         if body:
             from ..ops.bone_proxy_editor import editor_active,editor_scope
             unified=editor_active(context)
@@ -477,7 +720,7 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
             body.prop(s,'mass_mode',text='质量')
             body.prop(s,'target_mass_kg' if s.mass_mode=='MASS' else 'density',text='质量 kg' if s.mass_mode=='MASS' else '密度 kg/m³')
             group=get_group_by_uuid(context.scene,s.group_uuid) if s.group_uuid else None
-            if bone.parent and s.joint_mode == 'SOFT':
+            if not mmd and bone.parent and s.joint_mode == 'SOFT':
                 if has_joint_parent:
                     body.label(text='柔性关节')
                 try:
@@ -490,11 +733,11 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
                 anchor.prop(s, 'anchor_stiffness', text='连接刚度（N/m）')
                 if controlled: body.label(text='连接由恢复曲线控制，请使用曲线编辑入口', icon='INFO')
             if group and group.active:body.prop(group,'friction',text='摩擦系数')
-            self._draw_basic_control(body,s,bone,model,native_parent is not None)
-            if has_joint_parent:
+            self._draw_basic_control(body,s,bone,model,pmx_parent is not None,mmd=mmd)
+            if not mmd and has_joint_parent:
                 self._draw_joint_choice(body,s,model)
         follows_parent=bool(bone.parent and not bone.parent.ppf_bone_physics.enabled and getattr(s,'auto_follow_parent',False))
-        has_joint_parent=bool(native_parent is None and ((bone.parent and bone.parent.ppf_bone_physics.enabled) or follows_parent))
+        has_joint_parent=bool(not mmd and ((bone.parent and bone.parent.ppf_bone_physics.enabled) or follows_parent))
         header,collision=layout.panel('ppf_bone_collision',default_closed=True)
         header.label(text='碰撞组')
         if collision:
@@ -534,7 +777,7 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
                     row=limits.row(align=True);row.enabled=s.soft_limits_enabled[index]
                     row.prop(s,'soft_lower',index=index,text='下限');row.prop(s,'soft_upper',index=index,text='上限')
                     if s.soft_limit_policy=='ABSOLUTE_SI':limits.prop(s,'soft_stiffness_degree',index=index,text=label+' N·mm/°')
-        else:
+        elif not mmd:
             header,limits=layout.panel('ppf_bone_simple_limits',default_closed=True)
             header.label(text='软角度范围')
             if limits:
@@ -731,15 +974,15 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
         from ..models.new_binding_defaults import new_binding_plan
         return new_binding_plan(s).get('physical_model', s.physical_model)
 
-    def _draw_basic_control(self,control,s,bone,model,native_parent=False):
+    def _draw_basic_control(self,control,s,bone,model,pmx_parent=False,*,mmd=False):
         """Basic movement controls plus explicit removal of saved invalid events."""
-        generic_parent=bool(not native_parent and s.use_hierarchy_joint and bone.parent)
+        generic_parent=bool(not pmx_parent and s.use_hierarchy_joint and bone.parent)
         physical_parent=bool(generic_parent and bone.parent.ppf_bone_physics.enabled)
         follows_parent=bool(generic_parent and not physical_parent and s.auto_follow_parent)
         from ..core.bone_selection_parameters import resolve_selected_authors
-        if bone.parent or any(selected.parent for _arm,selected in resolve_selected_authors(bpy.context)):
+        if pmx_parent or (not mmd and (bone.parent or any(selected.parent for _arm,selected in resolve_selected_authors(bpy.context)))):
             control.prop(s, 'use_hierarchy_joint', text='连接父骨物理')
-        if generic_parent and not physical_parent:
+        if not mmd and generic_parent and not physical_parent:
             control.prop(s,'auto_follow_parent',text='跟随父骨骼')
         restricted=follows_parent or (model=='SOFT' and physical_parent)
         if restricted:
@@ -871,7 +1114,8 @@ class PPF_PT_ObjectCollisionGroups(bpy.types.Panel):
         layout.label(text='此处用于网格；解析墙和球使用原生设置', icon='INFO')
 
 
-classes = (PPF_PT_BonePhysics, PPF_PT_ObjectCollisionGroups)
+classes = (PPF_OT_PmxConnectionSelect, PPF_MT_PmxConnection, PPF_OT_PmxJointParameters,
+           PPF_PT_BonePhysics, PPF_PT_ObjectCollisionGroups)
 
 
 def register():
@@ -880,9 +1124,11 @@ def register():
     bone_display_context.register()
     bone_overlay.register()
     for cls in classes:_ppf_i18n.register_class(cls)
+    bpy.types.WindowManager.ppf_display_pmx_joint = StringProperty(options={'SKIP_SAVE'})
 
 
 def unregister():
+    del bpy.types.WindowManager.ppf_display_pmx_joint
     for cls in reversed(classes):bpy.utils.unregister_class(cls)
     from . import bone_overlay
     bone_overlay.unregister()

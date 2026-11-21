@@ -37,6 +37,9 @@ PRESETS = {
     'STIFF_RIBBON': BoneChainPreset(
         '挺括飘带', 'STIFF_RIGID', 25.0, 15.0, 50.0, .72,
         '未标定起点；采用较高密度代理材质与质量/惯量自适应恢复力'),
+    'HARD_WEBBING': BoneChainPreset(
+        '硬质织带', 'HARD_WEBBING', 20.0, 12.0, 45.0, .8,
+        '未标定起点；采用硬挺织带代理材质与质量/惯量自适应恢复力'),
 }
 
 PRESET_ITEMS = [(key, value.label, value.evidence) for key, value in PRESETS.items()]

@@ -18,6 +18,7 @@ PRESETS = {
     'LIGHT_HAIR': BoneMaterialPreset('轻质发片（未标定起点）', 1e8, 50., .3, .002, '未标定的代理效果起点'),
     'SOFT_CLOTH': BoneMaterialPreset('柔软布片（未标定起点）', 1e7, 100., .3, .002, '未标定的代理效果起点'),
     'STIFF_STRAP': BoneMaterialPreset('硬挺织带（未标定起点）', 1e8, 200., .3, .002, '未标定的代理效果起点'),
+    'HARD_WEBBING': BoneMaterialPreset('硬质织带（未标定起点）', 2e8, 200., .3, .002, '未标定的代理效果起点'),
 }
 PRESET_ITEMS = [(key, value.label, '待应用的软体材质；选择不等于已应用，不切换物理类型、形状或关节') for key, value in PRESETS.items()]
 

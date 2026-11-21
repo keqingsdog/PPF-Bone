@@ -17,7 +17,7 @@ def matrix_determinant(matrix_world):
     return determinant
 
 
-def measure_volume(mesh, matrix_world, *, edit_mesh=False):
+def measure_volume(mesh, matrix_world, *, edit_mesh=False, moments=False):
     determinant = matrix_determinant(matrix_world)
     temporary_mesh = None
     if edit_mesh:
@@ -59,12 +59,31 @@ def measure_volume(mesh, matrix_world, *, edit_mesh=False):
         result = strict_volume(vertices, triangles, determinant)
         result['local_volume_m3'] = result['volume_m3']/determinant
         result['volume_definition'] = 'author_base_mesh_matrix_world_m3'
+        if moments:
+            result.update(_rest_moments(vertices, triangles, result['local_volume_m3']))
         return result
     finally:
         if temporary_mesh is not None:
             import bpy
             bpy.data.meshes.remove(temporary_mesh)
         bm.free()
+
+
+def _rest_moments(vertices, triangles, local_volume):
+    """Second moments per unit mass, in local coordinates about point centroid."""
+    import numpy as np
+
+    points = np.asarray(vertices, dtype=np.float64)
+    points -= points.mean(axis=0)
+    a, b, c = points[np.asarray(triangles)].transpose(1, 0, 2)
+    total = a + b + c
+    fractions = np.einsum('ni,ni->n', a, np.cross(b, c)) / (6. * local_volume)
+    first = np.einsum('n,ni->i', fractions, total) / 4.
+    second = sum(np.einsum('n,ni,nj->ij', fractions, v, v)
+                 for v in (a, b, c, total)) / 20.
+    return dict(point_second_moment=points.T @ points / len(points),
+                solid_second_moment=second,
+                solid_centered_second_moment=second - np.outer(first, first))
 
 
 def author_geometry_bytes(mesh, *, edit_mesh=False):

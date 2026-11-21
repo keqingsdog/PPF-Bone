@@ -2,6 +2,7 @@
 import copy,json,uuid,math
 import bpy
 from ..core.bone_physical_units import CHANNELS,to_display,to_si,linear_constants,resolved_channels,trusted_build
+from ..core.bone_restoring_preview import angular_constants, angular_metrics
 from ..models import restoring_curves as curves
 from .restoring_curve_operators import read_state,write_state
 
@@ -9,6 +10,8 @@ from .restoring_curve_operators import read_state,write_state
 # from a property callback, panel draw, or the selection timer.
 _refresh_depth=0
 _refresh_key=None
+_AUTO_PREVIEW_LABEL='代理惯量预览'
+_AUTO_MASS_PENDING='等待有效代理惯量'
 
 
 def _author_key(context,bone):
@@ -29,7 +32,16 @@ def _mmd_auto_channels(context, bone, state):
     return channels if arm is not None and has_physical_joint_parent(bone, arm=arm) else ()
 
 
+def _preview_metrics(context, bone):
+    from ..models.bone_bindings import active_armature
+    return angular_metrics(context, active_armature(context), bone)
+
+
 def refresh(context,bone):
+    return _refresh(context, bone, _preview_metrics(context, bone))
+
+
+def _refresh(context,bone,metrics):
     global _refresh_depth
     _refresh_depth+=1
     try:
@@ -38,17 +50,19 @@ def refresh(context,bone):
         auto_channels=_mmd_auto_channels(context, bone, state)
         for index,channel in enumerate(CHANNELS):
             saved=_channel_state(state,s.joint_uuid,channel);value=None
-            if saved is None and channel in auto_channels:
-                from ..core.bone_physical_units import display_auto_value
-                value=display_auto_value(context,s.joint_uuid,channel,
-                                         curves.mmd_automatic_angular_curve(s.joint_uuid, channel))
-                label='当前构建自动值' if value is not None else '按惯量自动适配；待构建计算'
-            elif state['mode']=='LEGACY' or saved is None or not saved['binding']['enabled']:
+            implicit=saved is None and channel in auto_channels
+            if implicit:
+                saved=curves.mmd_automatic_angular_curve(s.joint_uuid, channel)
+            if not implicit and (state['mode']=='LEGACY' or saved is None or not saved['binding']['enabled']):
                 value=(s.anchor_stiffness,0.) if channel=='anchor' else (s.angular_stiffness[index],s.angular_damping[index])
                 label='固定 SI（旧线性）'
             elif saved['binding']['mode']=='ABSOLUTE_SI':
                 value=linear_constants(saved['table'],saved['binding']['damping'])
                 label='固定 SI' if value is not None else '自定义曲线'
+            elif index < 3:
+                value=angular_constants(metrics[index] if metrics is not None else None,saved)
+                label=(_AUTO_PREVIEW_LABEL if value is not None else
+                       '自动自定义曲线' if linear_constants(saved['table'],0.) is None else _AUTO_MASS_PENDING)
             else:
                 from ..core.bone_physical_units import display_auto_value
                 value=display_auto_value(context,s.joint_uuid,channel,saved)
@@ -61,13 +75,13 @@ def refresh(context,bone):
         owner.physical_channel_labels=json.dumps(labels,ensure_ascii=False)
         owner.physical_loaded_values=json.dumps(_values(owner))
         owner.physical_live=True
-        owner.physical_status='固定数值修改即生效；自适应曲线保留质量适配'
+        owner.physical_status='自动值按当前代理和质量估计；实际值由构建计算' if _AUTO_PREVIEW_LABEL in labels else ''
         return owner
     finally:_refresh_depth-=1
 
 
 def refresh_active():
-    """Registered main-thread timer: no draw writes, file IO or Build lookup."""
+    """Refresh author controls when the selected joint or cached mass changes."""
     global _refresh_key
     try:
         from ..models.bone_bindings import active_armature,active_bone
@@ -80,9 +94,17 @@ def refresh_active():
             _refresh_key=None;return .3
         from ..core.bone_physical_units import display_build_key
         from ..models.bone_bindings import has_physical_joint_parent
-        key=(_author_key(context,bone),display_build_key(context),has_physical_joint_parent(bone, arm=arm))
+        metrics=angular_metrics(context,arm,bone)
+        key=(_author_key(context,bone),display_build_key(context),has_physical_joint_parent(bone, arm=arm),metrics)
         if key!=_refresh_key:
-            refresh(context,bone);_refresh_key=key
+            owner=bone.ppf_bone_restoring_controls
+            if (not owner.physical_live and owner.physical_draft_loaded
+                    and owner.loaded_joint_uuid==s.joint_uuid and owner.loaded_bone_uuid==s.bone_uuid
+                    and (any(owner.physical_force_replace)
+                         or (owner.physical_loaded_values
+                             and _values(owner)!=json.loads(owner.physical_loaded_values)))):
+                return .3
+            _refresh(context,bone,metrics);_refresh_key=key
     except (ValueError,RuntimeError,ReferenceError,AttributeError,KeyError,TypeError):
         _refresh_key=None
     return .3
@@ -233,12 +255,13 @@ def load(context,bone):
     old_values=_values(owner)
     old_loaded=owner.physical_loaded_values
     s=bone.ppf_bone_physics
-    dirty=bool(owner.physical_draft_loaded and owner.loaded_bone_uuid==s.bone_uuid and
-               owner.loaded_joint_uuid==s.joint_uuid and (any(owner.physical_force_replace) or
-               (old_loaded and old_values!=json.loads(old_loaded))))
+    dirty=[]
+    if owner.physical_draft_loaded and owner.loaded_bone_uuid==s.bone_uuid and owner.loaded_joint_uuid==s.joint_uuid:
+        baseline=json.loads(old_loaded) if old_loaded else old_values
+        dirty=[i for i in range(4) if owner.physical_force_replace[i] or old_values[i]!=baseline[i]]
     try:
         result=_load(context,bone)
-        if dirty and not all(result.physical_available):
+        if any(not result.physical_available[i] for i in dirty):
             restore_rna(owner,snapshot)
             owner.physical_status='部分数值不可读取；保留未应用草稿'
         return owner
@@ -249,8 +272,9 @@ def load(context,bone):
 
 def _load(context,bone):
     owner,state=_initialize(context,bone);s=bone.ppf_bone_physics
-    last=None;snapshot=None;source=None;sources={};attempted=False;available=[];has_auto=False;has_custom=False;used_build=False;pending_auto=False
+    last=None;snapshot=None;source=None;sources={};preview_sources={};attempted=False;available=[];has_custom=False;used_build=False;pending_auto=False
     auto_channels=_mmd_auto_channels(context, bone, state)
+    metrics=_preview_metrics(context,bone)
     for index,channel in enumerate(CHANNELS):
         saved=_channel_state(state,s.joint_uuid,channel)
         value=None
@@ -263,19 +287,21 @@ def _load(context,bone):
             value=linear_constants(saved['table'],saved['binding']['damping'])
             has_custom=has_custom or value is None
         else:
-            has_auto=True
             # Enabled exact-zero AUTO curves are already known without a Build.
             if all(float(f)==0. for _x,f in saved['table']['nodes']) and saved['binding']['damping_ratio']==0:
                 value=(0.,0.)
             elif linear_constants(saved['table'],0.) is None:
                 has_custom=True
+            elif index < 3 and metrics is not None:
+                value=angular_constants(metrics[index],saved)
+                preview_sources[channel]=metrics[index]
             else:
                 if not attempted:
                     attempted=True
                     try:
                         snapshot,source=_last_build(context)
                         last=resolved_channels(snapshot,s.joint_uuid)
-                    except (ValueError,OSError,TypeError,KeyError):
+                    except (ImportError,ValueError,OSError,TypeError,KeyError):
                         last=None
                 if implicit:
                     from ..core.bone_physical_units import resolved_auto_value
@@ -289,10 +315,12 @@ def _load(context,bone):
         if value is not None:_set_value(owner,index,to_display(value[0],channel),to_display(value[1],channel))
     snapshots=json.loads(owner.physical_channel_snapshot)
     snapshots['__auto_resolved_sources__']=sources
+    snapshots['__auto_preview_sources__']=preview_sources
     owner.physical_channel_snapshot=json.dumps(snapshots,sort_keys=True)
     owner.physical_available=tuple(available)
+    owner.physical_channel_labels='[]'
     owner.physical_loaded_values=json.dumps(_values(owner))
-    owner.physical_status=('自动适配质量（待构建）' if pending_auto else '保留自定义曲线' if has_custom else '上次构建实际值' if used_build else '已载入物理参数')
+    owner.physical_status=('已载入代理惯量预览' if preview_sources else '部分自动值等待有效质量或构建' if pending_auto else '保留自定义曲线' if has_custom else '上次构建实际值' if used_build else '已载入物理参数')
     return owner
 
 
@@ -300,11 +328,13 @@ def new_draft(context,bone,channel):
     owner=bone.ppf_bone_restoring_controls;s=bone.ppf_bone_physics
     valid=owner.physical_draft_loaded and owner.loaded_bone_uuid==s.bone_uuid and owner.loaded_joint_uuid==s.joint_uuid
     if not valid:owner,_state=_initialize(context,bone)
+    owner.physical_live=False
     baseline=json.loads(owner.physical_loaded_values) if valid and owner.physical_loaded_values else _values(owner)
     state=read_state(context.scene);index=CHANNELS.index(channel)
     snapshots=json.loads(owner.physical_channel_snapshot or '{}')
     snapshots[channel]=_channel_state(state,s.joint_uuid,channel)
     snapshots.get('__auto_resolved_sources__',{}).pop(channel,None)
+    snapshots.get('__auto_preview_sources__',{}).pop(channel,None)
     owner.physical_channel_snapshot=json.dumps(snapshots,sort_keys=True)
     # Explicit replacement draft, not a claim about active AUTO/custom values.
     k,c=(s.anchor_stiffness,0.) if channel=='anchor' else (s.angular_stiffness[index],s.angular_damping[index])
@@ -352,6 +382,8 @@ def apply(context,bone):
             if current!=previous:
                 raise ValueError('该通道的旧线性作者参数已改变，请重新载入')
     sources=snapshots.get('__auto_resolved_sources__',{})
+    preview_sources=snapshots.get('__auto_preview_sources__',{})
+    current_metrics=_preview_metrics(context,bone) if preview_sources else None
     derived=[]
     auto_channels=_mmd_auto_channels(context, bone, state)
     for channel in changed:
@@ -362,6 +394,11 @@ def apply(context,bone):
                    and not (all(float(f)==0. for _x,f in saved['table']['nodes'])
                             and saved['binding']['damping_ratio']==0))
         if dependent or (saved is None and channel in auto_channels):
+            if channel in preview_sources:
+                if current_metrics is None or not math.isclose(
+                        current_metrics[CHANNELS.index(channel)],preview_sources[channel],rel_tol=1e-6):
+                    raise ValueError('代理惯量在载入后已改变，请重新载入数值')
+                continue
             if channel not in sources:
                 raise ValueError('旧恢复力草稿缺少当前构建来源，请重新载入数值')
             derived.append(channel)
@@ -403,6 +440,7 @@ def apply(context,bone):
         snapshots[channel]=_channel_state(state,s.joint_uuid,channel)
         owner.physical_force_replace[index]=False
         sources.pop(channel,None)
+        preview_sources.pop(channel,None)
     # A forced replacement after an external mode change refreshes only its
     # own channels. Do not legitimize untouched drafts from the old mode.
     for channel in CHANNELS:
@@ -494,13 +532,19 @@ def draw_inline(layout, context, bone, owner, physical_loaded, *, show_swing_mod
         layout.prop(settings, 'angular_restoring_mode', text='摆动恢复')
     cone = show_swing_mode and settings.angular_restoring_mode == 'CONE'
     axes = ('X扭转',) if cone else ('X扭转', 'Y弯曲', 'Z弯曲')
+    labels=json.loads(owner.physical_channel_labels or '[]') if physical_loaded else []
+    def unavailable(index):
+        if not physical_loaded:
+            return '等待选择父关节'
+        return labels[index] if index < len(labels) else _AUTO_MASS_PENDING
+
     for index, label in enumerate(axes):
         row=layout.row(align=True);row.label(text=label)
         switch=row.row(align=True);switch.enabled=physical_loaded
         switch.prop(owner,'physical_custom',index=index,text='自定义')
         value=row.row(align=True);value.enabled=physical_loaded and owner.physical_custom[index] and owner.physical_available[index]
         if physical_loaded and owner.physical_available[index]:value.prop(owner,'angular_stiffness_degree',index=index,text='')
-        else:value.label(text='自动值待构建' if physical_loaded else '等待选择父关节')
+        else:value.label(text=unavailable(index))
     if cone:
         layout.prop(settings, 'swing_restoring_stiffness_degree', text='圆锥刚度 N·mm/°')
     header,body=layout.panel('ppf_bone_physical_damping',default_closed=True)
@@ -509,6 +553,6 @@ def draw_inline(layout, context, bone, owner, physical_loaded, *, show_swing_mod
         for index, label in enumerate(axes):
             row=body.row(align=True);row.enabled=physical_loaded and owner.physical_custom[index] and owner.physical_available[index]
             if physical_loaded and owner.physical_available[index]:row.prop(owner,'angular_damping_degree',index=index,text=label)
-            else:row.label(text=label+'：自动值待构建')
+            else:row.label(text=label+'：'+unavailable(index))
         if cone:
             body.prop(settings, 'swing_restoring_damping_degree', text='圆锥阻尼')

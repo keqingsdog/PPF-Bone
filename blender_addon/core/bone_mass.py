@@ -49,6 +49,17 @@ def cached_status(scene, arm, bone):
     return bool(s.mass_valid), s.mass_status
 
 
+def cached_rest_mass(scene, arm, bone):
+    """Read the validated mass and rest moments without evaluating geometry."""
+    if not cached_status(scene, arm, bone)[0]:
+        return None
+    settings = bone.ppf_bone_physics
+    key = _key(scene, arm, bone)
+    if _metadata_snapshot(settings) != _snapshots.get(key):
+        return None
+    return CACHE.entries[key]['value']
+
+
 def _key(scene, arm, bone):
     if _identity_rebuilding or arm.mode == 'EDIT':
         raise RuntimeError('质量读取等待骨架数据重建完成')
@@ -192,13 +203,13 @@ def _owned(scene, arm, bone):
     return group
 
 
-def _measure(scene, settings, mesh=None, matrix=None):
+def _measure(scene, settings, mesh=None, matrix=None, *, moments=False):
     if float(scene.unit_settings.scale_length) != 1.:
         raise ValueError('骨骼质量使用 SI 单位；场景单位缩放必须为 1')
     proxy = settings.proxy
     if mesh is None and proxy is None: raise ValueError('请先创建物理代理，再计算质量')
     if mesh is not None: return measure_volume(mesh, matrix, edit_mesh=False)
-    return measure_volume(proxy.data, proxy.matrix_world, edit_mesh=proxy.mode == 'EDIT')
+    return measure_volume(proxy.data, proxy.matrix_world, edit_mesh=proxy.mode == 'EDIT', moments=moments)
 
 
 def _reuse_geometry(scene, settings, geometry):
@@ -321,7 +332,20 @@ def mass_timer():
             _indexes = indexes; _identity_names = names; _inventory_shape = shape; _inventory_dirty = False
         # One complete body per tick bounds multi-body authoring work. A failed
         # generation is cached too, and won't rescan until another edit/reset.
-        for key in CACHE.ready(now):
+        ready = CACHE.ready(now)
+        if ready:
+            from ..models.bone_bindings import active_armature, active_bone
+            context = bpy.context
+            arm = active_armature(context)
+            bone = active_bone(context) if arm is not None else None
+            if bone is not None:
+                scene = context.scene
+                priority = {_key(scene, arm, bone)}
+                parent = next((p for p in bone.parent_recursive if p.ppf_bone_physics.enabled), None)
+                if parent is not None:
+                    priority.add(_key(scene, arm, parent))
+                ready.sort(key=lambda key: key not in priority)
+        for key in ready:
             bone = _resolve(key)
             if bone is None:
                 _inventory_dirty = True
@@ -345,7 +369,7 @@ def mass_timer():
                     entry['geometry_dirty'] = False
                     result = _reuse_geometry(scene, s, entry['geometry'])
                 else:
-                    result = _measure(scene, s)
+                    result = _measure(scene, s, moments=True)
                     if signature != author_geometry_bytes(s.proxy.data, edit_mesh=s.proxy.mode == 'EDIT'):
                         raise ValueError('作者网格在测量期间改变；请等待刷新')
                     measured_geometry = dict(result)

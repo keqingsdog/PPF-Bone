@@ -15,7 +15,7 @@ class PPF_PG_CurveNode(bpy.types.PropertyGroup):
 class PPF_PG_RestoringCurves(bpy.types.PropertyGroup):
     advanced_ui: BoolProperty(name='Advanced Parameters',description='Show custom curves and detailed physics controls without changing saved simulation settings',default=False,options=set())
     ui_tier: EnumProperty(name='显示层级',items=[('SIMPLE','简易','常用恢复参数与预设'),('ADVANCED','进阶','物理体、材质、根运动与约束设置'),('PRO','专业','恢复力函数、单位与独立通道')],default='SIMPLE',update=_tier_changed,options=set())
-    bone_chain_preset: EnumProperty(name='骨链预设',items=[('LIGHT_HAIR','轻质发束',''),('STRAP','织带',''),('FLEXIBLE_STRAP','柔软织带',''),('STIFF_RIBBON','挺括飘带','')],default='LIGHT_HAIR',options=set())
+    bone_chain_preset: EnumProperty(name='骨链预设',items=[('LIGHT_HAIR','轻质发束',''),('STRAP','织带',''),('FLEXIBLE_STRAP','柔软织带',''),('STIFF_RIBBON','挺括飘带',''),('HARD_WEBBING','硬质织带','')],default='LIGHT_HAIR',options=set())
     bone_chain_scope: EnumProperty(name='预设应用范围',items=[('SELECTED','仅选中','只处理当前选中的物理骨骼'),('CHAIN','当前骨链','处理活动骨骼所属的物理链'),('ALL','整个骨架','处理当前活动骨架中的物理骨骼')],default='CHAIN',options=set())
     mode: EnumProperty(name='Restoring Mode',items=[('LEGACY','Legacy','Keep existing restoring parameters'),('COMMON','Common Restoring','Frequency and damping ratio'),('ADVANCED','Advanced','Edit individual restoring curves')],default='LEGACY',options=set())
     document_json: StringProperty(default='',options={'HIDDEN'})
