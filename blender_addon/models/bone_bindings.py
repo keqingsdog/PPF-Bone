@@ -136,7 +136,7 @@ def armature_data_owner_counts():
                    if obj.type == 'ARMATURE')
 
 
-def _owned_group(self, object_type):
+def _owned_group(self, object_type, *, snapshot=None):
     """Only the unique bone/armature may synchronize its dedicated material."""
     if not self.body_uuid or self.proxy is None:return None
     proxy=self.proxy;owner=proxy_parent_armature(proxy)
@@ -144,15 +144,15 @@ def _owned_group(self, object_type):
     if owner is not None and owner.type=='ARMATURE' and owner.data!=self.id_data:return None
     if proxy.get('ppf_bone_uuid')!=self.bone_uuid or proxy.get('_solver_uuid')!=self.body_uuid:return None
     if isinstance(self.id_data,bpy.types.Armature):
-        if sum(b.ppf_bone_physics.proxy==proxy for b in self.id_data.bones)!=1:return None
-    arms=[o for o in bpy.data.objects if o.type=='ARMATURE' and o.data==self.id_data]
+        if (sum(b.ppf_bone_physics.proxy==proxy for b in self.id_data.bones) if snapshot is None else snapshot['proxy_counts'].get(proxy.as_pointer(),0))!=1:return None
+    arms=([o for o in bpy.data.objects if o.type=='ARMATURE' and o.data==self.id_data] if snapshot is None else snapshot['arms_by_data'].get(self.id_data.as_pointer(),()))
     if len(arms)!=1 or len(arms[0].users_scene)!=1:return None
     scene=proxy.users_scene[0];arm=arms[0]
     if scene.objects.get(arm.name)!=arm or proxy.get('ppf_armature_uuid')!=arm.ppf_armature_uuid:return None
-    if sum(o.get('_solver_uuid')==self.body_uuid for o in scene.objects)!=1:return None
+    if (sum(o.get('_solver_uuid')==self.body_uuid for o in scene.objects) if snapshot is None else snapshot['body_counts'].get(scene.as_pointer(),{}).get(self.body_uuid,0))!=1:return None
     if owner is None or owner.type!='ARMATURE':
         if any(o.type=='ARMATURE' and o.data!=self.id_data and
-               o.ppf_armature_uuid==proxy.get('ppf_armature_uuid') for o in bpy.data.objects):return None
+               o.ppf_armature_uuid==proxy.get('ppf_armature_uuid') for o in (bpy.data.objects if snapshot is None else snapshot['arms_by_uuid'].get(proxy.get('ppf_armature_uuid'),()))):return None
     for group in _material_groups_of(self):
         if group.object_type==object_type and len(group.assigned_objects)==1 and group.assigned_objects[0].uuid==self.body_uuid:
             return group

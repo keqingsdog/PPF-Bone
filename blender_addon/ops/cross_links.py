@@ -224,7 +224,7 @@ class PPF_UL_CrossLinks(bpy.types.UIList):
 
 
     def draw_item(self,context,layout,data,item,icon,active_data,active_propname,index=0):
-        arm=data;label,error=author.status(context,arm,item,getattr(PPF_UL_CrossLinks,'_bone_index',None),getattr(PPF_UL_CrossLinks,'_proxy_counts',None))
+        arm=data;label,error=author.status(context,arm,item,getattr(PPF_UL_CrossLinks,'_bone_index',None),getattr(PPF_UL_CrossLinks,'_proxy_counts',None),getattr(PPF_UL_CrossLinks,'_owner_lookup',None))
         selected=_selected_bone_uuids(context,arm)
         related=_related(item,selected)
         any_related=any(_related(row,selected) for row in arm.ppf_cross_links) if selected else False
@@ -238,16 +238,18 @@ class PPF_UL_CrossLinks(bpy.types.UIList):
 
 
 @contextmanager
-def _list_index_scope(bone_index, proxy_counts):
+def _list_index_scope(bone_index, proxy_counts, owner_lookup):
     cls=PPF_UL_CrossLinks
-    old_index=getattr(cls,'_bone_index',None);old_counts=getattr(cls,'_proxy_counts',None)
-    cls._bone_index=bone_index;cls._proxy_counts=proxy_counts
+    old_index=getattr(cls,'_bone_index',None);old_counts=getattr(cls,'_proxy_counts',None);old_owner=getattr(cls,'_owner_lookup',None)
+    cls._bone_index=bone_index;cls._proxy_counts=proxy_counts;cls._owner_lookup=owner_lookup
     try:yield
     finally:
         if old_index is None:del cls._bone_index
         else:cls._bone_index=old_index
         if old_counts is None:del cls._proxy_counts
         else:cls._proxy_counts=old_counts
+        if old_owner is None:del cls._owner_lookup
+        else:cls._owner_lookup=old_owner
 
 
 class PPF_PT_CrossLinks(bpy.types.Panel):
@@ -344,7 +346,34 @@ class PPF_PT_CrossLinks(bpy.types.Panel):
             if proxy:proxy_counts[proxy.as_pointer()]=proxy_counts.get(proxy.as_pointer(),0)+1
         layout.label(text='左侧勾选用于批量编辑；右侧为碰撞排除',icon='INFO')
         layout.prop(draft,'search_text',text='',icon='VIEWZOOM')
-        with _list_index_scope(bone_index,proxy_counts):
+        # Cache only for this draw; binding edits are reflected next draw.
+        from ..models.bone_bindings import _owned_group
+        from collections import Counter
+        arms_by_data={}
+        arms_by_uuid={}
+        for obj in bpy.data.objects:
+            if obj.type=='ARMATURE':
+                arms_by_data.setdefault(obj.data.as_pointer(),[]).append(obj)
+                arms_by_uuid.setdefault(obj.ppf_armature_uuid,[]).append(obj)
+        body_counts = {
+            scene.as_pointer(): Counter(
+                uid for obj in scene.objects
+                if isinstance(uid := obj.get('_solver_uuid'), str)
+            )
+            for scene in bpy.data.scenes
+        }
+        snapshot = {
+            'proxy_counts': proxy_counts,
+            'arms_by_data': arms_by_data,
+            'arms_by_uuid': arms_by_uuid,
+            'body_counts': body_counts,
+        }
+        owners={}
+        def owner_lookup(settings, object_type):
+            key=(settings.as_pointer(),object_type)
+            if key not in owners:owners[key]=_owned_group(settings,object_type,snapshot=snapshot)
+            return owners[key]
+        with _list_index_scope(bone_index,proxy_counts,owner_lookup):
             layout.template_list('PPF_UL_CrossLinks','',arm,'ppf_cross_links',draft,'active_index',rows=3,maxrows=6)
         row=layout.row(align=True)
         row.operator('ppf.cross_links_select',text='全选').action='ALL';row.operator('ppf.cross_links_select',text='取消').action='NONE'
@@ -355,7 +384,7 @@ class PPF_PT_CrossLinks(bpy.types.Panel):
         if link is not None:
             actual=arm.ppf_cross_link_actual;box=layout.box()
             box.enabled=bool(target_ids)
-            label,error=author.status(context,arm,link,bone_index,proxy_counts)
+            label,error=author.status(context,arm,link,bone_index,proxy_counts,owner_lookup)
             box.label(text=label)
             count=len(author.selected_link_ids(arm))
             box.label(text=f'实际参数 · 修改即提交 {count} 条连接')

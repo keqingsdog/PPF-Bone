@@ -1972,9 +1972,8 @@ class SOLVER_OT_ClearAllDeformations(Operator):
         # clear" case) when no cache exists across the active groups.
         if is_bake_running() or is_capture_running() or is_pin_capture_running():
             return False
-        # Stateless and fast: a global static-deform-cache check (in-memory +
-        # one directory scan) instead of resolving every STATIC object by
-        # UUID and stat-ing its PC2 per redraw. The pin side is already cheap.
+        # The static predicate checks ownership only for existing PC2 files
+        # or in-memory arrays. Clear revalidates the caches when it runs.
         from ..core.pc2 import scene_has_static_deform_cache
         from .dynamics.pin_capture_ops import collect_pins_with_captured_anim
         return bool(

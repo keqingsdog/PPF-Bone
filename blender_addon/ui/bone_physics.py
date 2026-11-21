@@ -374,7 +374,7 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
         error=context.window_manager.ppf_selection_parameters.error
         if error:layout.label(text=error,icon='ERROR')
         layout.label(text=bone.name, icon='BONE_DATA', translate=False)
-        _draw_actual_physics(layout,context,active_armature(context),bone)
+        actual_model, owned_group = _draw_actual_physics(layout, context, active_armature(context), bone)
         layout.prop(s, 'joint_control_mode', text='', expand=True)
         layout.prop(s, "enabled", text='参与骨骼物理')
         color = layout.row(align=True)
@@ -383,7 +383,7 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
             color.prop(s, 'preview_color', text='')
         else:
             color.label(text='自动')
-        self._draw_simple(layout,context,s,bone)
+        self._draw_simple(layout, context, s, bone, actual_model, owned_group)
 
     def _draw_editor(self,layout,context,bone,frozen=False):
         from ..ops.bone_proxy_editor import editor_active,editor_scope
@@ -435,7 +435,7 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
         op=editor.operator('ppf.bone_settings_copy',text=f'复制到范围（{count} 根）',icon='CHECKMARK')
         op.scope=scope;op.category=wm.ppf_bone_editor_category
 
-    def _draw_simple(self,layout,context,s,bone):
+    def _draw_simple(self, layout, context, s, bone, actual_model, owned_group):
         """Only the common bone authoring controls; saved detailed data is untouched."""
         from ..models.new_binding_defaults import uses_new_binding_preset,new_binding_plan
         first=uses_new_binding_preset(s);plan=new_binding_plan(s)
@@ -466,8 +466,8 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
 
             self._draw_physical_model_choice(body, s, first, context)
             self._draw_body_switch(body,context,s)
-            actual,owned_group,_label=actual_physical_model(context,active_armature(context),bone)
-            if actual=='SOFT':_draw_soft_material_choice(body,context,s,owned_group)
+            if actual_model == 'SOFT':
+                _draw_soft_material_choice(body, context, s, owned_group)
             if not unified:
                 header,generation=body.panel('ppf_bone_simple_generation',default_closed=False)
                 header.label(text='代理形状与面数')
@@ -555,8 +555,7 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
                 from ..models.bone_material_presets import PRESETS as material_presets
                 material=material_presets[chain_presets[restoring_owner.bone_chain_preset].material_id]
                 presets.label(text=iface('预设密度：{density} kg/m³').format(density=f'{material.density_kg_m3:g}'),translate=False)
-                actual,_,_=actual_physical_model(context,active_armature(context),bone)
-                if actual=='SOFT':presets.label(text=iface('预设软体硬度：{young} MPa').format(young=f'{material.young_pa/1e6:g}'),translate=False)
+                if actual_model=='SOFT':presets.label(text=iface('预设软体硬度：{young} MPa').format(young=f'{material.young_pa/1e6:g}'),translate=False)
             else:
                 from ..ops.bone_presets import draw_user_presets
                 draw_user_presets(presets,context,embedded=True,controls=False)

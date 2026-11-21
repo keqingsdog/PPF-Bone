@@ -920,9 +920,8 @@ def pin_has_captured_anim(pin_item) -> bool:
 
 def pin_captured_frame_count(pin_item) -> int:
     """Frame count of this pin's captured cache, or 0 if absent."""
-    from ...core.pc2 import get_pin_anim_cache
+    from ...core.pc2 import peek_pin_anim_frame_count
     from ...core.uuid_registry import resolve_pin
-    from ...models.groups import decode_vertex_group_identifier
 
     if pin_item is None:
         return 0
@@ -935,10 +934,7 @@ def pin_captured_frame_count(pin_item) -> int:
     _, vg_name = decode_stored_pin_identifier(pin_item.name)
     if not vg_name:
         return 0
-    cache = get_pin_anim_cache(obj, vg_name)
-    if cache is None:
-        return 0
-    return int(cache.shape[0])
+    return peek_pin_anim_frame_count(obj, vg_name)
 
 
 # ---------------------------------------------------------------------------

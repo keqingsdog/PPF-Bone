@@ -905,10 +905,7 @@ def scene_has_solver_cache(scene=None) -> bool:
 
 def scene_has_static_deform_cache(scene=None) -> bool:
     """Only captures with exact ownership in this scene enable its Clear button."""
-    # This is a panel poll, not a deletion gate. With no capture in memory or
-    # this project's cache directory, resolving every potential owner is wasted
-    # work (quadratic for many bone proxies). Keep the strict ownership check
-    # below whenever any candidate exists, including unrecorded legacy files.
+    # Skip walking scene objects when the project has no static capture files.
     if not any(key.endswith(STATIC_DEFORM_SUFFIX) for key in _static_deform_cache):
         try:
             with os.scandir(get_pc2_dir()) as entries:
@@ -920,9 +917,7 @@ def scene_has_static_deform_cache(scene=None) -> bool:
             possible = True  # Inaccessible directories retain the original gate.
         if not possible:
             return False
-    return any(key.endswith(STATIC_DEFORM_SUFFIX)
-               and (key in _static_deform_cache or os.path.exists(get_pc2_path(key)))
-               for key in _owned_capture_keys(scene))
+    return bool(_owned_capture_keys(scene, static_cache_only=True))
 
 
 def remove_pc2_file(key):
@@ -1744,7 +1739,7 @@ def _safe_capture_key(key):
             and os.path.basename(get_pc2_path(key)) == key + '.pc2')
 
 
-def _capture_records(scene):
+def _capture_records(scene, *, static_only=False):
     if scene is None:
         return {}
     try:
@@ -1752,16 +1747,19 @@ def _capture_records(scene):
     except (TypeError, ValueError):
         return {}
     return {key: uid for key, uid in value.items()
-            if _safe_capture_key(key) and isinstance(uid, str) and uid} if isinstance(value, dict) else {}
+            if (not static_only or key.endswith(STATIC_DEFORM_SUFFIX))
+            and _safe_capture_key(key) and isinstance(uid, str) and uid} if isinstance(value, dict) else {}
 
 
-def _live_capture_keys(obj):
+def _live_capture_keys(obj, *, static_only=False):
     """Read-only full keys from the real UUID and actual vertex-group names."""
     from .uuid_registry import get_object_uuid
     uid = get_object_uuid(obj)
     if not uid or obj.type != 'MESH':
         return {}
     keys = {uid + STATIC_DEFORM_SUFFIX: uid}
+    if static_only:
+        return keys
     legacy_names = [vg.name.replace(' ', '_').replace('/', '_') for vg in obj.vertex_groups]
     # Call-local counts preserve case-insensitive legacy ambiguity rejection.
     from collections import Counter
@@ -1796,7 +1794,7 @@ def _record_capture_owner(obj, key):
     scene[_CAPTURE_OWNERS] = json.dumps(records, sort_keys=True)
 
 
-def _owned_capture_keys(scene=None):
+def _owned_capture_keys(scene=None, *, static_cache_only=False):
     """Same authority for saved/unsaved projects and disk/memory cleanup.
 
     New captures retain their exact owner on the scene, including after object
@@ -1807,27 +1805,40 @@ def _owned_capture_keys(scene=None):
     if scene is None or bpy is None:
         return set()
     from .uuid_registry import get_object_uuid
-    candidates = _capture_records(scene)
+    candidates = _capture_records(scene, static_only=static_cache_only)
     for obj in scene.objects:
-        for key, uid in _live_capture_keys(obj).items():
+        for key, uid in _live_capture_keys(obj, static_only=static_cache_only).items():
             if key in candidates and candidates[key] != uid:
                 candidates[key] = None
             else:
                 candidates[key] = uid
+    if static_cache_only:
+        # This runs from an operator poll during redraw. Restrict the ownership
+        # checks to present static files or arrays before resolving paths.
+        candidates = {
+            key: uid for key, uid in candidates.items()
+            if uid and _safe_capture_key(key)
+            and (key in _static_deform_cache or os.path.exists(get_pc2_path(key)))
+        }
+        if not candidates:
+            return set()
     foreign = set()
     for other_scene in bpy.data.scenes:
         if other_scene == scene:
             continue
-        foreign.update(_capture_records(other_scene))
+        foreign.update(_capture_records(other_scene, static_only=static_cache_only))
         for obj in other_scene.objects:
-            foreign.update(_live_capture_keys(obj))
+            foreign.update(_live_capture_keys(obj, static_only=static_cache_only))
     # Rebuild all indexes for THIS synchronous read. No cross-draw cache and no
     # skipped ownership gate: duplicate UUIDs, linked/shared objects, foreign
     # scenes, recorded orphans, and every mesh-cache path retain their meaning.
+    candidate_uids = set(candidates.values())
     owners_by_uid = {}
     referenced_paths = set()
     for obj in bpy.data.objects:
-        owners_by_uid.setdefault(get_object_uuid(obj), []).append(obj)
+        uid = get_object_uuid(obj)
+        if uid in candidate_uids:
+            owners_by_uid.setdefault(uid, []).append(obj)
         for mod in obj.modifiers:
             # Original call is _mesh_output_path_shared(path, owner, None):
             # no real modifier can be the exempt None, including owner's own.
@@ -2022,6 +2033,28 @@ def get_pin_anim_cache(obj, vg_name: str):
     if key not in _pin_anim_cache:
         load_pin_anim_cache(key)
     return _pin_anim_cache.get(key)
+
+
+def peek_pin_anim_frame_count(obj, vg_name: str) -> int:
+    """Read the displayed count without loading the pin's vertex samples."""
+    key = pin_anim_pc2_key(obj, vg_name)
+    cache = _pin_anim_cache.get(key)
+    if cache is not None:
+        return int(cache.shape[0])
+    try:
+        with open(get_pc2_path(key), "rb") as handle:
+            header = handle.read(PC2_HEADER_SIZE)
+            if len(header) != PC2_HEADER_SIZE:
+                return 0
+            magic, version, vertices, _, _, frames = struct.unpack("<12siiffi", header)
+            if magic != PC2_HEADER or version != PC2_VERSION or vertices < 1 or frames < 1:
+                return 0
+            # Match the array loader's expected payload length. Stat the open
+            # file so a concurrent replacement cannot supply its size.
+            expected_size = PC2_HEADER_SIZE + frames * vertices * FRAME_VERTEX_SIZE
+            return frames if os.fstat(handle.fileno()).st_size == expected_size else 0
+    except OSError:
+        return 0
 
 
 def remove_pin_anim_pc2(obj, vg_name: str, scene=None, *, allow_missing=False):

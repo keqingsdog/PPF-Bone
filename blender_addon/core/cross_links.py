@@ -123,7 +123,7 @@ def _link_paused(bones):
     return any(not bone.ppf_bone_physics.enabled for bone in bones)
 
 
-def endpoint(context, arm, bone_uuid, bone_index=None, proxy_counts=None, *, validate_pose=True):
+def endpoint(context, arm, bone_uuid, bone_index=None, proxy_counts=None, *, validate_pose=True, owner_lookup=None):
     from ..models.bone_bindings import validate_proxy_owner, _owned_group, bone_world_frame_scale
     b=_resolve_bone(arm,bone_uuid,bone_index);s=b.ppf_bone_physics
     if not s.enabled:raise ValueError(b.name+'：端点未参与物理')
@@ -149,20 +149,20 @@ def endpoint(context, arm, bone_uuid, bone_index=None, proxy_counts=None, *, val
     if validate_pose:bone_world_frame_scale(arm,b)
     if s.proxy is None or context.scene.objects.get(s.proxy.name)!=s.proxy:
         raise ValueError(b.name+'：缺少当前场景的物理代理')
-    group=_owned_group(s,'SOLID' if s.physical_model=='SOFT' else 'PDRD')
+    group=(owner_lookup or _owned_group)(s,'SOLID' if s.physical_model=='SOFT' else 'PDRD')
     if group is None or not group.active or not any(a.uuid==s.body_uuid and a.included for a in group.assigned_objects):
         raise ValueError(b.name+'：端点材质或参与绑定失效')
     return b,group
 
 
-def status(context, arm, row, bone_index=None, proxy_counts=None):
+def status(context, arm, row, bone_index=None, proxy_counts=None, owner_lookup=None):
     """Read-only diagnostic; no cleanup or binding/name mutation from UI draw."""
     try:
         a,b=_link_bones(arm,row.bone_a_uuid,row.bone_b_uuid,bone_index)
         if _link_paused((a,b)):
             return a.name+' ↔ '+b.name+'（端点物理已停用）', ''
         require_ready(context,arm,writable=False,allow_edit=True)
-        a,_=endpoint(context,arm,row.bone_a_uuid,bone_index,proxy_counts,validate_pose=False);b,_=endpoint(context,arm,row.bone_b_uuid,bone_index,proxy_counts,validate_pose=False)
+        a,_=endpoint(context,arm,row.bone_a_uuid,bone_index,proxy_counts,validate_pose=False,owner_lookup=owner_lookup);b,_=endpoint(context,arm,row.bone_b_uuid,bone_index,proxy_counts,validate_pose=False,owner_lookup=owner_lookup)
         return a.name+' ↔ '+b.name, ''
     except ValueError as exc:return row.bone_a_name+' ↔ '+row.bone_b_name, str(exc)
 
