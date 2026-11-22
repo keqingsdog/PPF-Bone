@@ -311,7 +311,7 @@ def _validate_source_action_proofs(tx, *, permitted_bindings=()):
                     raise ValueError('原数据或形态键的Action绑定已改变；未恢复。')
 
 
-def _validate_source_graph_proofs(tx):
+def _validate_source_graph_proofs(tx, *, original_meshes=None):
     from . import recovery_anim_graph
     if tx.get('source_graph_proof_schema') != 2:
         raise ValueError('旧记录缺少动画依赖证明；请保留烘焙与源动画。')
@@ -321,7 +321,7 @@ def _validate_source_graph_proofs(tx):
         obj=row.get('obj')
         if obj is None:continue
         owners.append(obj)
-        data=getattr(obj,'data',None)
+        data=original_meshes.get(obj, obj.data) if original_meshes else getattr(obj,'data',None)
         if data is not None:owners.append(data)
         # Full baking can create a new Key; only an author Key existing in the
         # pre-bake backup belongs to the source dependency proof.

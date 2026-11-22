@@ -2164,5 +2164,12 @@
   "Shape-key conflicts require review; invoke Bake All again: {conflicts}": "대상 또는 충돌이 변경되었습니다. 전체 베이크를 다시 확인하세요: {conflicts}",
   "Skipped shape-key conflicts: {conflicts}": "셰이프 키 충돌 대상을 건너뛰었습니다: {conflicts}",
   "Bake targets or conflicts changed; reopen Bake All to review.": "대상 또는 충돌이 변경되었습니다. 전체 베이크를 다시 여세요.",
-  "No remaining animation to bake; skipped: {conflicts}": "베이크할 애니메이션이 남지 않았습니다. 건너뜀: {conflicts}"
+  "No remaining animation to bake; skipped: {conflicts}": "베이크할 애니메이션이 남지 않았습니다. 건너뜀: {conflicts}",
+  "No eligible animation remains to bake.": "베이크할 애니메이션이 남아 있지 않습니다.",
+  "No eligible animation to bake; soft STATIC meshes are skipped.": "베이크할 대상이 없습니다. 소프트 제약 STATIC 메시를 건너뜁니다.",
+  "Skipped soft STATIC meshes: {objects}": "소프트 제약 STATIC 메시를 건너뛰었습니다: {objects}",
+  "Bake soft STATIC meshes": "소프트 제약 STATIC 메시 베이크",
+  "No readable animation cache: {name}": "읽을 수 있는 애니메이션 캐시 없음: {name}",
+  "Baking uses a result mesh; original shape-key animation is inactive.": "베이크 결과 메시를 사용하며 원본 셰이프 키 애니메이션은 비활성화됩니다.",
+  "Original shape keys, keyframes and drivers are preserved for restore.": "원본 셰이프 키, 키프레임 및 드라이버는 복원을 위해 보존됩니다."
 }

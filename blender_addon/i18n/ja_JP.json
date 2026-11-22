@@ -2164,5 +2164,12 @@
   "Shape-key conflicts require review; invoke Bake All again: {conflicts}": "対象または競合が変わりました。すべてベイクを再確認してください: {conflicts}",
   "Skipped shape-key conflicts: {conflicts}": "シェイプキーが競合する対象をスキップしました: {conflicts}",
   "Bake targets or conflicts changed; reopen Bake All to review.": "対象または競合が変わりました。すべてベイクを開き直してください。",
-  "No remaining animation to bake; skipped: {conflicts}": "ベイクする残りのアニメーションはありません。スキップ: {conflicts}"
+  "No remaining animation to bake; skipped: {conflicts}": "ベイクする残りのアニメーションはありません。スキップ: {conflicts}",
+  "No eligible animation remains to bake.": "ベイクできるアニメーションが残っていません。",
+  "No eligible animation to bake; soft STATIC meshes are skipped.": "ベイク対象がありません。ソフト制約の STATIC メッシュはスキップされます。",
+  "Skipped soft STATIC meshes: {objects}": "ソフト制約の STATIC メッシュをスキップしました: {objects}",
+  "Bake soft STATIC meshes": "ソフト制約 STATIC メッシュをベイク",
+  "No readable animation cache: {name}": "読み取り可能なアニメーションキャッシュなし: {name}",
+  "Baking uses a result mesh; original shape-key animation is inactive.": "ベイク結果のメッシュを使用し、元のシェイプキーアニメーションは無効になります。",
+  "Original shape keys, keyframes and drivers are preserved for restore.": "元のシェイプキー、キーフレーム、ドライバーは復元用に保持されます。"
 }

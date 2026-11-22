@@ -84,7 +84,69 @@ def _validate_full_source_graph_proofs(tx):
         copy = dict(proof.items());copy['owners'] = rows;proofs.append(copy)
     if len(matched)!=len(created):raise ValueError('Mesh Key original graph proof is missing')
     view = dict(tx.items());view['source_graph_proofs'] = proofs
-    single._validate_source_graph_proofs(view)
+    single._validate_source_graph_proofs(view, original_meshes=_original_meshes(tx))
+
+
+def _original_meshes(tx):
+    """Bind detached originals to the exact pre-bake Mesh and Key IDs."""
+    originals = {}
+    for row in tx.get('items', []):
+        if not row.get('retains_original_mesh'):
+            continue
+        obj, backup = row.get('obj'), row.get('backup')
+        key = row.get('original_mesh_key')
+        if (obj is None or not isinstance(backup, bpy.types.Mesh)
+                or key is None or backup.shape_keys != key
+                or obj.data != row.get('data') or obj.data == backup
+                or obj in originals):
+            raise ValueError('Original mesh or its working bake binding changed; recovery retained')
+        originals[obj] = backup
+    return originals
+
+
+def prepare_working_mesh(obj, entry):
+    """Create the bake output without touching the original mesh or its Key."""
+    row = entry['original_mesh_row']
+    source = row['backup']
+    if obj != row['obj'] or obj.data != source or source.shape_keys != row['original_mesh_key']:
+        raise ValueError('Original mesh changed before preparing the bake output')
+    working = source.copy()
+    if working.shape_keys is None or working.shape_keys == source.shape_keys:
+        if working.users == 0:
+            bpy.data.meshes.remove(working)
+        raise ValueError('Could not create an independent bake mesh')
+    try:
+        temporary = bpy.data.objects.new("PPF bake mesh preparation", working)
+        try:
+            temporary.shape_key_clear()
+        finally:
+            bpy.data.objects.remove(temporary)
+        if working.shape_keys is not None:
+            raise ValueError('Could not clear the copied mesh shape keys')
+        entry['working_base_signature'] = data_signature(working)
+    except BaseException:
+        if working.users == 0:
+            bpy.data.meshes.remove(working)
+        raise
+    row['data'] = working
+    obj.data = working
+
+
+def working_mesh_unchanged(entry):
+    row = entry['original_mesh_row']
+    working = row['data']
+    obj = row.get('obj')
+    return (obj is not None and obj.data == working and working != row['backup']
+            and data_signature(working, include_shape_keys=False) == entry.get('working_base_signature'))
+
+
+def rollback_working_mesh(row):
+    """Rebind only while the transaction still owns the object binding."""
+    source, obj = row['backup'], row.get('obj')
+    if obj is not None and obj.data == row['data'] and obj.data != source:
+        obj.data = source
+    if obj is not None and obj.data == source:
+        source.use_fake_user = row['original_mesh_fake_user']
 
 
 def begin(scene, queue):
@@ -310,13 +372,21 @@ def _begin(scene, queue, rows):
         obj=get_object_by_uuid(entry['obj_uuid'])
         if obj is None:raise ValueError('烘焙对象已删除。')
         single._recheck_source_owners(owners,proofs,graph)
-        backup=obj.data.copy();backup.use_fake_user=True
+        retain_original = bool(entry.get('use_working_mesh'))
+        backup = obj.data if retain_original else obj.data.copy()
+        original_fake_user = backup.use_fake_user
+        backup.use_fake_user=True
         action=obj.animation_data.action if obj.animation_data else None
         was_fake=actions.get(action.as_pointer(),False) if action else False
         row=dict(obj=obj,data=obj.data,backup=backup,mods=[dict(name=m.name,view=m.show_viewport,render=m.show_render) for m in obj.modifiers])
         if action:row['action']=action;row['action_was_fake']=was_fake
         rows.append(row)
-        key_binding=_capture_source_key_binding(obj,backup)
+        if retain_original:
+            row['retains_original_mesh'] = True
+            row['original_mesh_key'] = backup.shape_keys
+            row['original_mesh_fake_user'] = original_fake_user
+            entry['original_mesh_row'] = row
+        key_binding=None if retain_original else _capture_source_key_binding(obj,backup)
         if key_binding is not None:row['key_source_binding']=key_binding
         curve_binding=_capture_curve_source_binding(obj,backup)
         if curve_binding is not None:row['curve_source_binding']=curve_binding
@@ -331,7 +401,7 @@ def _begin(scene, queue, rows):
         if action:row['action']=action;row['action_was_fake']=was_fake
         slot=single._slot(obj)
         if slot:row['slot_handle']=slot[0];row['slot_identifier']=slot[1]
-        row['source_signature']=data_signature(backup)
+        row['source_signature']=_source_mesh_signature(row)
     from .facade import runner
     from . import recovery_anim_graph
     graphs=[graph]
@@ -392,16 +462,42 @@ def _author_layers(data):
     return result
 
 
-def data_signature(data):
+def _animated_shape_paths(key):
+    if key.animation_data is None:
+        return set()
+    from ..ui.dynamics.bake_ops import _single_animation_channels
+    return {curve.data_path for _, curve in _single_animation_channels(key) if not curve.mute} | {
+        curve.data_path for curve in key.animation_data.drivers if not curve.mute
+    }
+
+
+def _shape_settings(key, animated):
+    properties = _rna_values(key)
+    if 'eval_time' in animated:
+        properties.pop('eval_time', None)
+    blocks = []
+    for block in key.key_blocks:
+        settings = _rna_values(block)
+        if block.path_from_id('value') in animated:
+            settings.pop('value', None)
+        blocks.append({'properties': settings, 'relative': block.relative_key.name if block.relative_key else None,
+                       'custom': _custom_values(block)})
+    return {'properties': properties, 'custom': {k: _plain_value(key[k]) for k in key.keys()}, 'blocks': blocks}
+
+
+def _source_mesh_signature(row):
+    backup = row['backup']
+    return data_signature(backup, source_shape_graph=bool(row.get('retains_original_mesh')))
+
+
+def data_signature(data, *, source_shape_graph=False, include_shape_keys=True):
     if isinstance(data,bpy.types.Mesh):
-        shape=data.shape_keys
+        shape=data.shape_keys if include_shape_keys else None
+        animated = _animated_shape_paths(shape) if shape and source_shape_graph else ()
         return json.dumps([single._mesh_topology(data),[list(v.co) for v in data.vertices],
             [[k.name,[list(v.co) for v in k.data]] for k in shape.key_blocks] if shape else [],
             single._action_signature(shape) if shape else '',
-            {'properties':_rna_values(shape),'custom':{k:_plain_value(shape[k]) for k in shape.keys()},
-             'blocks':[{'properties':_rna_values(k),'relative':k.relative_key.name if k.relative_key else None,
-                        'custom':_custom_values(k)}
-                       for k in shape.key_blocks]} if shape else {},_author_layers(data)],sort_keys=True)
+            _shape_settings(shape, animated) if shape else {},_author_layers(data)],sort_keys=True)
     rows=[]
     for s in data.splines:
         rows.append([s.type,[[list(v.co),list(v.handle_left),list(v.handle_right),v.handle_left_type,v.handle_right_type] for v in s.bezier_points]
@@ -522,6 +618,8 @@ def commit(scene, tx, queue):
     bone=next((e for e in queue if e['obj_type']=='BONE'),None)
     tx['bone']=single._bone_row(bone) if bone else {}
     relevant=single._recovery_owners([r['obj'] for r in tx['items']]+[r['arm'] for r in tx['bone'].get('arms',[])])
+    for backup in _original_meshes(tx).values():
+        relevant.extend((backup, backup.shape_keys))
     tx['source_action_proofs']=[p for p in tx['source_action_proofs'] if p['obj'] in relevant]
     for row in tx['bone'].get('arms', []):
         row['static_scale_proof_schema']=1
@@ -570,7 +668,12 @@ def _validate_current_key_graph(tx):
 
 def _validate_backup_key_graph(tx):
     """Do not restore or release an uncertified backup Key animation graph."""
+    originals = _original_meshes(tx)
     for row in tx.get('items', []):
+        if row.get('obj') in originals:
+            # An exact retained original is verified against the source graph
+            # and is never released as a generated backup.
+            continue
         backup = row.get('backup')
         key = getattr(backup, 'shape_keys', None) if backup is not None else None
         ad = key.animation_data if key is not None else None
@@ -590,7 +693,7 @@ def _validate_backup_source_signatures(tx):
         backup=row.get('backup');expected=row.get('source_signature')
         if backup is None or not isinstance(expected,str) or not expected:
             raise ValueError('原始备份或数据指纹缺失；未修改场景。')
-        if data_signature(backup)!=expected:
+        if _source_mesh_signature(row)!=expected:
             raise ValueError('原始备份数据或作者动画已改变；未进入恢复或切换帧。')
 
 
@@ -711,7 +814,7 @@ def _restore(scene, validation_signatures):
         if obj is None or backup is None or obj.data!=row['data']:raise ValueError('烘焙对象或数据已替换，未覆盖当前工程。')
         if 'action' in row and row.get('action') is None:raise ValueError('原物体动画已删除，未修改场景。')
         if not single._valid_action_slot(row.get('action'),row):raise ValueError('原物体动画槽已删除，未修改场景。')
-        if data_signature(backup)!=validation_signatures[index]:raise ValueError('原始数据或作者动画已改变，未修改场景。')
+        if _source_mesh_signature(row)!=validation_signatures[index]:raise ValueError('原始数据或作者动画已改变，未修改场景。')
         if row.get('cache_path') and not __import__('os').path.isfile(row['cache_path']):raise ValueError('原模拟缓存已被删除，未修改当前工程。')
         if row.get('cache_path'):
             expected=row.get('cache_sha256')
@@ -740,7 +843,8 @@ def _restore(scene, validation_signatures):
         single._validate_static_scales(row)
     # Everything is admitted before any source data is reassigned.
     for row in tx['items']:
-        obj=row['obj'];obj.data=row['backup'];row['backup'].use_fake_user=False
+        obj=row['obj'];obj.data=row['backup']
+        row['backup'].use_fake_user=bool(row.get('original_mesh_fake_user', False))
         if row.get('action') is not None or obj.animation_data is not None:
             single._assign(obj,row.get('action'),single._slot_row(row))
         if row.get('action'):row['action'].use_fake_user=row['action_was_fake']
@@ -837,6 +941,8 @@ def _keep_curve_outputs(scene, tx):
             if legacy:obj[curve_output.LEGACY_DETACHED_KEY]=key
             else:curve_output.mark_detached(obj)
             pc2.unload_curve_cache(key)
+        for source in _original_meshes(tx).values():
+            source.use_fake_user = True
         scene['ppf_single_bake_session_stale']=True
         del scene[KEY]
     except BaseException as exc:
@@ -895,7 +1001,10 @@ def _discard(scene):
             if obj is not None and obj.as_pointer() in targets:group.assigned_objects.remove(i)
     for row in tx['items']:
         if row.get('backup'):
-            row['backup'].use_fake_user=not single._release_backup_safe(scene,tx,row['backup'],own_key=KEY)
+            if row.get('retains_original_mesh'):
+                row['backup'].use_fake_user = True
+            else:
+                row['backup'].use_fake_user=not single._release_backup_safe(scene,tx,row['backup'],own_key=KEY)
         obj=row.get('obj')
         if obj is None:continue
         unchanged=(obj.data==row['data'] and data_signature(obj.data)==row['signature'] and single._action_signature(obj)==row['object_action'])
@@ -921,5 +1030,9 @@ def suspend_object(obj):
 
 def discard_pending(tx, *, restore_source_flags=True):
     for row in tx.get('items',[]):
-        single.release_backup(row.get('backup'))
+        if row.get('retains_original_mesh'):
+            if row.get('obj') is not None and row['obj'].data == row['backup']:
+                row['backup'].use_fake_user = row['original_mesh_fake_user']
+        else:
+            single.release_backup(row.get('backup'))
         if restore_source_flags and row.get('action'):row['action'].use_fake_user=row['action_was_fake']

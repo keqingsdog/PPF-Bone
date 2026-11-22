@@ -48,7 +48,15 @@ def _collect(job):
     tx = job.get('recovery') or {}
     for index, row in enumerate(tx.get('items', [])):
         add(row.get('action'), 'item/%d/source_action' % index)
-        add(row.get('backup'), 'item/%d/backup_data' % index)
+        # A retained original is already protected by its object binding or
+        # fake user. An additional Text reference would make a retry appear
+        # to use shared geometry after the original is rebound.
+        if not row.get('retains_original_mesh'):
+            add(row.get('backup'), 'item/%d/backup_data' % index)
+        else:
+            obj, working = row.get('obj'), row.get('data')
+            if working != row.get('backup') and (obj is None or obj.data != working):
+                add(working, 'item/%d/detached_working_data' % index)
         add(row.get('key_source_binding', {}).get('source'), 'item/%d/key_source_action' % index)
     for index, proof in enumerate(tx.get('source_action_proofs', [])):
         add(proof.get('action'), 'proof/%d/source_action' % index, required=True)

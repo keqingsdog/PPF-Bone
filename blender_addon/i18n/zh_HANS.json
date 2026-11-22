@@ -2490,5 +2490,12 @@
   "Shape-key conflicts require review; invoke Bake All again: {conflicts}": "烘焙目标或形态键冲突已改变，请重新打开全部烘焙确认：{conflicts}",
   "Skipped shape-key conflicts: {conflicts}": "已跳过形态键冲突对象：{conflicts}",
   "Bake targets or conflicts changed; reopen Bake All to review.": "烘焙目标或冲突已改变，请重新打开全部烘焙以检查。",
-  "No remaining animation to bake; skipped: {conflicts}": "没有剩余动画可烘焙；已跳过：{conflicts}"
+  "No remaining animation to bake; skipped: {conflicts}": "没有剩余动画可烘焙；已跳过：{conflicts}",
+  "No eligible animation remains to bake.": "没有可烘焙的剩余动画。",
+  "No eligible animation to bake; soft STATIC meshes are skipped.": "没有可烘焙的动画；启用软约束的静态网格将被跳过。",
+  "Skipped soft STATIC meshes: {objects}": "已跳过启用软约束的静态网格：{objects}",
+  "Bake soft STATIC meshes": "烘焙启用软约束的静态网格",
+  "No readable animation cache: {name}": "无可读取的动画缓存：{name}",
+  "Baking uses a result mesh; original shape-key animation is inactive.": "烘焙将使用结果网格，原始形态键动画不再生效。",
+  "Original shape keys, keyframes and drivers are preserved for restore.": "原始形态键、关键帧和驱动器会保留，以便恢复。"
 }

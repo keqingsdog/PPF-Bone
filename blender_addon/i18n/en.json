@@ -2436,5 +2436,12 @@
   "Shape-key conflicts require review; invoke Bake All again: {conflicts}": "Shape-key conflicts require review; invoke Bake All again: {conflicts}",
   "Skipped shape-key conflicts: {conflicts}": "Skipped shape-key conflicts: {conflicts}",
   "Bake targets or conflicts changed; reopen Bake All to review.": "Bake targets or conflicts changed; reopen Bake All to review.",
-  "No remaining animation to bake; skipped: {conflicts}": "No remaining animation to bake; skipped: {conflicts}"
+  "No remaining animation to bake; skipped: {conflicts}": "No remaining animation to bake; skipped: {conflicts}",
+  "No eligible animation remains to bake.": "No eligible animation remains to bake.",
+  "No eligible animation to bake; soft STATIC meshes are skipped.": "No eligible animation to bake; soft STATIC meshes are skipped.",
+  "Skipped soft STATIC meshes: {objects}": "Skipped soft STATIC meshes: {objects}",
+  "Bake soft STATIC meshes": "Bake soft STATIC meshes",
+  "No readable animation cache: {name}": "No readable animation cache: {name}",
+  "Baking uses a result mesh; original shape-key animation is inactive.": "Baking uses a result mesh; original shape-key animation is inactive.",
+  "Original shape keys, keyframes and drivers are preserved for restore.": "Original shape keys, keyframes and drivers are preserved for restore."
 }

@@ -356,16 +356,84 @@ def _validate_curve_bake_cache(obj, cache):
         raise ValueError(f"Curve '{obj.name}' cache has non-finite coordinates")
 
 
-def _build_queue(context, *, group_index: int | None = None, skipped=None) -> list:
+def _soft_static_exclusions(context, group_index=None):
+    """Find soft STATIC meshes without resolving or changing group references."""
+    from ...core.uuid_registry import get_object_by_uuid
+    from ...models.groups import get_addon_data
+    from ..state import N_MAX_GROUPS
+    data = get_addon_data(context.scene)
+    indices = range(N_MAX_GROUPS) if group_index is None else (group_index,)
+    result = {}
+    for gi in indices:
+        group = getattr(data, f"object_group_{gi}", None)
+        if (group is None or not group.active or group.object_type != "STATIC"
+                or not group.enable_soft_constraint):
+            continue
+        for assigned in group.assigned_objects:
+            obj = get_object_by_uuid(assigned.uuid)
+            if obj is not None and obj.type == "MESH":
+                result[assigned.uuid] = obj.name
+    return result
+
+
+def _soft_static_candidates(excluded):
+    """Return readable soft-static outputs and their confirmation signatures."""
+    from ...core.uuid_registry import get_object_by_uuid
+    from ...core.pc2 import object_pc2_key_readonly
+    result = {}
+    for uid in excluded:
+        obj = get_object_by_uuid(uid)
+        if obj is None:
+            continue
+        key = object_pc2_key_readonly(obj)
+        path = get_pc2_path(key) if key else ""
+        if not path or not os.path.exists(path):
+            path = get_pc2_path(obj.name)
+        try:
+            frames = read_pc2_frame_count(path)
+            verts = read_pc2_n_verts(path)
+            stat = os.stat(path)
+        except (OSError, ValueError, struct.error):
+            continue
+        if frames > 0 and verts == len(obj.data.vertices) and stat.st_size >= 32 + frames * verts * 12:
+            result[uid] = (path, frames, verts, stat.st_size, stat.st_mtime_ns,
+                           tuple(modifiers_above_cache(obj)))
+    return result
+
+
+def _bake_group_signature(context, group_index=None):
+    from ...models.groups import get_addon_data
+    from ..state import N_MAX_GROUPS
+    data = get_addon_data(context.scene)
+    indices = range(N_MAX_GROUPS) if group_index is None else (group_index,)
+    groups = []
+    for gi in indices:
+        group = getattr(data, f"object_group_{gi}", None)
+        if group is not None and group.active:
+            groups.append((gi, group.object_type, group.enable_soft_constraint,
+                           group.assigned_objects_index if group_index is not None else None,
+                           tuple(a.uuid for a in group.assigned_objects)))
+    return tuple(groups)
+
+
+def _build_queue(context, *, group_index: int | None = None, skipped=None, include_soft=False) -> list:
     """Return job entries for every assigned MESH/CURVE in scope. The
     "all groups" case (``group_index is None``) queues every assigned
-    object in every active group — STATIC colliders and fcurve-driven
-    statics included — so finalize can purge them all from their groups
+    object in every active group except soft STATIC meshes, so finalize can purge them from their groups
     as a terminal Bake step. Entries without a readable cache get
     ``n_frames == 0`` and skip keyframing but still reach finalize for
     modifier + group cleanup."""
     from ...core.uuid_registry import resolve_assigned
     queue: list = []
+    excluded = _soft_static_exclusions(context, group_index)
+    admitted = _soft_static_candidates(excluded) if include_soft else {}
+
+    def append_entry(obj, gi, assigned):
+        entry = _make_entry(obj, gi, assigned.uuid, assigned.name)
+        keys = obj.data.shape_keys if obj.type == "MESH" else None
+        if assigned.uuid in admitted and keys is not None:
+            entry["use_working_mesh"] = True
+        queue.append(entry)
 
     if group_index is not None:
         group = get_group_from_index(context.scene, group_index)
@@ -374,9 +442,11 @@ def _build_queue(context, *, group_index: int | None = None, skipped=None) -> li
         idx = group.assigned_objects_index
         if 0 <= idx < len(group.assigned_objects):
             assigned = group.assigned_objects[idx]
+            if (assigned.uuid in excluded and assigned.uuid not in admitted) or (skipped and assigned.uuid in skipped):
+                return queue
             obj = resolve_assigned(assigned)
             if obj is not None and obj.type in ("MESH", "CURVE"):
-                queue.append(_make_entry(obj, group_index, assigned.uuid, assigned.name))
+                append_entry(obj, group_index, assigned)
         return queue
 
     from ...models.groups import get_addon_data
@@ -388,12 +458,12 @@ def _build_queue(context, *, group_index: int | None = None, skipped=None) -> li
         if group is None or not group.active:
             continue
         for assigned in group.assigned_objects:
-            if skipped and assigned.uuid in skipped:
+            if (assigned.uuid in excluded and assigned.uuid not in admitted) or (skipped and assigned.uuid in skipped):
                 continue
             obj = resolve_assigned(assigned)
             if obj is None or obj.type not in ("MESH", "CURVE"):
                 continue
-            queue.append(_make_entry(obj, gi, assigned.uuid, assigned.name))
+            append_entry(obj, gi, assigned)
     from ...core import bone_bake
     bones=bone_bake.make_entry(context.scene)
     if bones is not None:queue.insert(0,bones)
@@ -411,11 +481,14 @@ def _preview_all(context):
     from ...models.groups import get_addon_data
     from ..state import N_MAX_GROUPS
     skipped, eligible, seen = {}, [], set()
+    excluded = _soft_static_exclusions(context)
     for gi in range(N_MAX_GROUPS):
         group = getattr(get_addon_data(context.scene), f"object_group_{gi}", None)
         if group is None or not group.active:
             continue
         for assigned in group.assigned_objects:
+            if assigned.uuid in excluded:
+                continue
             obj = get_object_by_uuid(assigned.uuid)
             if obj is None or obj.type not in ("MESH", "CURVE"):
                 continue
@@ -441,13 +514,23 @@ def _preview_all(context):
                 skipped[assigned.uuid] = f"{obj.name} [{preview}]"
             else:
                 eligible.append(obj)
-    return skipped, eligible
+    return skipped, eligible, excluded
 
 
-def _preview_signature(skipped, eligible):
+def _preview_signature(skipped, eligible, excluded):
     return (tuple(sorted(skipped.items())),
             tuple((obj.as_pointer(), tuple(modifiers_above_cache(obj)))
-                  for obj in eligible))
+                  for obj in eligible), tuple(sorted(excluded.items())))
+
+
+def _single_soft_preview(context, group_index):
+    group = get_group_from_index(context.scene, group_index)
+    if group is None or not (0 <= group.assigned_objects_index < len(group.assigned_objects)):
+        return {}, {}
+    uid = group.assigned_objects[group.assigned_objects_index].uuid
+    excluded = _soft_static_exclusions(context, group_index)
+    excluded = {uid: excluded[uid]} if uid in excluded else {}
+    return excluded, _soft_static_candidates(excluded)
 
 
 def _check_mesh_shape_keys(queue: list) -> list[str]:
@@ -457,6 +540,8 @@ def _check_mesh_shape_keys(queue: list) -> list[str]:
     from ...core.uuid_registry import get_object_by_uuid
     blockers: list[str] = []
     for entry in queue:
+        if entry.get("use_working_mesh"):
+            continue
         if entry["obj_type"] != "MESH":
             continue
         # Entries with n_frames == 0 only need a modifier sweep — we
@@ -772,12 +857,16 @@ def _start_job(queue: list, kind: str) -> tuple[bool, str]:
     for entry in queue:
         entry['_owner_scene'] = origin_scene
     from ...core import full_bake_restore
-    recovery = full_bake_restore.begin(origin_scene, queue)
+    try:
+        recovery = full_bake_restore.begin(origin_scene, queue)
+    except (ValueError, RuntimeError, OSError) as exc:
+        return False, str(exc)
     from ...core import source_materials
     source_context = dict(scene=origin_scene, objects=queue, recovery=recovery, source_archive=None)
     try:
         source_materials.retain(source_context)
     except Exception as exc:
+        full_bake_restore.discard_pending(recovery)
         return False, str(exc)
     prepared = []
     try:
@@ -796,6 +885,8 @@ def _start_job(queue: list, kind: str) -> tuple[bool, str]:
                     raise ValueError("Mesh bake target disappeared")
                 if _bake_geometry_users(obj) > 1 or len(obj.users_scene) > 1:
                     raise ValueError("Mesh has shared data or Scene ownership")
+                if entry.get("use_working_mesh"):
+                    full_bake_restore.prepare_working_mesh(obj, entry)
                 if obj.data.shape_keys is not None:
                     prepared.append((obj, entry))
                     _begin_mesh_action(obj, entry)
@@ -811,6 +902,9 @@ def _start_job(queue: list, kind: str) -> tuple[bool, str]:
         from ...core import prepared_materials
         failed_context = dict(source_context, prepared=prepared,
                               finalize_error=str(exc), source_holder_error=source_holder_error)
+        for entry in queue:
+            if entry.get("original_mesh_row") is not None:
+                _rollback_staged_mesh(entry)
         try:
             archive = prepared_materials.retain(failed_context)
         except Exception as retain_exc:
@@ -1223,6 +1317,20 @@ def _finalize_job(context) -> tuple[int, int]:
         raise RuntimeError('Bake finalization failed: ' + detail) from exc
 
 
+def _rollback_staged_mesh(entry):
+    from ...core import full_bake_restore
+    if not full_bake_restore.working_mesh_unchanged(entry):
+        return
+    row = entry["original_mesh_row"]
+    obj = row["obj"]
+    if entry.get("mesh_created_key_transaction") is not None:
+        if not _abort_mesh_entry(obj, entry):
+            return
+    elif obj.data.shape_keys is not None:
+        return
+    full_bake_restore.rollback_working_mesh(row)
+
+
 def _abort_job() -> None:
     """Roll back uncommitted entries; retain terminal or uncertain baked output.
 
@@ -1262,7 +1370,10 @@ def _abort_job() -> None:
                 _abort_curve_entry(None, entry)
             continue
         if entry["obj_type"] == "MESH":
-            _abort_mesh_entry(obj, entry)
+            if entry.get("original_mesh_row") is not None:
+                _rollback_staged_mesh(entry)
+            else:
+                _abort_mesh_entry(obj, entry)
         else:
             _abort_curve_entry(obj, entry)
 
@@ -1350,7 +1461,7 @@ def _abort_created_mesh_keys(obj, entry, tx):
                 return
             for block in reversed(list(key.key_blocks)):
                 obj.shape_key_remove(block)
-            return
+            return obj.data.shape_keys is None
         # Public KeyBlock RNA can reuse addresses after deletion. If any
         # author-visible state diverged, preserve the whole uncertain Key.
         unchanged = (author_action == owned_action and author_slot == tx["slot"]
@@ -1583,8 +1694,7 @@ def _validate_mesh_action(obj, entry):
 def _abort_mesh_entry(obj, entry):
     created = entry.pop("mesh_created_key_transaction", None)
     if created is not None:
-        _abort_created_mesh_keys(obj, entry, created)
-        return
+        return _abort_created_mesh_keys(obj, entry, created)
     tx = entry.pop("mesh_action_transaction", None)
     if tx is None:
         if obj is not None:
@@ -1873,6 +1983,20 @@ def _draw_bake_dialog(layout, prompt: str, removable: list) -> None:
         )
 
 
+def _draw_soft_static_options(layout, operator):
+    excluded = getattr(operator, "_soft_excluded", {})
+    candidates = getattr(operator, "_soft_candidates", {})
+    if not excluded:
+        return
+    box = layout.box()
+    if candidates:
+        box.prop(operator, "bake_soft_static")
+        box.label(text="Baking uses a result mesh; original shape-key animation is inactive.", icon="INFO")
+        box.label(text="Original shape keys, keyframes and drivers are preserved for restore.")
+    for uid, name in excluded.items():
+        box.label(text=name if uid in candidates else iface_("No readable animation cache: {name}").format(name=name))
+
+
 # ---------------------------------------------------------------------------
 # Modal operator mixin (shared between per-object and all-object bakes)
 # ---------------------------------------------------------------------------
@@ -1895,18 +2019,30 @@ class _ModalBakeBase:
             return {"CANCELLED"}
         try:
             if self._kind == "all":
-                skipped, eligible = _preview_all(context)
+                skipped, eligible, excluded = _preview_all(context)
                 confirmed = getattr(self, "_confirmed_skipped", None)
-                signature = _preview_signature(skipped, eligible)
+                candidates = _soft_static_candidates(excluded)
+                signature = (_preview_signature(skipped, eligible, excluded), tuple(sorted(candidates.items())), _bake_group_signature(context))
                 if (skipped and confirmed is None) or (confirmed is not None and getattr(self, "_confirmed_signature", None) != signature):
                     self.report({"ERROR"}, iface_("Bake targets or conflicts changed; reopen Bake All to review."))
                     return {"CANCELLED"}
-                queue = _build_queue(context, skipped=skipped)
-                if skipped and not any(e.get("n_frames", 0) > 0 for e in queue):
-                    self.report({"WARNING"}, iface_("No remaining animation to bake; skipped: {conflicts}").format(conflicts="; ".join(skipped.values())))
+                include_soft = bool(confirmed is not None and self.bake_soft_static)
+                queue = _build_queue(context, skipped=skipped, include_soft=include_soft)
+                if (skipped or excluded) and not any(e.get("n_frames", 0) > 0 for e in queue):
+                    self.report({"INFO"}, iface_("No eligible animation remains to bake."))
                     return {"CANCELLED"}
             else:
-                queue = self._build_queue_for(context)
+                excluded_single, candidates_single = _single_soft_preview(context, self.group_index)
+                confirmed_single = getattr(self, "_confirmed_soft_signature", None)
+                signature_single = (tuple(sorted(excluded_single.items())), tuple(sorted(candidates_single.items())), _bake_group_signature(context, self.group_index))
+                if confirmed_single is not None and confirmed_single != signature_single:
+                    self.report({"ERROR"}, iface_("Bake targets or conflicts changed; reopen Bake All to review."))
+                    return {"CANCELLED"}
+                include_soft = bool(confirmed_single is not None and self.bake_soft_static)
+                queue = _build_queue(context, group_index=self.group_index, include_soft=include_soft)
+                if not queue:
+                    self.report({"INFO"}, iface_("No eligible animation to bake; soft STATIC meshes are skipped."))
+                    return {"CANCELLED"}
         except (OSError, ValueError, struct.error) as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
@@ -1926,6 +2062,10 @@ class _ModalBakeBase:
             return {"CANCELLED"}
         if self._kind == "all" and skipped:
             self.report({"WARNING"}, iface_("Skipped shape-key conflicts: {conflicts}").format(conflicts="; ".join(skipped.values())))
+        if self._kind == "all" and excluded:
+            remaining = {uid: name for uid, name in excluded.items() if not include_soft or uid not in candidates}
+            if remaining:
+                self.report({"INFO"}, iface_("Skipped soft STATIC meshes: {objects}").format(objects="; ".join(remaining.values())))
         wm = context.window_manager
         self._wm = wm
         self._externally_cancelled = False
@@ -2007,6 +2147,7 @@ class OBJECT_OT_BakeAnimation(_ModalBakeBase, Operator):
     bl_options = {"UNDO"}
 
     group_index: _ppf_props.IntProperty(options={'HIDDEN'})  # pyright: ignore
+    bake_soft_static: _ppf_props.BoolProperty(name="Bake soft STATIC meshes", default=False, options={'SKIP_SAVE'})  # pyright: ignore
     _kind = "single"
 
     @classmethod
@@ -2025,9 +2166,23 @@ class OBJECT_OT_BakeAnimation(_ModalBakeBase, Operator):
             return {"CANCELLED"}
         from ...core.uuid_registry import get_object_by_uuid
         try:
+            excluded, candidates = _single_soft_preview(context, self.group_index)
+            self._confirmed_soft_signature = (tuple(sorted(excluded.items())), tuple(sorted(candidates.items())), _bake_group_signature(context, self.group_index))
+            self._soft_candidates = candidates
+            self._soft_excluded = excluded
+            self.bake_soft_static = False
+            if excluded:
+                if not candidates:
+                    self.report({"INFO"}, iface_("No eligible animation to bake; soft STATIC meshes are skipped."))
+                    return {"CANCELLED"}
+                self._removable = _removable_modifiers_for_objs([get_object_by_uuid(uid) for uid in candidates])
+                return context.window_manager.invoke_props_dialog(self, width=520, title="Bake Animation", confirm_text="Bake")
             queue = self._build_queue_for(context)
         except (OSError, ValueError, struct.error) as exc:
             self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        if not queue:
+            self.report({"INFO"}, iface_("No eligible animation to bake; soft STATIC meshes are skipped."))
             return {"CANCELLED"}
         objs = [
             get_object_by_uuid(e["obj_uuid"])
@@ -2042,8 +2197,9 @@ class OBJECT_OT_BakeAnimation(_ModalBakeBase, Operator):
         _draw_bake_dialog(
             self.layout,
             "Bake animation for the selected object?",
-            getattr(self, "_removable", []),
+            getattr(self, "_removable", []) if not getattr(self, "_soft_candidates", {}) or self.bake_soft_static else [],
         )
+        _draw_soft_static_options(self.layout, self)
 
     def _build_queue_for(self, context) -> list:
         return _build_queue(context, group_index=self.group_index)
@@ -2174,6 +2330,7 @@ class SOLVER_OT_BakeAllAnimation(_ModalBakeBase, Operator):
     bl_idname = "solver.bake_all_animation"
     bl_label = "Bake Animation"
     bl_options = {"UNDO"}
+    bake_soft_static: _ppf_props.BoolProperty(name="Bake soft STATIC meshes", default=False, options={'SKIP_SAVE'})  # pyright: ignore
     _kind = "all"
 
     @classmethod
@@ -2193,23 +2350,30 @@ class SOLVER_OT_BakeAllAnimation(_ModalBakeBase, Operator):
             )
             return {"CANCELLED"}
         try:
-            skipped, objs = _preview_all(context)
+            skipped, objs, excluded = _preview_all(context)
+            candidates = _soft_static_candidates(excluded)
         except (OSError, ValueError, struct.error) as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
         self._confirmed_skipped = skipped
-        self._confirmed_signature = _preview_signature(skipped, objs)
+        self._confirmed_excluded = excluded
+        self._confirmed_signature = (_preview_signature(skipped, objs, excluded), tuple(sorted(candidates.items())), _bake_group_signature(context))
+        self._soft_candidates = candidates
+        self._soft_excluded = excluded
+        self.bake_soft_static = False
         self._removable = _removable_modifiers_for_objs(objs)
+        from ...core.uuid_registry import get_object_by_uuid
+        self._soft_removable = _removable_modifiers_for_objs([get_object_by_uuid(uid) for uid in candidates])
         return context.window_manager.invoke_props_dialog(
             self, width=520, title="Bake Animation",
-            confirm_text="Bake Remaining" if skipped else "Bake All",
+            confirm_text="Bake" if candidates else ("Bake Remaining" if skipped or excluded else "Bake All"),
         )
 
     def draw(self, context):
         _draw_bake_dialog(
             self.layout,
             "Bake animation for all objects in active groups?",
-            getattr(self, "_removable", []),
+            getattr(self, "_removable", []) + (getattr(self, "_soft_removable", []) if self.bake_soft_static else []),
         )
         skipped = getattr(self, "_confirmed_skipped", {})
         if skipped:
@@ -2217,6 +2381,7 @@ class SOLVER_OT_BakeAllAnimation(_ModalBakeBase, Operator):
             box.label(text="These objects have shape-key conflicts and will be skipped:", icon="ERROR")
             for line in skipped.values():
                 box.label(text=line)
+        _draw_soft_static_options(self.layout, self)
 
     def _build_queue_for(self, context) -> list:
         return _build_queue(context, group_index=None)

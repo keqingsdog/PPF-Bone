@@ -60,8 +60,14 @@ def _collect(job):
             missing.append(role + '/deleted_during_read')
     tx = job.get('recovery') or {}
     for i, row in enumerate(tx.get('items', [])):
-        owner(row.get('data'), 'item/%d/original_data' % i)
-        owner(row.get('backup'), 'item/%d/backup_data' % i)
+        if row.get('retains_original_mesh'):
+            # The original has its own binding or fake user. Archive only a
+            # distinct partial result so the original remains retryable.
+            if row.get('data') != row.get('backup'):
+                owner(row.get('data'), 'item/%d/working_data' % i)
+        else:
+            owner(row.get('data'), 'item/%d/original_data' % i)
+            owner(row.get('backup'), 'item/%d/backup_data' % i)
         add(row.get('action'), 'item/%d/source_action' % i)
         for key in ('key_source_binding', 'curve_source_binding'):
             for field in ('source', 'working', 'key', 'backup_key', 'data', 'backup'):
@@ -88,7 +94,8 @@ def _collect(job):
     for i, (obj, entry) in enumerate(job.get('prepared', [])):
         try:
             owner(obj, 'prepared/%d/current_object' % i)
-            owner(obj.data, 'prepared/%d/current_data' % i)
+            if not entry.get('use_working_mesh'):
+                owner(obj.data, 'prepared/%d/current_data' % i)
         except ReferenceError:
             missing.append('prepared/%d/deleted_object' % i)
     return refs, missing
