@@ -14,6 +14,8 @@ from ..models.bone_bindings import (active_armature, active_bone, bone_world_mat
 _handler = None
 _frames = {}
 _pmx_cache = {}
+_proxy_index = {}
+_legacy_offsets = {}
 _gpu_axes = {}
 
 
@@ -21,6 +23,8 @@ _gpu_axes = {}
 def _reset_for_load(_dummy):
     _frames.clear()
     _pmx_cache.clear()
+    _proxy_index.clear()
+    _legacy_offsets.clear()
     _gpu_axes.clear()
 
 
@@ -28,27 +32,75 @@ def _reset_for_load(_dummy):
 def _invalidate_armature_index(_scene, depsgraph):
     # Bone membership, names and custom body identities belong to Armature data.
     # Proxy transforms update objects and do not require an index rebuild.
-    if _pmx_cache and any(isinstance(update.id, bpy.types.Armature)
+    if (_pmx_cache or _proxy_index) and any(isinstance(update.id, bpy.types.Armature)
                           for update in depsgraph.updates):
         _pmx_cache.clear()
+        _proxy_index.clear()
 
 
-def native_frame(arm, bone):
+def _selected_bones(context, arm):
+    """Resolve selection once per sample, never during GPU drawing."""
+    result = {p.name: p.bone for p in (context.selected_pose_bones or ())
+              if p.id_data == arm}
+    objects = context.selected_objects or ()
+    proxies = [obj for obj in objects if obj.get('ppf_bone_uuid')]
+    if proxies:
+        key = arm.as_pointer()
+        index = _proxy_index.get(key)
+        if index is None:
+            index = {b.ppf_bone_physics.bone_uuid: b.name for b in arm.data.bones
+                     if b.ppf_bone_physics.bone_uuid}
+            _proxy_index[key] = index
+        for obj in proxies:
+            bone = arm.data.bones.get(index.get(obj.get('ppf_bone_uuid'), ''))
+            if bone and bone.ppf_bone_physics.proxy == obj:
+                result[bone.name] = bone
+    return tuple(result.values())
+
+
+def _pose_world(context, arm, bone):
+    evaluated = arm.evaluated_get(context.evaluated_depsgraph_get())
+    return evaluated.matrix_world @ evaluated.pose.bones[bone.name].matrix
+
+
+def _proxy_world(context, arm, bone, owner_snapshot=None):
+    from ..core.bone_author_follow import read_author_offset
+    proxy = bone.ppf_bone_physics.proxy
+    deps = context.evaluated_depsgraph_get()
+    if proxy.animation_data or proxy.constraints:
+        return rigid_matrix(proxy.evaluated_get(deps).matrix_world, proxy.name)
+    offset, authority = read_author_offset(context.scene, arm, bone, owner_snapshot=owner_snapshot)
+    if offset is None:
+        return None
+    key = (context.scene.as_pointer(), arm.as_pointer(), bone.name, proxy.as_pointer())
+    if authority == 'legacy_current_pose':
+        offset = _legacy_offsets.setdefault(key, offset.copy())
+    else:
+        _legacy_offsets.pop(key, None)
+    return rigid_matrix(_pose_world(context, arm, bone) @ offset, proxy.name)
+
+
+def native_frame(arm, bone, context=None, owner_snapshot=None):
+    context = context or bpy.context
     s = bone.ppf_bone_physics
     if (not s.enabled or not s.proxy or s.joint_control_mode != 'NATIVE'
             or not has_physical_joint_parent(bone, arm=arm)):
         return None
     if s.use_auto_frames:
-        return (bone_world_matrix(arm, bone) @ Matrix.Rotation(math.pi / 2, 4, 'Z')
+        evaluated = arm.evaluated_get(context.evaluated_depsgraph_get())
+        return (bone_world_matrix(evaluated, evaluated.data.bones[bone.name]) @ Matrix.Rotation(math.pi / 2, 4, 'Z')
                 @ Euler(tuple(s.joint_axis_euler)).to_matrix().to_4x4())
     parent = bone.parent
     ps = parent.ppf_bone_physics
     if ps.enabled:
         if not ps.proxy:
             return None
-        world = rigid_matrix(ps.proxy.matrix_world, parent.name)
+        world = _proxy_world(context, arm, parent, owner_snapshot)
+        if world is None:
+            return None
     else:
-        world = bone_world_matrix(arm, parent)
+        evaluated = arm.evaluated_get(context.evaluated_depsgraph_get())
+        world = bone_world_matrix(evaluated, evaluated.data.bones[parent.name])
     frame = _frame(s, 'parent')
     _frame(s, 'child')
     local = Quaternion(frame['quaternion_wxyz']).to_matrix().to_4x4()
@@ -56,7 +108,7 @@ def native_frame(arm, bone):
     return world @ local
 
 
-def pmx_frame(context, arm, bone):
+def pmx_frame(context, arm, bone, owner_snapshot=None):
     from ..core.encoder.pmx_joints import _mmd_endpoint
     s = bone.ppf_bone_physics
     if not _mmd_endpoint(bone) or s.physical_model != 'RIGID':
@@ -107,7 +159,8 @@ def pmx_frame(context, arm, bone):
     frame = record['frame_a']
     local = Quaternion(frame['quaternion_wxyz']).to_matrix().to_4x4()
     local.translation = frame['translation_m']
-    return rigid_matrix(side_a.ppf_bone_physics.proxy.matrix_world, side_a.name) @ local
+    world = _proxy_world(context, arm, side_a, owner_snapshot)
+    return world @ local if world is not None else None
 
 
 def _sample():
@@ -128,16 +181,37 @@ def _sample():
                     context = bpy.context
                     if not context.scene.ppf_bone_display.show_joint_axes:
                         continue
-                    arm, bone = active_armature(context), active_bone(context)
-                    if arm is None or bone is None:
+                    arm = active_armature(context)
+                    if arm is None:
                         continue
-                    frame = (pmx_frame(context, arm, bone) if bone.ppf_bone_physics.joint_control_mode == 'MMD'
-                             else native_frame(arm, bone))
-                    if frame is None:
+                    axes = [[], [], []]
+                    selected = _selected_bones(context, arm)
+                    if not selected:
                         continue
-                    size = max(0.05, min(1.0, bone.length * 0.5))
-                    origin = frame.translation
-                    fresh[key] = tuple((tuple(origin), tuple(origin + frame.to_3x3().col[i] * size)) for i in range(3))
+                    from collections import Counter, defaultdict
+                    from ..models.bone_bindings import armature_data_owner_counts
+                    arms_by_uuid = defaultdict(list)
+                    for obj in bpy.data.objects:
+                        if obj.type == 'ARMATURE':
+                            arms_by_uuid[obj.ppf_armature_uuid].append(obj)
+                    counts = Counter(b.ppf_bone_physics.proxy.as_pointer() for b in arm.data.bones
+                                     if b.ppf_bone_physics.proxy)
+                    snapshot = {'data_owner_counts': armature_data_owner_counts(),
+                                'proxy_counts': counts, 'arms_by_uuid': arms_by_uuid}
+                    for bone in selected:
+                        try:
+                            frame = (pmx_frame(context, arm, bone, snapshot) if bone.ppf_bone_physics.joint_control_mode == 'MMD'
+                                     else native_frame(arm, bone, context, snapshot))
+                            if frame is None:
+                                continue
+                            size = max(0.05, min(1.0, bone.length * 0.5))
+                            origin = frame.translation
+                            for i in range(3):
+                                axes[i].extend((tuple(origin), tuple(origin + frame.to_3x3().col[i] * size)))
+                        except (ValueError, RuntimeError, ReferenceError, AttributeError, KeyError, TypeError):
+                            continue
+                    if axes[0]:
+                        fresh[key] = tuple(tuple(points) for points in axes)
             except (ValueError, RuntimeError, ReferenceError, AttributeError, KeyError, TypeError):
                 continue
             if fresh.get(key) != _frames.get(key):
@@ -205,4 +279,6 @@ def unregister():
         _handler = None
     _frames.clear()
     _pmx_cache.clear()
+    _proxy_index.clear()
+    _legacy_offsets.clear()
     _gpu_axes.clear()

@@ -177,7 +177,7 @@ def proxy_parent_armature(proxy):
     return None
 
 
-def validate_proxy_owner(armature,bone, *, data_owner_counts=None, scene_user_counts=None, proxy_counts=None):
+def validate_proxy_owner(armature,bone, *, data_owner_counts=None, scene_user_counts=None, proxy_counts=None, arms_by_uuid=None):
     """Refuse copied/stale pointers before any authoring mutation."""
     if armature.library or armature.data.library:raise _error('Make the armature local before authoring bone physics')
     arm_scene_users = (len(armature.users_scene) if scene_user_counts is None
@@ -200,7 +200,7 @@ def validate_proxy_owner(armature,bone, *, data_owner_counts=None, scene_user_co
     if owner is not None and owner!=armature:
         raise _error('Duplicate armature identity; duplicated rigs need independent bindings')
     if owner is None and any(
-            o!=armature and o.type=='ARMATURE' and o.ppf_armature_uuid==armature.ppf_armature_uuid for o in bpy.data.objects):
+            o!=armature and o.type=='ARMATURE' and o.ppf_armature_uuid==armature.ppf_armature_uuid for o in (bpy.data.objects if arms_by_uuid is None else arms_by_uuid.get(armature.ppf_armature_uuid, ()))):
         raise _error('Duplicate armature identity; duplicated rigs need independent bindings')
     duplicate = (any(other != bone and other.ppf_bone_physics.proxy == proxy for other in armature.data.bones)
                  if proxy_counts is None else proxy_counts.get(proxy.as_pointer(), 0) > 1)

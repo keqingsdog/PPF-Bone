@@ -543,7 +543,6 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
         from .dynamics.bone_capture import draw_preview_controls
         base = _FrozenPropertyLayout(self.layout, context) if frozen else self.layout
         layout = SelectionLayout(base, context)
-        layout.prop(context.scene.ppf_bone_display, 'show_joint_axes')
         draw_preview_controls(layout, context)
         bone = active_bone(context)
         if active_armature(context) is None and not (context.object and context.object.get('ppf_bone_proxy_owned')):
@@ -573,6 +572,7 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
         if context.mode not in {'POSE','OBJECT'} or not selected:bone=None
         if active_armature(context) is None:
             layout.label(text=context.object.name, icon='MESH_DATA', translate=False)
+            layout.prop(context.scene.ppf_bone_display, 'show_joint_axes')
             source=active_author(context)
             actual,owned_group=_draw_actual_physics(layout,context,*source) if source is not None else (None,None)
             if context.mode=='OBJECT':
@@ -690,6 +690,8 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
         has_joint_parent=has_physical_joint_parent(bone, arm=arm)
         header,body=layout.panel('ppf_bone_essentials',default_closed=False)
         header.label(text='常用物理参数')
+        if body:
+            body.prop(context.scene.ppf_bone_display, 'show_joint_axes')
         if body and mmd:
             _draw_pmx_connection(body.column(align=True), context, arm, bone)
         elif body:
@@ -725,8 +727,6 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
             body.prop(s,'target_mass_kg' if s.mass_mode=='MASS' else 'density',text='质量 kg' if s.mass_mode=='MASS' else '密度 kg/m³')
             group=get_group_by_uuid(context.scene,s.group_uuid) if s.group_uuid else None
             if not mmd and bone.parent and s.joint_mode == 'SOFT':
-                if has_joint_parent:
-                    body.label(text='柔性关节')
                 try:
                     controlled = _selected_anchor_curve_active(context, bone)
                 except (ValueError, KeyError, TypeError):
@@ -1043,11 +1043,10 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
         if restricted and s.root_control_events:
             control.label(text='已保存事件不受支持；请逐条移除以修正', icon='ERROR')
     def _draw_joint_choice(self, joint, s, model):
-        # Legacy enum identifiers remain readable so old files are never
-        # silently converted; only the compliant option can be selected.
-        if s.joint_mode != 'SOFT':
-            joint.label(text='已保存的硬关节不再支持；请显式选择柔性关节', icon='ERROR')
-        joint.prop_enum(s, 'joint_mode', 'SOFT', text='柔性关节（显式修正）' if s.joint_mode != 'SOFT' else '关节类型：柔性关节')
+        if s.joint_mode == 'SOFT':
+            return
+        joint.label(text='已保存的硬关节不再支持；请显式选择柔性关节', icon='ERROR')
+        joint.prop_enum(s, 'joint_mode', 'SOFT', text='柔性关节（显式修正）')
 
     def _draw_joint(self, joint, s, model=None):
         model = s.physical_model if model is None else model

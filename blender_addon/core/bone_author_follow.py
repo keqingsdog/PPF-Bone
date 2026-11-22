@@ -266,7 +266,7 @@ def _load_author_record(settings, proxy):
         return None
 
 
-def read_author_offset(scene, arm, bone):
+def read_author_offset(scene, arm, bone, *, owner_snapshot=None):
     """Read-only raw bone-local proxy offset and its authority for Edit preview.
 
     A legacy fallback describes current placement only; it is never persisted
@@ -277,7 +277,7 @@ def read_author_offset(scene, arm, bone):
         return None, 'rebuilding'
     try:
         from ..models.bone_bindings import validate_proxy_owner
-        validate_proxy_owner(arm, bone)
+        validate_proxy_owner(arm, bone, **(owner_snapshot or {}))
         settings = bone.ppf_bone_physics
         proxy = settings.proxy
         if proxy is None or scene.objects.get(proxy.name) != proxy:
