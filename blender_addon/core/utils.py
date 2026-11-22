@@ -1494,8 +1494,24 @@ def _may_move(obj) -> bool:
     return False
 
 
+def finish_encode_steps(steps):
+    """Run the same encoder steps synchronously for non-modal callers."""
+    while True:
+        try:
+            next(steps)
+        except StopIteration as result:
+            return result.value
+
+
 def sample_transform_animation(objs, context, start_frame: int,
                                frame_count: int) -> dict:
+    return finish_encode_steps(sample_transform_animation_steps(
+        objs, context, start_frame, frame_count,
+    ))
+
+
+def sample_transform_animation_steps(objs, context, start_frame: int,
+                                     frame_count: int):
     """Every STATIC object's world transform at every frame of the solve.
 
     Returns ``{obj.name: {"frame_offset", "translation", "quaternion",
@@ -1513,8 +1529,8 @@ def sample_transform_animation(objs, context, start_frame: int,
     residual limit is a turn of more than 180 degrees within a single frame,
     which no sampling can tell from the shorter turn the other way.
 
-    One ``scene.frame_set`` per frame serves every object, and the scene's
-    current frame is restored afterward.
+    One ``scene.frame_set`` per frame serves every object. Yield the frame
+    progress and restore the current time on completion or cancellation.
     """
     objs = list(objs)
     if not objs:
@@ -1528,9 +1544,10 @@ def sample_transform_animation(objs, context, start_frame: int,
                 "supported for STATIC objects; use Capture Deformation."
             )
     from mathutils import Matrix  # pyright: ignore
+    from .frame_time import set_scene_frame
 
     scene = context.scene
-    current_frame = scene.frame_current
+    current_frame = scene.frame_current, scene.frame_subframe
     n = max(1, int(frame_count))
     samples = {obj.name: ([], [], [], []) for obj in objs}
     sheared = {}
@@ -1560,8 +1577,9 @@ def sample_transform_animation(objs, context, start_frame: int,
                     [float(quat.w), float(quat.x), float(quat.y), float(quat.z)]
                 )
                 scales.append([float(scale.x), float(scale.y), float(scale.z)])
+            yield "Sampling collider motion: {done}/{total} frames", k + 1, n
     finally:
-        scene.frame_set(current_frame)
+        set_scene_frame(scene, *current_frame)
 
     out = {}
     for name, (times, translations, quaternions, scales) in samples.items():

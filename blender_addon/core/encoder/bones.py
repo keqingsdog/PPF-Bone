@@ -200,7 +200,7 @@ def _validate_pose_scales_at_frame(sources, frame):
             raise ValueError(f'{bone.name}: animated pose scale is unsupported; frozen author scale changed at frame {frame}')
 
 
-def _validate_static_pose_scales(context, state, start_frame, *, explicit_only=False):
+def _validate_static_pose_scales_steps(context, state, start_frame, *, explicit_only=False):
     from ...models.bone_bindings import bone_frame_cache
     sources = _pose_scale_sources(context, explicit_only=explicit_only)
     if not sources:
@@ -215,9 +215,15 @@ def _validate_static_pose_scales(context, state, start_frame, *, explicit_only=F
             context.view_layer.update()
             with bone_frame_cache():
                 _validate_pose_scales_at_frame(sources, frame)
+            yield ("Validating bone scales: {done}/{total} frames", offset + 1, int(state.frame_count))
     finally:
         set_scene_frame(scene, previous, subframe)
         context.view_layer.update()
+
+
+def _validate_static_pose_scales(context, state, start_frame, *, explicit_only=False):
+    from ..utils import finish_encode_steps
+    return finish_encode_steps(_validate_static_pose_scales_steps(context, state, start_frame, explicit_only=explicit_only))
 
 
 def read_evaluated_bone_frame(armature, bone_name):
@@ -411,7 +417,7 @@ def finish_transport_bones(plan):
     return result
 
 
-def encode_bones(context, state, fps, start_frame, *, cone_restoring_joint_ids=None,
+def encode_bones_steps(context, state, fps, start_frame, *, cone_restoring_joint_ids=None,
                  mmd_automatic_channels=None):
     """Capture authoring at start and root motion at the original frame times."""
     plan = prepare_transport_bones(
@@ -433,7 +439,13 @@ def encode_bones(context, state, fps, start_frame, *, cone_restoring_joint_ids=N
                 context.view_layer.update()
                 sample_transport_bone_frame(
                     scale_sources, anchors.values(), roots, offset, fps, sample_frame)
+                yield ("Sampling bone motion: {done}/{total} frames", offset + 1, int(state.frame_count))
         finally:
             set_scene_frame(scene, previous, subframe)
             context.view_layer.update()
     return finish_transport_bones(plan)
+
+
+def encode_bones(context, state, fps, start_frame, **options):
+    from ..utils import finish_encode_steps
+    return finish_encode_steps(encode_bones_steps(context, state, fps, start_frame, **options))

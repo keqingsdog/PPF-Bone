@@ -1,4 +1,8 @@
 {
+  "Transfer was cancelled before a scene change": "Transfer was cancelled before a scene change",
+  "Sampling collider motion: {done}/{total} frames": "Sampling collider motion: {done}/{total} frames",
+  "Validating bone scales: {done}/{total} frames": "Validating bone scales: {done}/{total} frames",
+  "Transfer cancelled because the timeline, mode or handlers changed": "Transfer cancelled because the timeline, mode or handlers changed",
   "Loading scene data...": "Loading scene data...",
   "Scanning build plan...": "Scanning build plan...",
   "Applying object parameters...": "Applying object parameters...",

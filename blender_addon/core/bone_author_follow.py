@@ -635,10 +635,12 @@ def _transfer_scale_preflight_applicable(context):
     return _author_scale_checks_enabled(context.scene)
 
 
-def _sync(context, *, transfer=False):
+def _sync_steps(context, *, transfer=False):
     """Stage a whole author batch before writes; Apply Transform preserves shape."""
     global _transfer_deferred
     if context is None or context.scene is None:
+        return 0
+    if not transfer and _transfer_deferred is not None:
         return 0
     if not transfer and getattr(getattr(context, 'screen', None), 'is_animation_playing', False):
         return 0
@@ -671,8 +673,8 @@ def _sync(context, *, transfer=False):
         # Cached physical display is not authored pose. Keep the existing cache
         # and busy gates ahead of this validator and ahead of any mesh bake.
         from ..models.groups import get_addon_data
-        from .encoder.bones import _validate_static_pose_scales
-        _validate_static_pose_scales(context, get_addon_data(scene).state, scene.frame_current)
+        from .encoder.bones import _validate_static_pose_scales_steps
+        yield from _validate_static_pose_scales_steps(context, get_addon_data(scene).state, scene.frame_current)
     from .bone_geometry_edit import active
     if active():
         return 0
@@ -853,6 +855,15 @@ def apply_pending(context):
     if not has_pending():
         return 0
     return _sync(context)
+
+
+def _sync(context, *, transfer=False):
+    from .utils import finish_encode_steps
+    return finish_encode_steps(_sync_steps(context, transfer=transfer))
+
+
+def sync_for_transfer_steps(context):
+    return (yield from _sync_steps(context, transfer=True))
 
 
 @contextmanager

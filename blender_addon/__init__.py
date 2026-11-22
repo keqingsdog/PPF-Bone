@@ -95,6 +95,8 @@ _deferred_timers: list = []
 @persistent
 def _abort_capture_before_save(*_args):
     """Save stable author state rather than a capture job's temporary state."""
+    from .core.encoder import cancel_upload_steps
+    cancel_upload_steps()
     from .core.encoder.transfer_bone_stage import cancel as cancel_sliced
     cancel_sliced()
     from .core.capture_origin import abort_before_save
@@ -107,6 +109,8 @@ def _abort_capture_before_save(*_args):
 
 @persistent
 def _cancel_captures_before_change(*_args):
+    from .core.encoder import cancel_upload_steps
+    cancel_upload_steps()
     from .core.capture_origin import cancel_capture_jobs
     cancel_capture_jobs()
     from .core.encoder.transfer_bone_stage import cancel as cancel_sliced
@@ -115,6 +119,8 @@ def _cancel_captures_before_change(*_args):
 
 @persistent
 def _cancel_captures_before_undo(*_args):
+    from .core.encoder import cancel_upload_steps
+    cancel_upload_steps()
     from .core.capture_origin import cancel_capture_jobs
     cancel_capture_jobs(restore=False)
     from .core.encoder.transfer_bone_stage import cancel as cancel_sliced
@@ -660,6 +666,8 @@ def _register_body():
 
 
 def unregister():
+    from .core.encoder import cancel_upload_steps
+    cancel_upload_steps()
     from .core import rigid_pose as _rigid_pose_recovery
     _rigid_pose_recovery.export_pending_connection_recoveries()
     import bpy

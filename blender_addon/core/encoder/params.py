@@ -1093,7 +1093,7 @@ def sand_scene_radius_conflict(scene, groups=None):
     return rows if len({float(np.float32(radius)) for _name, radius in rows}) > 1 else None
 
 
-def _build_param_dict(context, *, pre_mmd_default=None, bone_motion=None) -> dict:
+def _build_param_dict_steps(context, *, pre_mmd_default=None, bone_motion=None):
     """Assemble the parameter dict that ``encode_param`` serializes.
 
     Factored out so ``compute_param_hash`` and ``encode_param_with_hash``
@@ -1156,13 +1156,13 @@ def _build_param_dict(context, *, pre_mmd_default=None, bone_motion=None) -> dic
         pin_config = _encode_pin_config(context, groups, state, fps, start_frame)
         ordered_pair_ids = []
         cross_stitch = _encode_cross_stitch(context, groups, ordered_pair_ids)
-        from .bones import encode_bones
+        from .bones import encode_bones_steps
         cone_restoring_joint_ids = set()
         mmd_automatic_channels = []
         options = dict(cone_restoring_joint_ids=cone_restoring_joint_ids,
                        mmd_automatic_channels=mmd_automatic_channels)
         if bone_motion is None:
-            bone_data = encode_bones(context, state, fps, start_frame, **options)
+            bone_data = yield from encode_bones_steps(context, state, fps, start_frame, **options)
         else:
             from .bones import prepare_transport_bones
             fresh = prepare_transport_bones(context, state, fps, start_frame, **options)
@@ -1257,6 +1257,20 @@ def _build_param_dict(context, *, pre_mmd_default=None, bone_motion=None) -> dic
     if restoring_curves is not None:
         result["restoring_curves_v1"] = restoring_curves
     return result
+
+
+def _build_param_dict(context, **options):
+    from ..utils import finish_encode_steps
+    return finish_encode_steps(_build_param_dict_steps(context, **options))
+
+
+def encode_param_with_hash_steps(context):
+    from ..bone_mass import producer_mass_transaction
+    with producer_mass_transaction(context):
+        from .cbor_encode import dumps_envelope
+        tree = yield from _build_param_dict_steps(context)
+        encoded = dumps_envelope("Param", tree)
+        return encoded, hashlib.sha256(encoded).hexdigest()
 
 
 def encode_param(context) -> bytes:

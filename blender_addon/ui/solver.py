@@ -944,11 +944,14 @@ class SOLVER_OT_Transfer(AsyncOperator):
         self._payload = {}
         self._transfer_frame = (context.scene.frame_current, context.scene.frame_subframe)
         self._bone_stage = None
-        sliced = getattr(self, "sliced_bones", False)
-        self._stage_timer_interval = 0.02 if sliced else None
+        self._upload_steps = None
+        self._upload_stamp = None
+        self._upload_mode = context.mode
+        self._upload_layer = context.view_layer.as_pointer()
+        self._stage_timer_interval = 0.02
         self._stage_next_tick = 0.0
         stages = []
-        if sliced:
+        if getattr(self, "sliced_bones", False):
             stages.append(("Preparing bone motion...", self._stage_bone_motion))
         stages.extend([
             ("Encoding scene and parameters...", self._stage_encode_geometry),
@@ -970,14 +973,15 @@ class SOLVER_OT_Transfer(AsyncOperator):
             return STAGE_PENDING
 
     def modal(self, context, event):
-        from ..core.encoder.transfer_bone_stage import active
-        if getattr(self, "sliced_bones", False) and not self._remote_request_started:
+        if not self._remote_request_started:
             if event.type == "ESC" and event.value == "PRESS":
                 self.cancel(context)
                 return {"CANCELLED"}
-            if self._bone_stage is not None and not active():
-                self.cancel(context)
-                return {"CANCELLED"}
+            if self._bone_stage is not None:
+                from ..core.encoder.transfer_bone_stage import active
+                if not active():
+                    self.cancel(context)
+                    return {"CANCELLED"}
             if event.type != "TIMER":
                 return {"RUNNING_MODAL"}
             # Blender's Python Event exposes the timer type, but no Timer handle.
@@ -993,15 +997,18 @@ class SOLVER_OT_Transfer(AsyncOperator):
         return super().modal(context,event)
 
     def _stage_encode_geometry(self, context):
+        from ..core.async_op import STAGE_PENDING
         try:
-            if (context.scene.frame_current, context.scene.frame_subframe) != self._transfer_frame:
-                raise ValueError(iface_("Timeline changed before Transfer encoding; start Transfer again"))
-            if getattr(self, "_bone_stage", None) is None:
-                data, param, data_hash, param_hash = prepare_upload(context)
-            else:
+            if self._bone_stage is not None:
+                if (context.scene.frame_current, context.scene.frame_subframe) != self._transfer_frame:
+                    raise ValueError(iface_("Timeline changed before Transfer encoding; start Transfer again"))
                 with self._bone_stage.encoding(context):
-                    data, param, data_hash, param_hash = prepare_upload(
-                        context, bone_motion=self._bone_stage)
+                    prepared = prepare_upload(context, bone_motion=self._bone_stage)
+            else:
+                prepared = self._advance_upload_steps(context)
+                if prepared is None:
+                    return STAGE_PENDING
+            data, param, data_hash, param_hash = prepared
 
         except (Cbor2NotInstalledError, ValueError) as e:
             com.set_error(str(e))
@@ -1015,6 +1022,37 @@ class SOLVER_OT_Transfer(AsyncOperator):
         self._payload["data_hash"] = data_hash
         self._payload["param"] = param
         self._payload["param_hash"] = param_hash
+
+    def _advance_upload_steps(self, context):
+        from ..core.encoder import begin_upload_steps, cancel_upload_steps, upload_steps_active
+        from ..core.encoder.transfer_bone_stage import _callback_token
+        from ..core import encode_progress
+
+        frame = context.scene.frame_current, context.scene.frame_subframe
+        if self._upload_steps is None:
+            if frame != self._transfer_frame:
+                raise ValueError(iface_("Timeline changed before Transfer encoding; start Transfer again"))
+            self._upload_steps = begin_upload_steps(context)
+        if not upload_steps_active(self._upload_steps):
+            raise StageAbort(iface_("Transfer was cancelled before a scene change"), "INFO")
+        current_stamp = frame, _callback_token()
+        if (context.mode != self._upload_mode or context.view_layer.as_pointer() != self._upload_layer
+                or (self._upload_stamp is not None and current_stamp != self._upload_stamp)):
+            raise ValueError(iface_("Transfer cancelled because the timeline, mode or handlers changed"))
+
+        deadline = time.monotonic() + 0.025
+        while True:
+            try:
+                label, done, total = next(self._upload_steps)
+            except StopIteration as finished:
+                self._upload_steps = None
+                cancel_upload_steps()
+                return finished.value
+            encode_progress.update(0, iface_(label).format(done=done, total=total))
+            if time.monotonic() >= deadline:
+                frame = context.scene.frame_current, context.scene.frame_subframe
+                self._upload_stamp = frame, _callback_token()
+                return None
 
     def _stage_upload(self, context):
         # The topology stamp lands HERE, not in the encoder: every stage that
@@ -1100,6 +1138,11 @@ class SOLVER_OT_Transfer(AsyncOperator):
     def cleanup_modal(self, context):
         # Also release locally retained bytes after refusal/cancel/timeout.
         # Queued or in-flight upload commands keep their own references.
+        from ..core.encoder import cancel_upload_steps, upload_steps_active
+        steps = getattr(self, "_upload_steps", None)
+        self._upload_steps = None
+        if upload_steps_active(steps):
+            cancel_upload_steps()
         self._payload = {}
         stage = getattr(self, "_bone_stage", None)
         if stage is not None:

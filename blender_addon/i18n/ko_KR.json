@@ -1,4 +1,8 @@
 {
+  "Transfer was cancelled before a scene change": "씬이 변경되기 전에 전송이 취소되었습니다",
+  "Sampling collider motion: {done}/{total} frames": "콜라이더 모션을 샘플링하는 중（{done}/{total} 프레임）",
+  "Validating bone scales: {done}/{total} frames": "본 스케일을 검증하는 중（{done}/{total} 프레임）",
+  "Transfer cancelled because the timeline, mode or handlers changed": "타임라인, 모드 또는 핸들러가 변경되어 전송이 취소되었습니다",
   "Loading scene data...": "씬 데이터를 불러오는 중…",
   "Scanning build plan...": "빌드 계획을 확인하는 중…",
   "Applying object parameters...": "오브젝트 매개변수를 적용하는 중…",

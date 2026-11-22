@@ -1,4 +1,8 @@
 {
+  "Transfer was cancelled before a scene change": "场景即将更改，传输已取消",
+  "Sampling collider motion: {done}/{total} frames": "正在采样碰撞体动作（{done}/{total} 帧）",
+  "Validating bone scales: {done}/{total} frames": "正在校验骨骼缩放（{done}/{total} 帧）",
+  "Transfer cancelled because the timeline, mode or handlers changed": "时间轴、模式或回调已变化，传输已取消",
   "Loading scene data...": "正在加载场景数据…",
   "Scanning build plan...": "正在分析构建计划…",
   "Applying object parameters...": "正在应用物体参数…",

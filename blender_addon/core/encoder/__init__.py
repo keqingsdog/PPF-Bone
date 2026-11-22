@@ -328,6 +328,70 @@ def _encode_upload_payloads(context, *, want_data, want_param, bone_motion=None)
     return data, param, data_hash, param_hash
 
 
+_active_upload_steps = None
+
+
+def upload_steps_active(steps):
+    return steps is not None and _active_upload_steps is steps
+
+
+def cancel_upload_steps():
+    global _active_upload_steps
+    steps, _active_upload_steps = _active_upload_steps, None
+    if steps is not None:
+        steps.close()
+
+
+def begin_upload_steps(context):
+    global _active_upload_steps
+    if _active_upload_steps is not None:
+        raise RuntimeError("A Transfer encode is already active")
+    _active_upload_steps = prepare_upload_steps(context)
+    return _active_upload_steps
+
+
+def prepare_upload_steps(context):
+    """Run the ordinary upload transaction, yielding after sampled frames."""
+    from ..pin_reference import validate_export_pin_references
+    from ..bone_author_follow import transfer_author_transaction, sync_for_transfer_steps
+    from ..bone_mass import producer_mass_transaction
+    from ..rigid_pose import suspend_playback
+    from ..bone_geometry_edit import assert_solver_available
+    from ...ops.bone_proxy import reconcile_deleted_proxies
+    from .bones import _validate_static_pose_scales
+    from .mesh import encode_obj_with_hash_steps
+    from .params import encode_param_with_hash_steps
+    from contextlib import ExitStack
+    validate_export_pin_references(context)
+    _validate_static_pose_scales(context, None, None, explicit_only=True)
+    with transfer_author_transaction(context) as commit_notification:
+        with ExitStack() as mass_scope:
+            with suspend_playback():
+                validate_export_pin_references(context)
+                assert_solver_available()
+                reconcile_deleted_proxies(context.scene)
+                yield from sync_for_transfer_steps(context)
+                mass_scope.enter_context(producer_mass_transaction(context))
+                data, data_hash = yield from encode_obj_with_hash_steps(context)
+                if data:
+                    import tempfile
+                    size = len(data)
+                    with tempfile.TemporaryFile(mode="w+b", prefix="ppf-upload-") as staged_data:
+                        if staged_data.write(data) != size:
+                            raise OSError("Incomplete temporary Scene payload write")
+                        staged_data.flush()
+                        del data
+                        param, param_hash = yield from encode_param_with_hash_steps(context)
+                        staged_data.seek(0)
+                        data = staged_data.read()
+                        if len(data) != size:
+                            raise OSError("Incomplete temporary Scene payload read")
+                else:
+                    param, param_hash = yield from encode_param_with_hash_steps(context)
+            commit_notification()
+    return data, param, data_hash, param_hash
+
+
 def prepare_upload(
     context,
     *,

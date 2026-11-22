@@ -20,7 +20,8 @@ from ..utils import (
     get_vertices_in_group,
     has_deforming_modifier_stack,
     has_transform_fcurves,
-    sample_transform_animation,
+    finish_encode_steps,
+    sample_transform_animation_steps,
     static_mesh_deforms,
     world_matrix,
 )
@@ -588,6 +589,12 @@ def _validate_export_representations(scene):
 
 
 def _build_obj_data(context, *, persist_topology_hash: bool) -> list:
+    return finish_encode_steps(_build_obj_data_steps(
+        context, persist_topology_hash=persist_topology_hash,
+    ))
+
+
+def _build_obj_data_steps(context, *, persist_topology_hash: bool):
     from ..pin_reference import validate_export_pin_references
     validate_export_pin_references(context)
     _validate_export_representations(context.scene)
@@ -596,13 +603,13 @@ def _build_obj_data(context, *, persist_topology_hash: bool) -> list:
     if persist_topology_hash:
         with producer_mass_transaction(context):
             with suspend_playback():
-                return _build_author_obj_data(context, persist_topology_hash=True)
+                return (yield from _build_author_obj_data(context, persist_topology_hash=True))
     producer_preflight(context, commit=False)
     with suspend_playback():
-        return _build_author_obj_data(context, persist_topology_hash=False)
+        return (yield from _build_author_obj_data(context, persist_topology_hash=False))
 
 
-def _build_author_obj_data(context, *, persist_topology_hash: bool) -> list:
+def _build_author_obj_data(context, *, persist_topology_hash: bool):
     """Construct the list-of-group dicts that ``encode_obj`` serializes to CBOR.
 
     Factored so ``compute_data_hash`` can fingerprint the same source
@@ -746,7 +753,7 @@ def _build_author_obj_data(context, *, persist_topology_hash: bool) -> list:
 
     data = []
     with evaluate_at_start_frame(context, state):
-        return _encode_obj_inner(context, scene, state, data)
+        return (yield from _encode_obj_inner(context, scene, state, data))
 
 
 def _refuse_degenerate_tessellation(context, scene, state):
@@ -908,7 +915,7 @@ def _encode_obj_inner(context, scene, state, data):
                 continue
             if _may_move(_obj):
                 _moving_statics.append(_obj)
-    static_motion = sample_transform_animation(
+    static_motion = yield from sample_transform_animation_steps(
         _moving_statics, context, start_frame, state.frame_count,
     )
 
@@ -1339,8 +1346,12 @@ def encode_obj_with_hash(context) -> tuple[bytes, str]:
     because ``_build_obj_data`` produces a fixed dict-insertion order
     and ``cbor2.dumps`` preserves that order.
     """
+    return finish_encode_steps(encode_obj_with_hash_steps(context))
+
+
+def encode_obj_with_hash_steps(context):
     from .cbor_encode import dumps_envelope
-    tree = _build_obj_data(context, persist_topology_hash=True)
+    tree = yield from _build_obj_data_steps(context, persist_topology_hash=True)
     encoded = dumps_envelope("Scene", tree)
     return encoded, hashlib.sha256(encoded).hexdigest()
 

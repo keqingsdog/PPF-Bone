@@ -1,4 +1,8 @@
 {
+  "Transfer was cancelled before a scene change": "シーンの変更前に転送を中止しました",
+  "Sampling collider motion: {done}/{total} frames": "コライダーの動きをサンプリング中（{done}/{total} フレーム）",
+  "Validating bone scales: {done}/{total} frames": "ボーンのスケールを検証中（{done}/{total} フレーム）",
+  "Transfer cancelled because the timeline, mode or handlers changed": "タイムライン、モード、またはハンドラーの変更により転送が中止されました",
   "Loading scene data...": "シーンデータを読み込み中…",
   "Scanning build plan...": "構築計画を確認中…",
   "Applying object parameters...": "オブジェクトのパラメーターを適用中…",
