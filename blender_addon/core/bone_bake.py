@@ -335,29 +335,30 @@ def _finish_steps(entry, *, fast):
                 snap['static_scale_names'] = list(static_scales) + _omit_constant_generated_scales(arm, [n for n in snap['names'] if n in proven_static_names and n not in static_scales], new, [frame for frame, _rows in entry['samples']], entry['created'])
             else:
                 snap['static_scale_names'] = list(snap['names'])
-        # The real depsgraph, under restored author flags and without cache,
-        # is the acceptance gate; no successful-but-offset fallback.
-        maximum=0.
-        for sample_index,(frame,rows) in enumerate(entry['samples']):
-            yield iface_("Validating bone frame {done}/{total}").format(done=sample_index + 1, total=len(entry['samples']))
-            out=frame
-            scene.frame_set(out);bpy.context.view_layer.update();dg=bpy.context.evaluated_depsgraph_get()
-            for snap in entry['snapshots']:
-                ev=snap['arm'].evaluated_get(dg)
-                for n in snap['names']:
-                    error=max(abs(ev.pose.bones[n].matrix[i][j]-rows[snap['arm'].name][n][i][j]) for i in range(4) for j in range(4));maximum=max(maximum,error)
-                    if error>3e-5:
-                        detail='Cache-free Action differs from mapped pose: '+n+' error='+str(error)
-                        pb=ev.pose.bones[n]
-                        if pb.parent is not None and pb.bone.use_connect:
-                            from mathutils import Vector
-                            parent_matrix=rows[snap['arm'].name][pb.parent.name]
-                            target_head=rows[snap['arm'].name][n].translation
-                            parent_tail=parent_matrix @ Vector((0.,pb.parent.bone.length,0.))
-                            world=snap['arm'].matrix_world
-                            gap=((world @ target_head)-(world @ parent_tail)).length
-                            detail+='; '+snap['arm'].name+'/'+n+' at frame '+str(frame)+' has authored use_connect=True; mapped head-to-parent-tail world gap='+str(gap)+'. The connected rig may not express this solver pose; source Action and rig are preserved.'
-                        raise _FastPoseMismatch(detail) if fast else BoneBakeError(detail)
+        if entry['single']:
+            # The real depsgraph, under restored author flags and without cache,
+            # is the acceptance gate; no successful-but-offset fallback.
+            maximum=0.
+            for sample_index,(frame,rows) in enumerate(entry['samples']):
+                yield iface_("Validating bone frame {done}/{total}").format(done=sample_index + 1, total=len(entry['samples']))
+                out=frame
+                scene.frame_set(out);bpy.context.view_layer.update();dg=bpy.context.evaluated_depsgraph_get()
+                for snap in entry['snapshots']:
+                    ev=snap['arm'].evaluated_get(dg)
+                    for n in snap['names']:
+                        error=max(abs(ev.pose.bones[n].matrix[i][j]-rows[snap['arm'].name][n][i][j]) for i in range(4) for j in range(4));maximum=max(maximum,error)
+                        if error>3e-5:
+                            detail='Cache-free Action differs from mapped pose: '+n+' error='+str(error)
+                            pb=ev.pose.bones[n]
+                            if pb.parent is not None and pb.bone.use_connect:
+                                from mathutils import Vector
+                                parent_matrix=rows[snap['arm'].name][pb.parent.name]
+                                target_head=rows[snap['arm'].name][n].translation
+                                parent_tail=parent_matrix @ Vector((0.,pb.parent.bone.length,0.))
+                                world=snap['arm'].matrix_world
+                                gap=((world @ target_head)-(world @ parent_tail)).length
+                                detail+='; '+snap['arm'].name+'/'+n+' at frame '+str(frame)+' has authored use_connect=True; mapped head-to-parent-tail world gap='+str(gap)+'. The connected rig may not express this solver pose; source Action and rig are preserved.'
+                            raise _FastPoseMismatch(detail) if fast else BoneBakeError(detail)
         yield iface_("Completing bone Action")
         scene.frame_set(entry['entry_time'][0],subframe=entry['entry_time'][1])
         bpy.context.view_layer.update()
@@ -369,7 +370,9 @@ def _finish_steps(entry, *, fast):
             old=snap['action']
             if old is not None and old.users==0 and not old.use_fake_user:
                 retained.append(old);old.use_fake_user=True
-        entry['max_error']=maximum;entry['committed']=True
+        if entry['single']:
+            entry['max_error']=maximum
+        entry['committed']=True
     except BaseException:
         rollback(entry)
         entry['_finish_rollback_complete'] = True
