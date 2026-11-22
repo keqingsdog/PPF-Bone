@@ -2723,7 +2723,7 @@ class SOLVER_OT_FetchData(AsyncOperator):
 
     def execute(self, context):
         if context.scene.get("ppf_single_bake_session_stale"):
-            self.report({"ERROR"}, iface_("Single Frame Bake committed the author scene; transfer it again before fetching animation from a new session."))
+            self.report({"ERROR"}, iface_("Baked results were kept and the previous simulation session expired; transfer again before fetching animation."))
             return {"CANCELLED"}
         try:
             stop_for_edit(context)

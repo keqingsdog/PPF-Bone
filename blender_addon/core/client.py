@@ -986,7 +986,7 @@ def _apply_animation_impl(context=None):
                 from .events import FetchFailed
                 from .facade import tick
                 from ..i18n import pgettext_iface as iface_
-                engine.dispatch(FetchFailed(reason=iface_("Single Frame Bake retired the previous animation session")))
+                engine.dispatch(FetchFailed(reason=iface_("Baked results retired the previous animation session")))
                 tick()
         return
     com = communicator
