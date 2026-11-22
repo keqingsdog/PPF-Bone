@@ -269,6 +269,8 @@
   "Baked {frame_count} frame(s) for {object_count} object(s)": "Baked {frame_count} frame(s) for {object_count} object(s)",
   "Baking {name} [{done}/{total}]": "Baking {name} [{done}/{total}]",
   "Baking...": "Baking...",
+  "Preparing animation bake...": "Preparing animation bake...",
+  "Finalizing baked animation...": "Finalizing baked animation...",
   "Baraff-Witkin": "Baraff-Witkin",
   "Baraff-Witkin model": "Baraff-Witkin model",
   "Basis": "Basis",

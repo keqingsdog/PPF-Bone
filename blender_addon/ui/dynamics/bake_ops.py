@@ -64,6 +64,7 @@ _bake_job: dict = {
     "total_frames_processed": 0,
     "total_frames": 0,
     "status": "",
+    "phase": "",
     "finalize_error": None,
     "finalize_result": None,
     "scene": None,
@@ -80,11 +81,13 @@ def _reset_job() -> None:
         "total_frames_processed": 0,
         "total_frames": 0,
         "status": "",
+        "phase": "",
         "finalize_error": None,
         "finalize_result": None,
         "scene": None,
         "material_archive": None,
         "source_archive": None,
+        "recovery": None,
     })
 
 
@@ -921,7 +924,8 @@ def _start_job(queue: list, kind: str) -> tuple[bool, str]:
         "object_cursor": 0,
         "total_frames_processed": 0,
         "total_frames": sum(e["n_frames"] for e in queue),
-        "status": "Baking...",
+        "status": iface_("Baking..."),
+        "phase": "frames",
         "finalize_error": None,
         "finalize_result": None,
         "scene": origin_scene,
@@ -952,7 +956,7 @@ def _process_one_frame_mesh(entry, obj) -> None:
     (native C loop — orders of magnitude faster than per-vertex
     keyframe_insert). Value is keyed 0→1→0 with CONSTANT interpolation
     so each shape key is "on" for exactly its frame."""
-    _validate_mesh_action(obj, entry)
+    _validate_mesh_action(obj, entry, frame_write=True)
     f = entry["frames_done"]
     scene_frame = f + entry["start_frame"]
     n_verts = entry["n_verts"]
@@ -974,7 +978,8 @@ def _process_one_frame_mesh(entry, obj) -> None:
     entry["added_sk_names"].append(kb.name)
     key_transaction = entry.get("mesh_created_key_transaction") or entry.get("mesh_action_transaction")
     if key_transaction is not None:
-        key_transaction["keys"].append((kb, kb.name, _mesh_key_digest(flat),
+        digest = _mesh_key_digest(flat)
+        key_transaction["keys"].append((kb, kb.name, digest,
              (kb.slider_min, kb.slider_max, kb.vertex_group, kb.interpolation)))
     if existing_tx is not None and kb.name != sk_name:
         actual_curve = _sk_value_fcurve(existing_tx["key"], kb.name)
@@ -986,32 +991,16 @@ def _process_one_frame_mesh(entry, obj) -> None:
             entry["added_sk_names"].pop()
             key_transaction["keys"].pop()
             raise ValueError("Author changed a disambiguated Shape Key curve before Bake")
-    kb.data.foreach_set("co", flat)
+    getattr(kb, "points", kb.data).foreach_set("co", flat)
 
     created = entry.get("mesh_created_key_transaction")
     if created is not None and created.get("encoding") == "ABSOLUTE_STEP_V1":
         kb.interpolation = 'KEY_LINEAR'
-        created["keys"][-1] = (kb, kb.name, _mesh_key_digest(flat),
+        created["keys"][-1] = (kb, kb.name, digest,
                               (kb.slider_min, kb.slider_max, kb.vertex_group, kb.interpolation))
         created["sample_frames"].append(float(kb.frame))
-        key = created["key"]
-        if f == 0:
-            key.eval_time = key.reference_key.frame
-            key.keyframe_insert("eval_time", frame=scene_frame - 1)
-        key.eval_time = kb.frame
-        key.keyframe_insert("eval_time", frame=scene_frame)
-        key.eval_time = key.reference_key.frame
-        key.keyframe_insert("eval_time", frame=scene_frame + 1)
-        created["action"] = key.animation_data.action
-        created["slot"] = _curve_action_slot(key)
-        curves = list(get_id_fcurves(key))
-        if len(curves) != 1 or curves[0].data_path != 'eval_time':
-            raise ValueError("Unexpected Shape Key animation during Bake")
-        curves[0].extrapolation = 'CONSTANT'
-        for point in curves[0].keyframe_points:
-            point.interpolation = 'CONSTANT'
-        created["expected_curves"] = _mesh_action_snapshot(key)
-        key.eval_time = curves[0].evaluate(bpy.context.scene.frame_current_final)
+        if f + 1 == entry["n_frames"]:
+            _write_absolute_mesh_timing(created, entry["start_frame"])
         return
 
     kb.value = 0.0
@@ -1034,6 +1023,32 @@ def _process_one_frame_mesh(entry, obj) -> None:
             kp.interpolation = "CONSTANT"
         if tx is not None:
             tx["expected_curves"][(fc.data_path, fc.array_index)] = _mesh_fcurve_snapshot(fc)
+
+
+def _write_absolute_mesh_timing(created, start_frame):
+    """Write the one absolute-key timing curve after all positions are present."""
+    key = created["key"]
+    basis_time = key.reference_key.frame
+    if not key.keyframe_insert("eval_time", frame=start_frame - 1):
+        raise ValueError("Could not create Shape Key animation during Bake")
+    curves = list(get_id_fcurves(key))
+    if len(curves) != 1 or curves[0].data_path != 'eval_time':
+        raise ValueError("Unexpected Shape Key animation during Bake")
+    curve = curves[0]
+    points = curve.keyframe_points
+    values = [basis_time, *created["sample_frames"], basis_time]
+    coordinates = numpy.empty((len(values), 2), dtype=numpy.float32)
+    coordinates[:, 0] = numpy.arange(start_frame - 1, start_frame - 1 + len(values))
+    coordinates[:, 1] = values
+    points.add(len(values) - 1)
+    points.foreach_set("co", coordinates.ravel())
+    for point in points:
+        point.interpolation = 'CONSTANT'
+    curve.extrapolation = 'CONSTANT'
+    curve.update()
+    created["slot"] = _curve_action_slot(key)
+    created["expected_curves"] = _mesh_action_snapshot(key)
+    key.eval_time = curve.evaluate(bpy.context.scene.frame_current_final)
 
 
 def _process_one_frame_curve(entry, obj) -> None:
@@ -1339,6 +1354,8 @@ def _abort_job() -> None:
     fully recoverable. For MESH: remove shape keys we added (plus Basis
     if we created the block) and their value fcurves. For CURVE: remove
     inserted per-CV fcurves and restore bezier handle types."""
+    if _bake_job.get("phase") == "preparing":
+        return
     from ...core import full_bake_restore
     scene=_bake_job.get('scene')
     if scene is not None and full_bake_restore.available(scene):return
@@ -1408,14 +1425,20 @@ def _mesh_key_digest(coordinates):
                            digest_size=16).digest()
 
 
+def _mesh_key_coordinates(block):
+    points = getattr(block, "points", block.data)
+    coordinates = numpy.empty(len(points) * 3, dtype=numpy.float32)
+    points.foreach_get("co", coordinates)
+    return coordinates
+
+
 def _begin_created_mesh_keys(obj, entry):
-    from ...core.full_bake_restore import _author_layers
+    from ...core.full_bake_restore import mesh_author_snapshot
     tx = dict(data=obj.data, key=None, basis=None, action=None, slot=None, keys=[])
-    tx["author_layers"] = _author_layers(obj.data)
+    tx["author_layers"] = mesh_author_snapshot(obj.data)
     entry["mesh_created_key_transaction"] = tx
     basis = obj.shape_key_add(name="Basis", from_mix=False)
-    rest = numpy.empty(len(basis.data) * 3, dtype=numpy.float32)
-    basis.data.foreach_get("co", rest)
+    rest = _mesh_key_coordinates(basis)
     key = obj.data.shape_keys
     # Blender may otherwise reuse the object's Action when inserting the first
     # Shape Key keyframe, adding a KEY slot to the protected source Action.
@@ -1468,8 +1491,7 @@ def _abort_created_mesh_keys(obj, entry, tx):
                      and len(key.key_blocks) == len(tx["keys"]) + 1
                      and key.reference_key == tx["basis"])
         if unchanged:
-            rest = numpy.empty(len(key.reference_key.data) * 3, dtype=numpy.float32)
-            key.reference_key.data.foreach_get("co", rest)
+            rest = _mesh_key_coordinates(key.reference_key)
             unchanged = (key.reference_key.name == tx["basis_name"]
                          and _mesh_key_digest(rest) == tx["basis_digest"]
                          and (key.use_relative, key.eval_time) == tx["key_settings"]
@@ -1484,8 +1506,7 @@ def _abort_created_mesh_keys(obj, entry, tx):
         if unchanged:
             for index, (block, name, expected, metadata) in enumerate(tx["keys"]):
                 try:
-                    actual = numpy.empty(len(block.data) * 3, dtype=numpy.float32)
-                    block.data.foreach_get("co", actual)
+                    actual = _mesh_key_coordinates(block)
                     unchanged = (block.name == name
                                  and not block.mute and block.relative_key == tx["basis"]
                                  and (block.slider_min, block.slider_max, block.vertex_group,
@@ -1520,8 +1541,7 @@ def _abort_created_mesh_keys(obj, entry, tx):
         for block, _name, expected, _metadata in tx["keys"]:
             try:
                 if any(item == block for item in key.key_blocks):
-                    actual = numpy.empty(len(block.data) * 3, dtype=numpy.float32)
-                    block.data.foreach_get("co", actual)
+                    actual = _mesh_key_coordinates(block)
                     if _mesh_key_digest(actual) == expected:
                         owned_names.append(block.name)
             except (ReferenceError, UnicodeError):
@@ -1602,13 +1622,13 @@ def _mesh_action_snapshot(key):
 
 
 def _begin_mesh_action(obj, entry):
-    from ...core.full_bake_restore import _author_layers
+    from ...core.full_bake_restore import mesh_author_snapshot
     key = obj.data.shape_keys
     ad = key.animation_data
     old = ad.action if ad else None
     slot = _curve_action_slot(key)
     tx = dict(data=obj.data, key=key, action=old, slot=slot,
-              author_layers=_author_layers(obj.data),
+              author_layers=mesh_author_snapshot(obj.data),
               had_animation=ad is not None, working=None,
               expected_curves=_mesh_action_snapshot(key), keys=[],
               initial_keys=tuple(block.name for block in key.key_blocks),
@@ -1633,15 +1653,13 @@ def _absolute_mesh_unchanged(key, tx):
                 or _mesh_action_snapshot(key) != tx["expected_curves"]):
             return False
         basis = key.reference_key
-        coords = numpy.empty(len(basis.data) * 3, dtype=numpy.float32)
-        basis.data.foreach_get("co", coords)
+        coords = _mesh_key_coordinates(basis)
         if (basis.name != tx["basis_name"] or _mesh_key_digest(coords) != tx["basis_digest"]
                 or (basis.value, basis.mute, basis.slider_min, basis.slider_max,
                     basis.vertex_group, basis.interpolation) != tx["basis_settings"]):
             return False
         for index, (block, name, digest, metadata) in enumerate(tx["keys"]):
-            coords = numpy.empty(len(block.data) * 3, dtype=numpy.float32)
-            block.data.foreach_get("co", coords)
+            coords = _mesh_key_coordinates(block)
             if (key.key_blocks[index + 1] != block or block.name != name or block.mute
                     or float(block.frame) != tx["sample_frames"][index]
                     or (block.slider_min, block.slider_max, block.vertex_group,
@@ -1661,18 +1679,34 @@ def _absolute_mesh_unchanged(key, tx):
         return False
 
 
-def _validate_mesh_action(obj, entry):
+def _validate_mesh_action(obj, entry, *, frame_write=False):
     created = entry.get("mesh_created_key_transaction")
     if created is not None:
         if obj is None or obj.data != created["data"] or obj.data.shape_keys != created["key"]:
             raise ValueError("Mesh Shape Key data changed during Bake")
-        from ...core.full_bake_restore import _author_layers
-        if _author_layers(obj.data) != created["author_layers"]:
-            raise ValueError("Mesh author data changed during Bake")
+        if not frame_write:
+            from ...core.full_bake_restore import mesh_author_snapshot
+            if mesh_author_snapshot(obj.data) != created["author_layers"]:
+                raise ValueError("Mesh author data changed during Bake")
         if len(created["key"].key_blocks) != len(created["keys"]) + 1:
             raise ValueError("Mesh Shape Key set changed during Bake")
-        if created.get("encoding") == "ABSOLUTE_STEP_V1" and not _absolute_mesh_unchanged(created["key"], created):
-            raise ValueError("Mesh Shape Keys or animation changed during Bake")
+        if created.get("encoding") == "ABSOLUTE_STEP_V1":
+            if frame_write:
+                key = created["key"]
+                ad = key.animation_data
+                if (key.use_relative or key.reference_key != created["basis"]
+                        or (ad and (ad.drivers or ad.nla_tracks))
+                        or _mesh_action_snapshot(key) != created["expected_curves"]):
+                    raise ValueError("Mesh Shape Keys or animation changed during Bake")
+                curves = list(get_id_fcurves(key)) if ad and ad.action else []
+                if curves:
+                    if (len(curves) != 1 or curves[0].data_path != "eval_time"
+                            or abs(key.eval_time - curves[0].evaluate(bpy.context.scene.frame_current_final)) > 1e-4):
+                        raise ValueError("Mesh Shape Key evaluation changed during Bake")
+                elif abs(key.eval_time - created["key_settings"][1]) > 1e-4:
+                    raise ValueError("Mesh Shape Key evaluation changed during Bake")
+            elif not _absolute_mesh_unchanged(created["key"], created):
+                raise ValueError("Mesh Shape Keys or animation changed during Bake")
         ad = created["key"].animation_data
         if ((ad.action if ad else None) != created["action"]
                 or _curve_action_slot(created["key"]) != created["slot"]):
@@ -1683,9 +1717,10 @@ def _validate_mesh_action(obj, entry):
         return
     if obj is None or obj.data != tx["data"] or obj.data.shape_keys != tx["key"]:
         raise ValueError("Mesh Shape Key data changed during Bake")
-    from ...core.full_bake_restore import _author_layers
-    if _author_layers(obj.data) != tx["author_layers"]:
-        raise ValueError("Mesh author data changed during Bake")
+    if not frame_write:
+        from ...core.full_bake_restore import mesh_author_snapshot
+        if mesh_author_snapshot(obj.data) != tx["author_layers"]:
+            raise ValueError("Mesh author data changed during Bake")
     ad = tx["key"].animation_data
     if ad is None or ad.action != tx["working"] or _curve_action_slot(tx["key"]) != tx["working_slot"]:
         raise ValueError("Mesh Shape Key Action changed during Bake")
@@ -1735,8 +1770,7 @@ def _abort_mesh_entry(obj, entry):
             if block is None:
                 generated_unchanged = False
                 break
-            coordinates = numpy.empty(len(block.data) * 3, dtype=numpy.float32)
-            block.data.foreach_get("co", coordinates)
+            coordinates = _mesh_key_coordinates(block)
             curve = _sk_value_fcurve(key, name)
             evaluated = curve.evaluate(bpy.context.scene.frame_current_final) if curve else None
             if (_mesh_key_digest(coordinates) != digest or block.mute
@@ -2017,6 +2051,25 @@ class _ModalBakeBase:
         if available(context.scene):
             self.report({"ERROR"}, "请先点击恢复单帧烘焙前的模拟，再烘焙完整动画。")
             return {"CANCELLED"}
+        if _bake_job["active"]:
+            self.report({"WARNING"}, iface_("Another bake job is in progress"))
+            return {"CANCELLED"}
+        wm = context.window_manager
+        self._wm = wm
+        self._start_scene = context.scene
+        self._externally_cancelled = False
+        self._timer = wm.event_timer_add(0.02, window=context.window)
+        wm.modal_handler_add(self)
+        _bake_modal_owner = self
+        _bake_job.update(active=True, aborted=False, phase="preparing",
+                         scene=context.scene, status=iface_("Preparing animation bake..."))
+        redraw_all_areas(context)
+        return {"RUNNING_MODAL"}
+
+    def _prepare_job(self, context):
+        if context.scene != self._start_scene:
+            self.report({"ERROR"}, iface_("Bake targets or conflicts changed; reopen Bake All to review."))
+            return {"CANCELLED"}
         try:
             if self._kind == "all":
                 skipped, eligible, excluded = _preview_all(context)
@@ -2056,6 +2109,7 @@ class _ModalBakeBase:
                 ).format(conflicts=joined),
             )
             return {"CANCELLED"}
+        _bake_job["active"] = False  # Hand the modal reservation to the job.
         ok, err = _start_job(queue, kind=self._kind)
         if not ok:
             self.report({"WARNING"}, err)
@@ -2066,20 +2120,16 @@ class _ModalBakeBase:
             remaining = {uid: name for uid, name in excluded.items() if not include_soft or uid not in candidates}
             if remaining:
                 self.report({"INFO"}, iface_("Skipped soft STATIC meshes: {objects}").format(objects="; ".join(remaining.values())))
-        wm = context.window_manager
-        self._wm = wm
-        self._externally_cancelled = False
-        _bake_modal_owner = self
-        self._timer = wm.event_timer_add(0.01, window=context.window)
-        wm.modal_handler_add(self)
-        redraw_all_areas(context)
         return {"RUNNING_MODAL"}
 
     def modal(self, context, event):
         if getattr(self, "_externally_cancelled", False) or _bake_modal_owner is not self:
             self._detach_timer()
             return {"CANCELLED"}
-        if event.type != "TIMER":
+        if event.type == "ESC" and event.value == "PRESS":
+            _bake_job["aborted"] = True
+            return {"RUNNING_MODAL"}
+        if event.type != "TIMER" or getattr(event, "timer", self._timer) != self._timer:
             return {"PASS_THROUGH"}
         if _bake_job["aborted"]:
             _abort_job()
@@ -2087,12 +2137,17 @@ class _ModalBakeBase:
             redraw_all_areas(context)
             self.report({"INFO"}, iface_("Bake aborted"))
             return {"CANCELLED"}
-        try:
-            more = _tick_job()
-        except Exception as exc:
-            _abort_job();self._teardown(context);self.report({"ERROR"}, str(exc));return {"CANCELLED"}
-        redraw_all_areas(context)
-        if not more and not _bake_job["aborted"]:
+        if _bake_job["phase"] == "preparing":
+            try:
+                result = self._prepare_job(context)
+            except Exception as exc:
+                self.report({"ERROR"}, str(exc))
+                result = {"CANCELLED"}
+            if result != {"RUNNING_MODAL"}:
+                self._teardown(context)
+            redraw_all_areas(context)
+            return result
+        if _bake_job["phase"] == "finalizing":
             try:
                 n_objs, n_frames = _finalize_job(context)
             except Exception as exc:
@@ -2108,6 +2163,13 @@ class _ModalBakeBase:
                 ),
             )
             return {"FINISHED"}
+        try:
+            more = _tick_job(budget_ms=20)
+        except Exception as exc:
+            _abort_job();self._teardown(context);self.report({"ERROR"}, str(exc));return {"CANCELLED"}
+        if not more and not _bake_job["aborted"]:
+            _bake_job.update(phase="finalizing", status=iface_("Finalizing baked animation..."))
+        redraw_all_areas(context)
         return {"RUNNING_MODAL"}
 
     def cancel(self, context):

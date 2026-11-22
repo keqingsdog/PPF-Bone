@@ -123,7 +123,7 @@ def prepare_working_mesh(obj, entry):
             bpy.data.objects.remove(temporary)
         if working.shape_keys is not None:
             raise ValueError('Could not clear the copied mesh shape keys')
-        entry['working_base_signature'] = data_signature(working)
+        entry['working_base_signature'] = data_signature(working, legacy=False)
     except BaseException:
         if working.users == 0:
             bpy.data.meshes.remove(working)
@@ -137,7 +137,7 @@ def working_mesh_unchanged(entry):
     working = row['data']
     obj = row.get('obj')
     return (obj is not None and obj.data == working and working != row['backup']
-            and data_signature(working, include_shape_keys=False) == entry.get('working_base_signature'))
+            and data_signature(working, include_shape_keys=False, legacy=not entry.get('working_base_signature', '').startswith(('mesh-v2:', 'mesh-v3:')), compact_version=2 if entry.get('working_base_signature', '').startswith('mesh-v2:') else 3) == entry.get('working_base_signature'))
 
 
 def rollback_working_mesh(row):
@@ -485,15 +485,93 @@ def _shape_settings(key, animated):
     return {'properties': properties, 'custom': {k: _plain_value(key[k]) for k in key.keys()}, 'blocks': blocks}
 
 
-def _source_mesh_signature(row):
+def _source_mesh_signature(row, expected=None):
     backup = row['backup']
-    return data_signature(backup, source_shape_graph=bool(row.get('retains_original_mesh')))
+    return data_signature(backup, source_shape_graph=bool(row.get('retains_original_mesh')), legacy=expected is not None and not expected.startswith(('mesh-v2:', 'mesh-v3:')), compact_version=2 if expected and expected.startswith('mesh-v2:') else 3)
 
 
-def data_signature(data, *, source_shape_graph=False, include_shape_keys=True):
+def _bulk_fingerprint(collection, field, code, width=1):
+    """Return a compact exact fingerprint of a native RNA collection field."""
+    from array import array
+    import hashlib
+    values = array(code, [0]) * (len(collection) * width)
+    collection.foreach_get(field, values)
+    return [len(collection), width, code, hashlib.sha256(values.tobytes()).hexdigest()]
+
+
+def _bulk_attribute_values(attribute):
+    data = attribute.data
+    if not data:
+        return []
+    sample = data[0]
+    fields = _rna_values(sample)
+    result = {}
+    try:
+        for name, value in fields.items():
+            prop = sample.bl_rna.properties[name]
+            if prop.type not in {'FLOAT', 'INT', 'BOOLEAN'}:
+                raise ValueError('unsupported attribute field')
+            code = {'FLOAT': 'f', 'INT': 'i', 'BOOLEAN': 'b'}[prop.type]
+            width = len(value) if isinstance(value, list) else 1
+            result[name] = _bulk_fingerprint(data, name, code, width)
+        return result
+    except (AttributeError, TypeError, ValueError, RuntimeError):
+        return [_rna_values(item) for item in data]
+
+
+def mesh_author_snapshot(data):
+    """Capture mesh author metadata with native bulk reads when supported."""
+    return {'properties': _rna_values(data),
+            'materials': [_plain_value(m) for m in data.materials],
+            'custom': {k: _plain_value(data[k]) for k in data.keys()},
+            'attributes': [(a.name, a.data_type, a.domain, _bulk_attribute_values(a)) for a in data.attributes],
+            'uv_layers': [(u.name, u.active_render, u.active_clone) for u in data.uv_layers],
+            'polygons': [_bulk_fingerprint(data.polygons, 'material_index', 'i'),
+                         _bulk_fingerprint(data.polygons, 'use_smooth', 'b')],
+            'edges': _bulk_fingerprint(data.edges, 'use_seam', 'b'),
+            'weights': [[(g.group, g.weight) for g in v.groups] for v in data.vertices]}
+
+
+def _bulk_mesh_topology(data):
+    return [len(data.vertices), _bulk_fingerprint(data.edges, 'vertices', 'i', 2),
+            _bulk_fingerprint(data.loops, 'vertex_index', 'i'),
+            _bulk_fingerprint(data.polygons, 'loop_start', 'i'),
+            _bulk_fingerprint(data.polygons, 'loop_total', 'i')]
+
+
+def _compact_mesh_signature(data, shape, animated, *, version=3):
+    """Stream mesh coordinates in native batches; retain existing metadata checks."""
+    import hashlib
+    from array import array
+    digest = hashlib.sha256()
+    def part(value):
+        payload = json.dumps(value, sort_keys=True, ensure_ascii=True).encode('utf-8')
+        digest.update(len(payload).to_bytes(8, 'big'))
+        digest.update(payload)
+    def coords(collection):
+        values = array('f', [0.0]) * (len(collection) * 3)
+        collection.foreach_get('co', values)
+        digest.update(len(values).to_bytes(8, 'big'))
+        digest.update(values.tobytes())
+    part(_bulk_mesh_topology(data) if version == 3 else single._mesh_topology(data))
+    coords(data.vertices)
+    part(len(shape.key_blocks) if shape else 0)
+    if shape:
+        for block in shape.key_blocks:
+            part(block.name)
+            coords(getattr(block, 'points', block.data))
+    part(single._action_signature(shape) if shape else '')
+    part(_shape_settings(shape, animated) if shape else {})
+    part(mesh_author_snapshot(data) if version == 3 else _author_layers(data))
+    return f'mesh-v{version}:' + digest.hexdigest()
+
+
+def data_signature(data, *, source_shape_graph=False, include_shape_keys=True, legacy=True, compact_version=3):
     if isinstance(data,bpy.types.Mesh):
         shape=data.shape_keys if include_shape_keys else None
         animated = _animated_shape_paths(shape) if shape and source_shape_graph else ()
+        if not legacy:
+            return _compact_mesh_signature(data, shape, animated, version=compact_version)
         return json.dumps([single._mesh_topology(data),[list(v.co) for v in data.vertices],
             [[k.name,[list(v.co) for v in k.data]] for k in shape.key_blocks] if shape else [],
             single._action_signature(shape) if shape else '',
@@ -633,7 +711,7 @@ def commit(scene, tx, queue):
                 and _is_zero_curve_cache(row.get('cache_path'), _curve_point_count(obj))):
             row['curve_no_output_schema'] = 1
             row['curve_no_output_points'] = _curve_point_count(obj)
-        row['signature']=data_signature(obj.data)
+        row['signature']=data_signature(obj.data, legacy=False)
         row['object_action']=single._action_signature(obj)
         if obj.animation_data and obj.animation_data.action:row['current_action']=obj.animation_data.action
         row['mod_signatures']=[single._modifier_signature(m) for m in obj.modifiers]
@@ -693,7 +771,7 @@ def _validate_backup_source_signatures(tx):
         backup=row.get('backup');expected=row.get('source_signature')
         if backup is None or not isinstance(expected,str) or not expected:
             raise ValueError('原始备份或数据指纹缺失；未修改场景。')
-        if _source_mesh_signature(row)!=expected:
+        if _source_mesh_signature(row, expected)!=expected:
             raise ValueError('原始备份数据或作者动画已改变；未进入恢复或切换帧。')
 
 
@@ -702,6 +780,9 @@ def _validation_backup_signatures(tx):
     from .utils import get_id_fcurves
     result = []
     for row in tx['items']:
+        if row['source_signature'].startswith(('mesh-v2:', 'mesh-v3:')):
+            result.append(row['source_signature'])
+            continue
         expected = json.loads(row['source_signature'])
         backup = row['backup']
         binding = row.get('curve_source_binding')
@@ -814,13 +895,13 @@ def _restore(scene, validation_signatures):
         if obj is None or backup is None or obj.data!=row['data']:raise ValueError('烘焙对象或数据已替换，未覆盖当前工程。')
         if 'action' in row and row.get('action') is None:raise ValueError('原物体动画已删除，未修改场景。')
         if not single._valid_action_slot(row.get('action'),row):raise ValueError('原物体动画槽已删除，未修改场景。')
-        if _source_mesh_signature(row)!=validation_signatures[index]:raise ValueError('原始数据或作者动画已改变，未修改场景。')
+        if _source_mesh_signature(row, validation_signatures[index])!=validation_signatures[index]:raise ValueError('原始数据或作者动画已改变，未修改场景。')
         if row.get('cache_path') and not __import__('os').path.isfile(row['cache_path']):raise ValueError('原模拟缓存已被删除，未修改当前工程。')
         if row.get('cache_path'):
             expected=row.get('cache_sha256')
             if not expected:raise ValueError('旧恢复记录没有缓存内容指纹，无法安全恢复；原烘焙与记录已保留。')
             if _cache_digest(row['cache_path'])!=expected:raise ValueError('原模拟缓存内容已改变，未覆盖当前工程。')
-        if data_signature(obj.data)!=row['signature'] or single._action_signature(obj)!=row['object_action']:
+        if data_signature(obj.data, legacy=not row['signature'].startswith(('mesh-v2:', 'mesh-v3:')), compact_version=2 if row['signature'].startswith('mesh-v2:') else 3)!=row['signature'] or single._action_signature(obj)!=row['object_action']:
             raise ValueError('烘焙后对象或动画已编辑，未覆盖作者修改。')
         action=obj.animation_data.action if obj.animation_data else None
         if action!=row.get('current_action'):raise ValueError('烘焙后动画已改绑，未覆盖作者修改。')
@@ -1007,7 +1088,7 @@ def _discard(scene):
                 row['backup'].use_fake_user=not single._release_backup_safe(scene,tx,row['backup'],own_key=KEY)
         obj=row.get('obj')
         if obj is None:continue
-        unchanged=(obj.data==row['data'] and data_signature(obj.data)==row['signature'] and single._action_signature(obj)==row['object_action'])
+        unchanged=(obj.data==row['data'] and data_signature(obj.data, legacy=not row['signature'].startswith(('mesh-v2:', 'mesh-v3:')), compact_version=2 if row['signature'].startswith('mesh-v2:') else 3)==row['signature'] and single._action_signature(obj)==row['object_action'])
         if obj.type=='CURVE':
             if unchanged:
                 from .curve_output import mark_detached
