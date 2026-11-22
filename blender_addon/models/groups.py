@@ -117,11 +117,8 @@ OBJECT_GROUP_DEFAULTS = {
     # feature was built for), sweeping 0.1 / 1 / 10 / 100 / 1000: 0.1 is too
     # soft and the collider deforms into an intersection, 1 completes but
     # gives up 33 mm at the worst contact, and 1000 starts costing Newton
-    # iterations as it approaches the exact pin it replaces. 10 sits mid-range,
-    # holds the collider to 0.08 mm mean / 8 mm worst-case, and solves as
-    # cheaply as an exact pin does. It is a starting point, not a constant: the
-    # right value scales with how hard the scene's contacts push.
-    "soft_constraint_stiffness": 10.0,
+    # iterations as it approaches the exact pin it replaces.
+    "soft_constraint_stiffness": 100.0,
     # Rod-specific parameters (1D analog of shell shrink_x / solid shrink)
     "length_factor": 1.0,
     # The tetrahedralizer backend (fTetWild / TetGen) and its per-field

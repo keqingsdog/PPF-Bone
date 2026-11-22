@@ -174,7 +174,7 @@ try:
         hasattr(rna_hard, "enable_soft_constraint")
         and hasattr(rna_hard, "soft_constraint_stiffness")
         and rna_hard.enable_soft_constraint is False
-        and abs(rna_hard.soft_constraint_stiffness - 10.0) < 1e-6
+        and abs(rna_hard.soft_constraint_stiffness - 100.0) < 1e-6
     )
     dh.record(
         "D_rna_registered_with_defaults", defaults_ok,
