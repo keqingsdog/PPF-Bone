@@ -2427,5 +2427,14 @@
   "PMX 限位下限须小于上限": "The PMX lower limit must be below the upper limit.",
   "代理惯量预览": "Proxy Inertia Preview",
   "等待有效代理惯量": "Waiting for valid proxy inertia",
-  "自动自定义曲线": "Adaptive Custom Curve"
+  "自动自定义曲线": "Adaptive Custom Curve",
+  "Bake Remaining": "Bake Remaining",
+  "These modifiers will be deactivated for baked objects:": "These modifiers will be deactivated for baked objects:",
+  "Cache modifiers on baked objects will be deactivated.": "Cache modifiers on baked objects will be deactivated.",
+  "These objects have shape-key conflicts and will be skipped:": "These objects have shape-key conflicts and will be skipped:",
+  "Existing shape keys conflict with animation bake on: {conflicts}": "Existing shape keys conflict with animation bake on: {conflicts}",
+  "Shape-key conflicts require review; invoke Bake All again: {conflicts}": "Shape-key conflicts require review; invoke Bake All again: {conflicts}",
+  "Skipped shape-key conflicts: {conflicts}": "Skipped shape-key conflicts: {conflicts}",
+  "Bake targets or conflicts changed; reopen Bake All to review.": "Bake targets or conflicts changed; reopen Bake All to review.",
+  "No remaining animation to bake; skipped: {conflicts}": "No remaining animation to bake; skipped: {conflicts}"
 }

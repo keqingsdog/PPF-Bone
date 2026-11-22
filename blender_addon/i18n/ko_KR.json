@@ -2155,5 +2155,14 @@
   "PMX 限位下限须小于上限": "PMX 하한은 상한보다 작아야 합니다.",
   "代理惯量预览": "프록시 관성 미리 보기",
   "等待有效代理惯量": "유효한 프록시 관성을 기다리는 중",
-  "自动自定义曲线": "적응형 사용자 곡선"
+  "自动自定义曲线": "적응형 사용자 곡선",
+  "Bake Remaining": "나머지 베이크",
+  "These modifiers will be deactivated for baked objects:": "베이크 대상의 다음 모디파이어가 비활성화됩니다:",
+  "Cache modifiers on baked objects will be deactivated.": "베이크 대상의 캐시 모디파이어가 비활성화됩니다.",
+  "These objects have shape-key conflicts and will be skipped:": "셰이프 키 충돌이 있는 다음 객체를 건너뜁니다:",
+  "Existing shape keys conflict with animation bake on: {conflicts}": "기존 셰이프 키가 애니메이션 베이크와 충돌합니다: {conflicts}",
+  "Shape-key conflicts require review; invoke Bake All again: {conflicts}": "대상 또는 충돌이 변경되었습니다. 전체 베이크를 다시 확인하세요: {conflicts}",
+  "Skipped shape-key conflicts: {conflicts}": "셰이프 키 충돌 대상을 건너뛰었습니다: {conflicts}",
+  "Bake targets or conflicts changed; reopen Bake All to review.": "대상 또는 충돌이 변경되었습니다. 전체 베이크를 다시 여세요.",
+  "No remaining animation to bake; skipped: {conflicts}": "베이크할 애니메이션이 남지 않았습니다. 건너뜀: {conflicts}"
 }

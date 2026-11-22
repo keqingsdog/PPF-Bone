@@ -356,7 +356,7 @@ def _validate_curve_bake_cache(obj, cache):
         raise ValueError(f"Curve '{obj.name}' cache has non-finite coordinates")
 
 
-def _build_queue(context, *, group_index: int | None = None) -> list:
+def _build_queue(context, *, group_index: int | None = None, skipped=None) -> list:
     """Return job entries for every assigned MESH/CURVE in scope. The
     "all groups" case (``group_index is None``) queues every assigned
     object in every active group — STATIC colliders and fcurve-driven
@@ -388,6 +388,8 @@ def _build_queue(context, *, group_index: int | None = None) -> list:
         if group is None or not group.active:
             continue
         for assigned in group.assigned_objects:
+            if skipped and assigned.uuid in skipped:
+                continue
             obj = resolve_assigned(assigned)
             if obj is None or obj.type not in ("MESH", "CURVE"):
                 continue
@@ -402,12 +404,56 @@ def _build_queue(context, *, group_index: int | None = None) -> list:
 # Pre-bake validation
 # ---------------------------------------------------------------------------
 
+def _preview_all(context):
+    """Read mesh cache headers without changing objects or migrating caches."""
+    from ...core.uuid_registry import get_object_by_uuid
+    from ...core.pc2 import object_pc2_key_readonly
+    from ...models.groups import get_addon_data
+    from ..state import N_MAX_GROUPS
+    skipped, eligible, seen = {}, [], set()
+    for gi in range(N_MAX_GROUPS):
+        group = getattr(get_addon_data(context.scene), f"object_group_{gi}", None)
+        if group is None or not group.active:
+            continue
+        for assigned in group.assigned_objects:
+            obj = get_object_by_uuid(assigned.uuid)
+            if obj is None or obj.type not in ("MESH", "CURVE"):
+                continue
+            pointer = obj.as_pointer()
+            if pointer in seen:
+                continue
+            seen.add(pointer)
+            keys = obj.data.shape_keys if obj.type == "MESH" else None
+            conflict = False
+            if keys and len(keys.key_blocks) > 1:
+                uid = object_pc2_key_readonly(obj)
+                path = get_pc2_path(uid) if uid else ""
+                if not path or not os.path.exists(path):
+                    path = get_pc2_path(obj.name)
+                if os.path.exists(path):
+                    conflict = (read_pc2_frame_count(path) > 0 and
+                                read_pc2_n_verts(path) == len(obj.data.vertices))
+            if conflict:
+                names = [kb.name for kb in list(keys.key_blocks)[1:]]
+                preview = ", ".join(names[:3])
+                if len(names) > 3:
+                    preview += iface_(" (+{count} more)").format(count=len(names) - 3)
+                skipped[assigned.uuid] = f"{obj.name} [{preview}]"
+            else:
+                eligible.append(obj)
+    return skipped, eligible
+
+
+def _preview_signature(skipped, eligible):
+    return (tuple(sorted(skipped.items())),
+            tuple((obj.as_pointer(), tuple(modifiers_above_cache(obj)))
+                  for obj in eligible))
+
 
 def _check_mesh_shape_keys(queue: list) -> list[str]:
     """Return blocker lines for MESH entries that already carry non-Basis
     shape keys. Baking absolute poses into additional shape keys would
-    double-blend with the user's existing keys, so refuse and ask them
-    to remove extras manually."""
+    double-blend with the user's existing keys, so refuse the bake."""
     from ...core.uuid_registry import get_object_by_uuid
     blockers: list[str] = []
     for entry in queue:
@@ -1806,11 +1852,12 @@ def _removable_modifiers_for_objs(objs) -> list:
 def _draw_bake_dialog(layout, prompt: str, removable: list) -> None:
     """Render the shared bake-confirm dialog body."""
     layout.label(text=prompt, icon="QUESTION")
+    layout.label(text="Cache modifiers on baked objects will be deactivated.")
     if removable:
         layout.separator()
         box = layout.box()
         box.label(
-            text="These deforming modifiers will also be removed:",
+            text="These modifiers will be deactivated for baked objects:",
             icon="ERROR",
         )
         for obj_name, mod_names in removable:
@@ -1847,7 +1894,19 @@ class _ModalBakeBase:
             self.report({"ERROR"}, "请先点击恢复单帧烘焙前的模拟，再烘焙完整动画。")
             return {"CANCELLED"}
         try:
-            queue = self._build_queue_for(context)
+            if self._kind == "all":
+                skipped, eligible = _preview_all(context)
+                confirmed = getattr(self, "_confirmed_skipped", None)
+                signature = _preview_signature(skipped, eligible)
+                if (skipped and confirmed is None) or (confirmed is not None and getattr(self, "_confirmed_signature", None) != signature):
+                    self.report({"ERROR"}, iface_("Bake targets or conflicts changed; reopen Bake All to review."))
+                    return {"CANCELLED"}
+                queue = _build_queue(context, skipped=skipped)
+                if skipped and not any(e.get("n_frames", 0) > 0 for e in queue):
+                    self.report({"WARNING"}, iface_("No remaining animation to bake; skipped: {conflicts}").format(conflicts="; ".join(skipped.values())))
+                    return {"CANCELLED"}
+            else:
+                queue = self._build_queue_for(context)
         except (OSError, ValueError, struct.error) as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
@@ -1857,8 +1916,7 @@ class _ModalBakeBase:
             self.report(
                 {"ERROR"},
                 iface_(
-                    "Remove all shape keys except Basis before baking — "
-                    "conflicts on: {conflicts}"
+                    "Existing shape keys conflict with animation bake on: {conflicts}"
                 ).format(conflicts=joined),
             )
             return {"CANCELLED"}
@@ -1866,6 +1924,8 @@ class _ModalBakeBase:
         if not ok:
             self.report({"WARNING"}, err)
             return {"CANCELLED"}
+        if self._kind == "all" and skipped:
+            self.report({"WARNING"}, iface_("Skipped shape-key conflicts: {conflicts}").format(conflicts="; ".join(skipped.values())))
         wm = context.window_manager
         self._wm = wm
         self._externally_cancelled = False
@@ -2132,20 +2192,17 @@ class SOLVER_OT_BakeAllAnimation(_ModalBakeBase, Operator):
                 ),
             )
             return {"CANCELLED"}
-        from ...core.uuid_registry import get_object_by_uuid
         try:
-            queue = self._build_queue_for(context)
+            skipped, objs = _preview_all(context)
         except (OSError, ValueError, struct.error) as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
-        objs = [
-            get_object_by_uuid(e["obj_uuid"])
-            for e in queue if e["obj_type"] == "MESH"
-        ]
+        self._confirmed_skipped = skipped
+        self._confirmed_signature = _preview_signature(skipped, objs)
         self._removable = _removable_modifiers_for_objs(objs)
         return context.window_manager.invoke_props_dialog(
-            self, width=420, title="Bake Animation",
-            confirm_text="Bake All",
+            self, width=520, title="Bake Animation",
+            confirm_text="Bake Remaining" if skipped else "Bake All",
         )
 
     def draw(self, context):
@@ -2154,6 +2211,12 @@ class SOLVER_OT_BakeAllAnimation(_ModalBakeBase, Operator):
             "Bake animation for all objects in active groups?",
             getattr(self, "_removable", []),
         )
+        skipped = getattr(self, "_confirmed_skipped", {})
+        if skipped:
+            box = self.layout.box()
+            box.label(text="These objects have shape-key conflicts and will be skipped:", icon="ERROR")
+            for line in skipped.values():
+                box.label(text=line)
 
     def _build_queue_for(self, context) -> list:
         return _build_queue(context, group_index=None)

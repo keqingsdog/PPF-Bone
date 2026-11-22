@@ -2481,5 +2481,14 @@
   "PMX 限位下限须小于上限": "PMX 限位下限须小于上限",
   "代理惯量预览": "代理惯量预览",
   "等待有效代理惯量": "等待有效代理惯量",
-  "自动自定义曲线": "自动自定义曲线"
+  "自动自定义曲线": "自动自定义曲线",
+  "Bake Remaining": "烘焙其余对象",
+  "These modifiers will be deactivated for baked objects:": "以下修改器将在烘焙对象上停用：",
+  "Cache modifiers on baked objects will be deactivated.": "烘焙对象上的缓存修改器将被停用。",
+  "These objects have shape-key conflicts and will be skipped:": "以下对象存在形态键冲突，将被跳过：",
+  "Existing shape keys conflict with animation bake on: {conflicts}": "现有形态键与动画烘焙冲突：{conflicts}",
+  "Shape-key conflicts require review; invoke Bake All again: {conflicts}": "烘焙目标或形态键冲突已改变，请重新打开全部烘焙确认：{conflicts}",
+  "Skipped shape-key conflicts: {conflicts}": "已跳过形态键冲突对象：{conflicts}",
+  "Bake targets or conflicts changed; reopen Bake All to review.": "烘焙目标或冲突已改变，请重新打开全部烘焙以检查。",
+  "No remaining animation to bake; skipped: {conflicts}": "没有剩余动画可烘焙；已跳过：{conflicts}"
 }

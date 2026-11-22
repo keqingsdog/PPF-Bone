@@ -2155,5 +2155,14 @@
   "PMX 限位下限须小于上限": "PMX の下限は上限より小さくしてください。",
   "代理惯量预览": "プロキシ慣性のプレビュー",
   "等待有效代理惯量": "有効なプロキシ慣性を待機中",
-  "自动自定义曲线": "自動適応カスタム曲線"
+  "自动自定义曲线": "自動適応カスタム曲線",
+  "Bake Remaining": "残りをベイク",
+  "These modifiers will be deactivated for baked objects:": "ベイク対象の次のモディファイアーを無効にします:",
+  "Cache modifiers on baked objects will be deactivated.": "ベイク対象のキャッシュモディファイアーを無効にします。",
+  "These objects have shape-key conflicts and will be skipped:": "シェイプキーが競合する次のオブジェクトをスキップします:",
+  "Existing shape keys conflict with animation bake on: {conflicts}": "既存のシェイプキーがアニメーションベイクと競合します: {conflicts}",
+  "Shape-key conflicts require review; invoke Bake All again: {conflicts}": "対象または競合が変わりました。すべてベイクを再確認してください: {conflicts}",
+  "Skipped shape-key conflicts: {conflicts}": "シェイプキーが競合する対象をスキップしました: {conflicts}",
+  "Bake targets or conflicts changed; reopen Bake All to review.": "対象または競合が変わりました。すべてベイクを開き直してください。",
+  "No remaining animation to bake; skipped: {conflicts}": "ベイクする残りのアニメーションはありません。スキップ: {conflicts}"
 }
