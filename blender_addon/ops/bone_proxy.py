@@ -403,8 +403,17 @@ def _update_proxies_author_transaction(context, all_bones=False, scope='SELECTED
                  and b.ppf_bone_physics.joint_mode in {'SOFT','BALL_FIXED'}
                  for channel in (('twist_x','swing_y','swing_z') if b.ppf_bone_physics.joint_mode=='BALL_FIXED' else ('twist_x','swing_y','swing_z','anchor'))]
         data=get_addon_data(context.scene)
+        # Imported and authored proxies keep their pre-existing defaults.
+        new_native_joint_ids = {
+            planned_ids[bone.name] for bone in bones
+            if authoring_rows is None and bone.name in fresh
+            and bone.ppf_bone_physics.joint_control_mode == 'NATIVE'
+            and not bone.ppf_bone_physics.is_property_set('angular_stiffness')
+            and not bone.ppf_bone_physics.is_property_set('angular_damping')
+        }
         candidate=add_new_common(previous,targets,[p.pair_id for p in data.state.merge_pairs],
-                                 has_draft=dormant or bool(owner.editor_target_json or len(owner.nodes)))
+                                 has_draft=dormant or bool(owner.editor_target_json or len(owner.nodes)),
+                                 new_native_joint_ids=new_native_joint_ids)
         from ..core.bone_author_follow import flush_author_before_update
         follow_changed = flush_author_before_update(context)
         count=_update_proxies(context,all_bones,scope,rebuild,planned_ids,retained_meshes,new_visibility,reset_default_size,shape_changed_from,new_resources,authoring_rows)

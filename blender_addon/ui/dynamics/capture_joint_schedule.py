@@ -11,7 +11,13 @@ class JointCapture:
     _combined_capture_owner = True
     _capture_cancelled = False
 
-    def __init__(self, context, static_objects, pin_specs):
+    def __init__(self, context, static_objects, pin_specs, *, frame_reader=None, bone_sampling=None):
+        # Optional prototype extension point. The reader owns transaction-local
+        # scratch and must not publish or write Blender state. This is not a
+        # validity proof or an input-cache contract for a later Transfer.
+        self._frame_reader = frame_reader
+        self.bone_sampling = bone_sampling
+        self._reader_done_frame = None
         self.context = context
         self.scene = context.scene
         self.saved_frame = int(self.scene.frame_current)
@@ -59,6 +65,8 @@ class JointCapture:
             if job.get('aborted'):
                 raise RuntimeError(job.get('error') or "Combined deformation capture cancelled")
             frame._require_supported(self.context, job, token, self.layer, self.world, self.callbacks)
+        if self.bone_sampling is not None:
+            self.bone_sampling.require_valid(self.context)
         if self.jobs:
             origin.sampling_targets(self.jobs[0][2], ())
         if self.restored:
@@ -77,8 +85,11 @@ class JointCapture:
                 mod._require_capture_range_settings(self.scene, rows)
 
     def _pending(self):
-        return min((f for _, _, _, _, rows in self.jobs
-                    if (f := frame._pending_frame(rows)) is not None), default=None)
+        frames = [f for _, _, _, _, rows in self.jobs
+                  if (f := frame._pending_frame(rows)) is not None]
+        if self.bone_sampling is not None and self.bone_sampling.pending is not None:
+            frames.append(self.bone_sampling.pending)
+        return min(frames, default=None)
 
     def tick(self, context=None, *, budget_ms=40):
         """Sample union frames; return whether more samples remain."""
@@ -114,6 +125,13 @@ class JointCapture:
                 with origin.sampling_cache_scope(self._capture_sampling_targets):
                     graph = self.context.evaluated_depsgraph_get()
                     self._guard()
+                    if self._frame_reader is not None and self._reader_done_frame != f:
+                        self._frame_reader(self.context, graph, f)
+                        self._guard()
+                        self._reader_done_frame = f
+                    if self.bone_sampling is not None:
+                        self.bone_sampling.sample(self.context, f)
+                        self._guard()
                     expired = False
                     for kind, mod, job, _, rows in self.jobs:
                         for row in rows:
@@ -209,3 +227,5 @@ class JointCapture:
                     mod._reset_job()
             self.closed = True
             self._capture_sampling_targets = None
+            self._frame_reader = None
+            self.bone_sampling = None

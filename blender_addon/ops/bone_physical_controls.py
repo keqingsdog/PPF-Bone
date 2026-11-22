@@ -111,7 +111,13 @@ def refresh_active():
 
 
 def direct_commit(context,bone,channel,k,c,*,replace=False,component=None):
-    """Plan all scoped targets, then commit one channel atomically."""
+    """Single-channel entry point used by the explicit custom mode switch."""
+    count,skipped,_state=_direct_commit_many(context,bone,{channel:(k,c,component)},replace=replace)
+    return count,skipped
+
+
+def _direct_commit_many(context,bone,edits,*,replace=False):
+    """Plan every axis for every scoped joint before one document write."""
     from .bone_chain_presets import _active_physical_bone,_targets_for_bone
     from .bone_proxy import selected_bones,_owner_animation_paths
     from .bone_proxy_editor import editor_active,editor_scope
@@ -120,16 +126,18 @@ def direct_commit(context,bone,channel,k,c,*,replace=False,component=None):
     from . import restoring_curve_presets as presets
     arm,active=_active_physical_bone(context)
     if active!=bone:raise ValueError('活动骨骼已改变，恢复参数未写入')
+    if not context.scene.is_editable or not arm.data.is_editable:
+        raise ValueError('场景或骨架不可编辑')
     proxy._facade_communicator().assert_bone_body_switch_idle()
     if proxy.stale_simulation_output(context):raise ValueError('请先 Clear 已有模拟帧，再修改恢复力')
-    k=to_si(k,channel);c=to_si(c,channel)
+    converted={ch:(to_si(k,ch),to_si(c,ch),component) for ch,(k,c,component) in edits.items()}
     scope=editor_scope(context) if editor_active(context) else 'SELECTED'
     _arm,bones=selected_bones(context,scope=scope)
     if bone not in bones:raise ValueError('活动骨骼不在当前操作范围')
     state=read_state(context.scene)
     if state['mode']=='LEGACY' and state.get('document') is not None:
         raise ValueError('保留中的旧自定义曲线尚未启用，不能自动替换')
-    targets=[];skipped=[];constants={}
+    targets=[];skipped=[];tables=[];bindings=[];joint_ids=set()
     paths=[p for block,label in ((context.scene,'scene'),(arm.data,'armature data'),(arm,'armature object')) for p in _owner_animation_paths(block,label)]
     for target_bone in bones:
         rows=_targets_for_bone(arm,target_bone)
@@ -141,29 +149,32 @@ def direct_commit(context,bone,channel,k,c,*,replace=False,component=None):
         validate_proxy_owner(arm,target_bone)
         prefix=target_bone.path_from_id()+'.ppf_bone_restoring_controls.'
         if any(p.startswith(prefix) for p in paths):raise ValueError(target_bone.name+': 恢复参数有动画，不能直接改写')
-        target=next((t for t in rows if t['channel']==channel), None)
-        if target is None:
-            skipped.append(target_bone.name);continue
-        saved=_channel_state(state,target['joint_uuid'],channel)
-        # Only an explicit mode switch may replace AUTO/nonlinear intent.
-        if not replace and saved and saved['binding']['enabled'] and state['mode']!='LEGACY':
-            if saved['binding']['mode']!='ABSOLUTE_SI' or linear_constants(saved['table'],saved['binding']['damping']) is None:
-                raise ValueError(target_bone.name+': 此通道仍为自适应或自定义曲线，请先显式选择固定 SI')
-        pair=(k,c)
-        if component is not None:
-            original=(settings.anchor_stiffness,0.) if channel=='anchor' else (settings.angular_stiffness[CHANNELS.index(channel)],settings.angular_damping[CHANNELS.index(channel)])
+        matched=[t for t in rows if t['channel'] in converted]
+        if not matched:
+            skipped.append(target_bone.name)
+            continue
+        if len(matched)!=len(converted):
+            raise ValueError(target_bone.name+': 当前关节缺少选中的恢复通道')
+        for target in matched:
+            channel=target['channel']
+            k,c,component=converted[channel]
+            saved=_channel_state(state,target['joint_uuid'],channel)
             if saved and saved['binding']['enabled'] and state['mode']!='LEGACY':
-                original=linear_constants(saved['table'],saved['binding']['damping'])
-            pair=(k,original[1]) if component=='k' else (original[0],c)
-        constants[target['joint_uuid']]=pair
-        targets.append(target)
+                if not replace and (saved['binding']['mode']!='ABSOLUTE_SI'
+                                    or linear_constants(saved['table'],saved['binding']['damping']) is None):
+                    raise ValueError(target_bone.name+': 此通道仍为自适应或自定义曲线，请先显式选择固定 SI')
+            if component is not None:
+                original=(settings.anchor_stiffness,0.) if channel=='anchor' else (settings.angular_stiffness[CHANNELS.index(channel)],settings.angular_damping[CHANNELS.index(channel)])
+                if saved and saved['binding']['enabled'] and state['mode']!='LEGACY':
+                    original=linear_constants(saved['table'],saved['binding']['damping'])
+                if component=='k':c=original[1]
+                else:k=original[0]
+            tid='physical_'+uuid.uuid4().hex
+            tables.append(dict(table_id=tid,domain='RADIAL' if channel=='anchor' else 'ODD',tail='LINEAR',nodes=[[0.,0.],[1.,k]]))
+            bindings.append(dict(target=target,enabled=True,table_id=tid,mode='ABSOLUTE_SI',damping=c))
+            joint_ids.add(target['joint_uuid'])
+            targets.append(target)
     if not targets:raise ValueError('当前范围无可写父关节')
-    tables=[];bindings=[]
-    for target in targets:
-        tid='physical_'+uuid.uuid4().hex
-        target_k,target_c=constants[target['joint_uuid']]
-        tables.append(dict(table_id=tid,domain='RADIAL' if channel=='anchor' else 'ODD',tail='LINEAR',nodes=[[0.,0.],[1.,target_k]]))
-        bindings.append(dict(target=target,enabled=True,table_id=tid,mode='ABSOLUTE_SI',damping=target_c))
     doc=curves.validate_author_map(dict(version=1,tables=tables,bindings=bindings,stitch_pairs=[]))
     author.apply_preset(state,presets.named_preset('物理刚度',doc),[dict(source=t,destination=t) for t in targets],targets,[])
     owner=context.scene.ppf_restoring_curves
@@ -172,7 +183,7 @@ def direct_commit(context,bone,channel,k,c,*,replace=False,component=None):
     except Exception:
         owner.document_json,owner.mode,owner.requested_mode=raw
         raise
-    return len(targets),skipped
+    return len(joint_ids),skipped,state
 
 
 def field_changed(owner,context):
@@ -187,19 +198,29 @@ def field_changed(owner,context):
         if bone.ppf_bone_restoring_controls!=owner or owner.loaded_joint_uuid!=bone.ppf_bone_physics.joint_uuid:
             raise ValueError('活动关节已改变，未写入恢复力')
         changed=[i for i in range(4) if values[i]!=old[i]]
-        if len(changed)!=1:raise ValueError('请一次修改一个恢复通道')
-        i=changed[0]
-        if i<3 and not owner.physical_custom[i]:raise ValueError('请先开启该轴自定义恢复力')
         snapshot=json.loads(owner.physical_channel_snapshot or '{}')
         current=read_state(context.scene)
-        if current['mode']!=snapshot.get('__author_mode__',current['mode']) or _channel_state(current,owner.loaded_joint_uuid,CHANNELS[i])!=snapshot.get(CHANNELS[i]):
+        if current['mode']!=snapshot.get('__author_mode__',current['mode']) or any(
+                _channel_state(current,owner.loaded_joint_uuid,CHANNELS[i])!=snapshot.get(CHANNELS[i])
+                for i in changed):
             raise ValueError('作者通道已改变，已恢复当前值')
         settings=bone.ppf_bone_physics
         if current['mode']=='LEGACY' and snapshot.get('__legacy_values__')!=[list(settings.angular_stiffness),list(settings.angular_damping),settings.anchor_stiffness]:
             raise ValueError('旧线性作者参数已改变，请等待刷新')
-        component='k' if values[i][0]!=old[i][0] and values[i][1]==old[i][1] else 'c' if values[i][0]==old[i][0] else None
-        count,skipped=direct_commit(context,bone,CHANNELS[i],*values[i],component=component)
-        refresh(context,bone)
+        edits={}
+        for i in changed:
+            if not owner.physical_available[i] or (i<3 and not owner.physical_custom[i]):
+                raise ValueError('请先开启该轴自定义恢复力')
+            k,c=values[i];old_k,old_c=old[i]
+            edits[CHANNELS[i]]=(k,c,'k' if c==old_c else 'c' if k==old_k else None)
+        # Blender's native multi-number gesture stages values before RNA update callbacks.
+        # Commit all changed components once, without rewriting the vector inside a callback.
+        count,skipped,state=_direct_commit_many(context,bone,edits)
+        for channel in edits:
+            snapshot[channel]=_channel_state(state,owner.loaded_joint_uuid,channel)
+        snapshot['__author_mode__']=state['mode']
+        owner.physical_channel_snapshot=json.dumps(snapshot,sort_keys=True)
+        owner.physical_loaded_values=json.dumps(values)
         owner.physical_status=f'已修改 {count} 个父关节'+('；跳过无父关节：'+', '.join(skipped) if skipped else '')
         _refresh_key=None
     except Exception as error:
@@ -510,7 +531,14 @@ def custom_changed(owner,context):
                     tables.append(table);bindings.append(binding)
                 else:
                     from .bone_chain_presets import _linear_frequency_document
-                    strength=control.twist_strength if i==0 else control.bend_strength
+                    field='twist_strength' if i==0 else 'bend_strength'
+                    strength=getattr(control,field)
+                    settings=b.ppf_bone_physics
+                    if (settings.joint_control_mode == 'NATIVE' and settings.proxy
+                            and not settings.proxy.get('ppf_mmd_source')
+                            and not control.is_property_set(field)):
+                        from .restoring_curves import NEW_NATIVE_ANGULAR_HZ
+                        strength=(NEW_NATIVE_ANGULAR_HZ[channel]/10.)**2
                     doc=_linear_frequency_document(rows,{channel:dict(frequency_hz=strength_to_frequency(strength),damping_ratio=control.damping_ratio,enabled=True,zero_effort=strength==0)})
                     tables.extend(doc['tables']);bindings.extend(doc['bindings'])
             doc=curves.validate_author_map(dict(version=1,tables=tables,bindings=bindings,stitch_pairs=[]))
@@ -523,6 +551,11 @@ def custom_changed(owner,context):
             if 'actual' in locals():owner.physical_custom=actual
             owner.physical_status='未写入：'+str(error)
         finally:_refresh_depth-=1
+
+
+def _format_auto_angular(value):
+    """Expose small nonzero estimates that a fixed precision RNA widget hides."""
+    return format(float(value), '.6g')
 
 
 def draw_inline(layout, context, bone, owner, physical_loaded, *, show_swing_mode=True):
@@ -543,7 +576,11 @@ def draw_inline(layout, context, bone, owner, physical_loaded, *, show_swing_mod
         switch=row.row(align=True);switch.enabled=physical_loaded
         switch.prop(owner,'physical_custom',index=index,text='自定义')
         value=row.row(align=True);value.enabled=physical_loaded and owner.physical_custom[index] and owner.physical_available[index]
-        if physical_loaded and owner.physical_available[index]:value.prop(owner,'angular_stiffness_degree',index=index,text='')
+        if physical_loaded and owner.physical_available[index]:
+            if index < len(labels) and labels[index] == _AUTO_PREVIEW_LABEL:
+                value.enabled=True;value.label(text=_format_auto_angular(owner.angular_stiffness_degree[index])+' N·mm/°')
+            else:
+                value.prop(owner,'angular_stiffness_degree',index=index,text='')
         else:value.label(text=unavailable(index))
     if cone:
         layout.prop(settings, 'swing_restoring_stiffness_degree', text='圆锥刚度 N·mm/°')
@@ -552,7 +589,11 @@ def draw_inline(layout, context, bone, owner, physical_loaded, *, show_swing_mod
     if body is not None:
         for index, label in enumerate(axes):
             row=body.row(align=True);row.enabled=physical_loaded and owner.physical_custom[index] and owner.physical_available[index]
-            if physical_loaded and owner.physical_available[index]:row.prop(owner,'angular_damping_degree',index=index,text=label)
+            if physical_loaded and owner.physical_available[index]:
+                if index < len(labels) and labels[index] == _AUTO_PREVIEW_LABEL:
+                    row.enabled=True;row.label(text=label+'：'+_format_auto_angular(owner.angular_damping_degree[index]))
+                else:
+                    row.prop(owner,'angular_damping_degree',index=index,text=label)
             else:row.label(text=label+'：'+unavailable(index))
         if cone:
             body.prop(settings, 'swing_restoring_damping_degree', text='圆锥阻尼')

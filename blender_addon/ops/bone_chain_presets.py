@@ -6,7 +6,7 @@ import bpy
 from ..i18n.props import EnumProperty,FloatProperty
 
 from ..models import restoring_curves as curves
-from ..models.bone_chain_presets import PRESETS as CHAIN_PRESETS
+from ..models.bone_chain_presets import OPERATOR_PRESET_ITEMS, PRESETS as CHAIN_PRESETS
 from ..models.bone_bindings import active_armature, active_bone, validate_proxy_owner, sync_owned_material
 from ..models.bone_material_presets import PRESETS as MATERIAL_PRESETS, preset_values
 from ..ops import restoring_curves as curve_author
@@ -443,8 +443,7 @@ class PPF_OT_BoneChainPresetApply(bpy.types.Operator):
     bl_label = '应用骨骼链预设'
     bl_description = '显式应用材质/质量起点和弯曲、扭转、锚点质量/惯量自适应恢复曲线'
     bl_options = {'REGISTER', 'UNDO'}
-    preset: EnumProperty(name='链条预设', items=[(key, value.label, value.evidence)
-                            for key, value in CHAIN_PRESETS.items()], default='LIGHT_HAIR')
+    preset: EnumProperty(name='链条预设', items=OPERATOR_PRESET_ITEMS, default='LIGHT_HAIR')
     scope: EnumProperty(name='骨骼范围', items=SCOPES, default='SELECTED')
 
     def execute(self, context):

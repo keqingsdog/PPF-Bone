@@ -390,7 +390,8 @@ def _process_one_frame(context, depsgraph, entry, frame: int) -> tuple[bool, str
 
 
 def _start_job(context, entries: list, *, _joint_owner=None) -> tuple[bool, str]:
-    if _capture_job["active"]:
+    from .bone_capture import is_active as bone_running
+    if _capture_job["active"] or bone_running():
         return False, iface_("Another Capture Deformation job is in progress")
     # Refuse to start if a pin-deformation capture is in flight: the two
     # share the depsgraph + frame_set side effects and would corrupt each

@@ -43,6 +43,7 @@ from .protocol import (
     STATUS_SAVE_AND_QUIT,
 )
 from .query_contract import validate_query
+from .runtime_intersection import intersection_rows
 from .state import Activity, AppState, Phase, Server, Solver
 from .events import (
     AbortRequested,
@@ -1136,6 +1137,14 @@ def _interpret_response(
     # label.
     elif error_msg and error_msg != state.server_error:
         effects.extend(_remote_log_lines(error_msg))
+
+    # Native records can appear a poll after the terminal status. Print the
+    # extra report once per payload; keep build failures and old overlay intact.
+    if error_msg and crash_kind == "intersection" and (
+        error_msg != state.server_error or violations != state.violations
+    ):
+        effects.extend(DoLog(key.format(**values))
+                       for key, values in intersection_rows(violations, details=True))
 
     # --- Solver-driven polling and side-effects ---
     # Poll and fetch decisions are based purely on solver state,

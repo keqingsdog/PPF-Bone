@@ -11,11 +11,11 @@ from ..models.bone_bindings import _frame, bone_world_matrix, rigid_matrix
 
 def _angular_mobility(scene, arm, bone, axes):
     settings = bone.ppf_bone_physics
+    if settings.root_mode in {'STATIC', 'KINEMATIC'}:
+        return np.zeros(3)
     measured = cached_rest_mass(scene, arm, bone)
     if measured is None:
         return None
-    if settings.root_mode in {'STATIC', 'KINEMATIC'}:
-        return np.zeros(3)
 
     transform = np.asarray(settings.proxy.matrix_world.to_3x3(), dtype=np.float64)
     if settings.physical_model == 'RIGID':

@@ -220,13 +220,57 @@ def _validate_static_pose_scales(context, state, start_frame, *, explicit_only=F
         context.view_layer.update()
 
 
-def encode_bones(context, state, fps, start_frame, *, cone_restoring_joint_ids=None,
+def read_evaluated_bone_frame(armature, bone_name):
+    """Read a rigid world matrix at the caller's current evaluated frame.
+
+    This is a read only; no frame set, graph evaluation, persistent cache, or
+    playback mode change. The caller owns author-pose evaluation and may wrap
+    a batch of reads in bone_frame_cache(), never across timeline steps.
+    """
+    from ...models.bone_bindings import bone_world_matrix
+    return bone_world_matrix(armature, armature.data.bones[bone_name])
+
+
+def sample_transport_bone_frame(scale_sources, anchors, roots, offset, fps, sample_frame):
+    """Consume one already-evaluated frame inside the existing Transfer preflight.
+
+    Preserve validation order and the exact initial-frame overrides. The
+    request containers are transaction-owned and their Blender references
+    must not survive a graph replacement, scene reload, or separate capture.
+    """
+    from ...models.bone_bindings import bone_frame_cache
+    from .automatic_parent_anchors import sample_parent_track
+    with bone_frame_cache():
+        _validate_pose_scales_at_frame(scale_sources, sample_frame)
+        for request in anchors:
+            sample_parent_track(request, offset, fps,
+                                request['anchors'][0]['parent_world_matrix_blender'],
+                                sample_frame)
+        for arm, bone_name, row, root, source_mode in roots:
+            if root["mode"] == "static" and offset > 0 and not root.get("control_events"):
+                continue
+            if source_mode == "POSE":
+                world = read_evaluated_bone_frame(arm, bone_name)
+            else:
+                proxy = arm.data.bones[bone_name].ppf_bone_physics.proxy
+                if proxy is None:
+                    raise ValueError("BLENDER_BONE_INVALID: missing root proxy motion source")
+                world = proxy.matrix_world
+            frame = _frame(world, f"root {bone_name} frame {sample_frame}")
+            if offset == 0:
+                frame = root["initial_frame"]
+            root["keys"].append({"time_s": offset / float(fps),
+                                  "center_world_m": frame["translation_m"],
+                                  "rotation_world_wxyz": frame["quaternion_wxyz"]})
+
+
+def prepare_transport_bones(context, state, fps, start_frame, *, cone_restoring_joint_ids=None,
                  mmd_automatic_channels=None):
-    """Capture authoring at start and root motion at the original frame times."""
+    """Prepare a transaction-local plan at the evaluated solver start frame."""
     from ...models.bone_bindings import (
-        bone_frame_cache, bone_world_matrix, collect_bindings, collect_body_controls_contract,
+        collect_bindings, collect_body_controls_contract,
     )
-    from .automatic_parent_anchors import prepare_parent_track, sample_parent_track, finish_parent_track
+    from .automatic_parent_anchors import prepare_parent_track
     from ...models.restoring_curves import mmd_automatic_angular_channels
     source = collect_bindings(context)
     from ..cross_links import encode as encode_cross_links, collision_pairs
@@ -261,15 +305,28 @@ def encode_bones(context, state, fps, start_frame, *, cone_restoring_joint_ids=N
     if "collision_filter_v1" in source:
         result["collision_filter_v1"] = deepcopy(source["collision_filter_v1"])
     armatures = {a["armature_uuid"]: context.scene.objects.get(a["object_name"]) for a in source["armatures"]}
-    fem_event_scene = any(r.get('enabled') and any(b.ppf_bone_physics.body_uuid == r['body_uuid'] and b.ppf_bone_physics.physical_model == 'SOFT' and b.ppf_bone_physics.root_control_events for arm in armatures.values() if arm is not None for b in arm.data.bones) for r in result['bindings'])
-    # Physical joints use the v3 restoring path; generated parent anchors are
-    # real endpoints.  An unparented root alone does not create a joint.
-    physical_ids = {bone.ppf_bone_physics.body_uuid for arm in armatures.values() if arm is not None
-                 for bone in arm.data.bones if bone.ppf_bone_physics.enabled
-                 and bone.ppf_bone_physics.physical_model in ('RIGID', 'SOFT')}
-    rigid_ids = {bone.ppf_bone_physics.body_uuid for arm in armatures.values() if arm is not None
-                 for bone in arm.data.bones if bone.ppf_bone_physics.enabled
-                 and bone.ppf_bone_physics.physical_model == 'RIGID'}
+    # Blender RNA iteration is expensive in a deep rig. Preserve first
+    # match semantics of the old UUID search, but index each armature once.
+    # Plans remain invocation-local; no evaluated pose or index survives it.
+    bone_index = {}
+    physical_ids, rigid_ids, fem_control_ids = set(), set(), set()
+    for arm_uuid, arm in armatures.items():
+        if arm is None:
+            continue
+        arm_index = bone_index[arm_uuid] = {}
+        for bone in arm.data.bones:
+            settings = bone.ppf_bone_physics
+            arm_index.setdefault(settings.bone_uuid, bone)
+            kind = settings.physical_model
+            body_id = settings.body_uuid
+            if kind == 'SOFT' and settings.root_control_events:
+                fem_control_ids.add(body_id)
+            if settings.enabled and kind in ('RIGID', 'SOFT'):
+                physical_ids.add(body_id)
+                if kind == 'RIGID':
+                    rigid_ids.add(body_id)
+    fem_event_scene = any(r.get('enabled') and r['body_uuid'] in fem_control_ids
+                          for r in result['bindings'])
     roots = []
     sampled_auto_anchors = {}
     for row in result["bindings"]:
@@ -278,7 +335,7 @@ def encode_bones(context, state, fps, start_frame, *, cone_restoring_joint_ids=N
         arm = armatures[row["armature_uuid"]]
         if arm is None or arm.ppf_armature_uuid != row["armature_uuid"]:
             raise ValueError("BLENDER_BONE_INVALID: armature UUID cannot be resolved")
-        bone = next((b for b in arm.data.bones if b.ppf_bone_physics.bone_uuid == row["bone_uuid"]), None)
+        bone = bone_index[row["armature_uuid"]].get(row["bone_uuid"])
         if bone is None:
             raise ValueError("BLENDER_BONE_INVALID: root bone UUID cannot be resolved")
         has_joint = bool(row.get('parent_body_uuid') or row.get('automatic_parent_anchor_v1'))
@@ -321,43 +378,14 @@ def encode_bones(context, state, fps, start_frame, *, cone_restoring_joint_ids=N
         if result.get('body_controls_v1'):
             row['root_motion_source'] = source_mode
         roots.append((arm, bone.name, row, root, source_mode))
-    # Frozen scale and motion both use the evaluated pose at the same frame.
-    if scale_sources or roots or sampled_auto_anchors:
-        if sampled_auto_anchors and int(state.frame_count) < 2:
-            raise ValueError("BLENDER_BONE_INVALID: automatic parent follow requires at least two sampled frames")
-        from ..frame_time import set_scene_frame
-        scene = context.scene
-        previous, subframe = scene.frame_current, scene.frame_subframe
-        try:
-            for offset in range(int(state.frame_count)):
-                sample_frame = start_frame + offset
-                scene.frame_set(sample_frame)
-                context.view_layer.update()
-                with bone_frame_cache():
-                    _validate_pose_scales_at_frame(scale_sources, sample_frame)
-                    for request in sampled_auto_anchors.values():
-                        sample_parent_track(request, offset, fps,
-                                            request['anchors'][0]['parent_world_matrix_blender'],
-                                            sample_frame)
-                    for arm, bone_name, row, root, source_mode in roots:
-                        if root["mode"] == "static" and offset > 0 and not root.get("control_events"):
-                            continue
-                        if source_mode == "POSE":
-                            world = bone_world_matrix(arm, arm.data.bones[bone_name])
-                        else:
-                            proxy = arm.data.bones[bone_name].ppf_bone_physics.proxy
-                            if proxy is None:
-                                raise ValueError("BLENDER_BONE_INVALID: missing root proxy motion source")
-                            world = proxy.matrix_world
-                        frame = _frame(world, f"root {bone_name} frame {sample_frame}")
-                        if offset == 0:
-                            frame = root["initial_frame"]
-                        root["keys"].append({"time_s": offset / float(fps),
-                                              "center_world_m": frame["translation_m"],
-                                              "rotation_world_wxyz": frame["quaternion_wxyz"]})
-        finally:
-            set_scene_frame(scene, previous, subframe)
-            context.view_layer.update()
+    if sampled_auto_anchors and int(state.frame_count) < 2:
+        raise ValueError("BLENDER_BONE_INVALID: automatic parent follow requires at least two sampled frames")
+    return result, bone_index, tuple(scale_sources), sampled_auto_anchors, roots
+
+
+def finish_transport_bones(plan):
+    from .automatic_parent_anchors import finish_parent_track
+    result, bone_index, _, sampled_auto_anchors, _ = plan
     for request in sampled_auto_anchors.values():
         key, value = finish_parent_track(request, request['anchors'][0]['parent_world_matrix_blender'])
         for anchor in request['anchors']:
@@ -366,8 +394,7 @@ def encode_bones(context, state, fps, start_frame, *, cone_restoring_joint_ids=N
     limit_intent=[]
     for row in result['bindings']:
         if not (row.get('parent_body_uuid') or row.get('automatic_parent_anchor_v1')):continue
-        arm=armatures[row['armature_uuid']]
-        bone=next(b for b in arm.data.bones if b.ppf_bone_physics.bone_uuid==row['bone_uuid'])
+        bone=bone_index[row['armature_uuid']][row['bone_uuid']]
         settings=bone.ppf_bone_physics
         if settings.soft_limit_policy!='AUTO_INERTIA' or not (any(settings.soft_limits_enabled) or settings.soft_limit_mode=='CONE'):continue
         if settings.joint_mode not in {'SOFT','BALL_FIXED'}:raise ValueError('SOFT_LIMIT_AUTO_UNSUPPORTED: compliant joint required')
@@ -382,3 +409,31 @@ def encode_bones(context, state, fps, start_frame, *, cone_restoring_joint_ids=N
         limit_intent.append(spec)
     if limit_intent:result['soft_limit_auto_v1']={'version':1,'joints':limit_intent}
     return result
+
+
+def encode_bones(context, state, fps, start_frame, *, cone_restoring_joint_ids=None,
+                 mmd_automatic_channels=None):
+    """Capture authoring at start and root motion at the original frame times."""
+    plan = prepare_transport_bones(
+        context, state, fps, start_frame,
+        cone_restoring_joint_ids=cone_restoring_joint_ids,
+        mmd_automatic_channels=mmd_automatic_channels,
+    )
+    if plan is None:
+        return None
+    _, _, scale_sources, anchors, roots = plan
+    if scale_sources or roots or anchors:
+        from ..frame_time import set_scene_frame
+        scene = context.scene
+        previous, subframe = scene.frame_current, scene.frame_subframe
+        try:
+            for offset in range(int(state.frame_count)):
+                sample_frame = start_frame + offset
+                scene.frame_set(sample_frame)
+                context.view_layer.update()
+                sample_transport_bone_frame(
+                    scale_sources, anchors.values(), roots, offset, fps, sample_frame)
+        finally:
+            set_scene_frame(scene, previous, subframe)
+            context.view_layer.update()
+    return finish_transport_bones(plan)

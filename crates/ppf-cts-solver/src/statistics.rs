@@ -142,6 +142,24 @@ impl TimelineStatistics {
             crate::cvec::CVec::from(vec![0_u32; self.input.objects.len()].as_slice());
     }
 
+    /// Return a manifest entry only if every primitive vertex belongs to it.
+    pub(crate) fn intersection_object(
+        &self,
+        owners: &[u32],
+        vertex_ids: &[u32],
+    ) -> Option<&StatisticsObject> {
+        let owner = *owners.get(*vertex_ids.first()? as usize)?;
+        if owner == u32::MAX
+            || !vertex_ids.iter().all(|&id| owners.get(id as usize) == Some(&owner))
+        {
+            return None;
+        }
+        self.manifest
+            .objects
+            .get(owner as usize)
+            .filter(|object| object.object_index == owner)
+    }
+
     pub fn analyze_and_write(
         &mut self,
         solver_frame: u32,

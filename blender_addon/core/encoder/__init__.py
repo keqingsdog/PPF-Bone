@@ -301,13 +301,14 @@ def prepare_authoring_for_upload(context):
     sync_for_transfer(context)
 
 
-def _encode_upload_payloads(context, *, want_data, want_param):
+def _encode_upload_payloads(context, *, want_data, want_param, bone_motion=None):
     """Preserve encode order while keeping large Scene bytes off-heap during Param.
 
     This helper remains inside the caller's original author/mass/playback
     transactions. It never changes capture inputs or bypasses either encoder.
     The private temporary file is closed on success and on every exception.
     """
+    param_options = {"bone_motion": bone_motion} if bone_motion is not None else {}
     data, data_hash = encode_obj_with_hash(context) if want_data else (b"", "")
     if want_data and want_param and data:
         import tempfile
@@ -317,13 +318,13 @@ def _encode_upload_payloads(context, *, want_data, want_param):
                 raise OSError("Incomplete temporary Scene payload write")
             staged_data.flush()
             del data
-            param, param_hash = encode_param_with_hash(context)
+            param, param_hash = encode_param_with_hash(context, **param_options)
             staged_data.seek(0)
             data = staged_data.read()
             if len(data) != size:
                 raise OSError("Incomplete temporary Scene payload read")
     else:
-        param, param_hash = encode_param_with_hash(context) if want_param else (b"", "")
+        param, param_hash = encode_param_with_hash(context, **param_options) if want_param else (b"", "")
     return data, param, data_hash, param_hash
 
 
@@ -332,6 +333,7 @@ def prepare_upload(
     *,
     want_data: bool = True,
     want_param: bool = True,
+    bone_motion=None,
 ) -> tuple[bytes, bytes, str, str]:
     """Single source of truth for what gets sent up the wire.
 
@@ -367,6 +369,6 @@ def prepare_upload(
                 prepare_authoring_for_upload(context)
                 mass_scope.enter_context(producer_mass_transaction(context))
                 data, param, data_hash, param_hash = _encode_upload_payloads(
-                    context, want_data=want_data, want_param=want_param)
+                    context, want_data=want_data, want_param=want_param, bone_motion=bone_motion)
             commit_notification()
     return data, param, data_hash, param_hash

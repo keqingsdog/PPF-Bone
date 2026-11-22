@@ -5,6 +5,8 @@ from ..models import restoring_curves as curves
 from ..models.restoring_curves import COMMON_ANGULAR_FREQUENCY_HZ, COMMON_DAMPING_RATIO
 
 COMMON_FREQUENCY_HZ = 10.0
+# Uncalibrated defaults for newly created ordinary Native proxy joints only.
+NEW_NATIVE_ANGULAR_HZ = {'twist_x': 4.0, 'swing_y': 3.0, 'swing_z': 3.0}
 
 
 def _commit(state, mode, document):
@@ -35,7 +37,7 @@ def replace_document(state, document, mode='ADVANCED'):
     return _commit(state, mode, document)
 
 
-def common_document(targets, stitch_pairs=(), *, frequency_hz=None, damping_ratio=None, coordinate_scale=None, enable_anchor=False):
+def common_document(targets, stitch_pairs=(), *, frequency_hz=None, damping_ratio=None, coordinate_scale=None, enable_anchor=False, new_native=False):
     """Linear frequency authoring with separate angular/positional defaults.
 
     All five channels have distinct tables so subsequent axis edits are local.
@@ -52,8 +54,10 @@ def common_document(targets, stitch_pairs=(), *, frequency_hz=None, damping_rati
         domain='ODD' if angular else 'RADIAL' if channel=='anchor' else 'SIGNED'
         tables.append({'table_id':identifier,'domain':domain,'tail':'LINEAR',
                        'nodes':[[0,0],[1,1]] if domain!='SIGNED' else [[-1,-1],[0,0],[1,1]]})
+        default_frequency = (NEW_NATIVE_ANGULAR_HZ[channel] if new_native and angular
+                             else COMMON_ANGULAR_FREQUENCY_HZ if angular else COMMON_FREQUENCY_HZ)
         bindings.append({'target':copy.deepcopy(target),'enabled':bool(enable_anchor) if channel=='anchor' else True,'table_id':identifier,
-                         'mode':'AUTO_FREQUENCY','frequency_hz':frequency_hz if frequency_hz is not None else (COMMON_ANGULAR_FREQUENCY_HZ if angular else COMMON_FREQUENCY_HZ),
+                         'mode':'AUTO_FREQUENCY','frequency_hz':frequency_hz if frequency_hz is not None else default_frequency,
                          'damping_ratio':damping_ratio if damping_ratio is not None else COMMON_DAMPING_RATIO,
                          'coordinate_scale':coordinate_scale if coordinate_scale is not None else 1 if angular else .001,
                          'mass_policy':'LOCAL_REST_V1'})
@@ -93,7 +97,7 @@ def _merge_author_pair_mappings(current, incoming):
     return merged
 
 
-def add_new_common(state, targets, ordered_pair_ids=(), *, has_draft=False):
+def add_new_common(state, targets, ordered_pair_ids=(), *, has_draft=False, new_native_joint_ids=()):
     """Creation-only candidate. Dormant legacy data is never activated."""
     candidate=copy.deepcopy(state)
     if state['mode']=='LEGACY' and (state.get('document') is not None or has_draft):
@@ -103,7 +107,14 @@ def add_new_common(state, targets, ordered_pair_ids=(), *, has_draft=False):
     missing=[target for target in targets if curves.target_key(target) not in existing]
     if not missing:return candidate
     required=[t['pair_id'] for t in missing if t['kind']=='STITCH_PAIR']
-    new=common_document(missing,curves.stitch_mapping(ordered_pair_ids,required))
+    native_ids = set(new_native_joint_ids)
+    regular = [target for target in missing if target.get('joint_uuid') not in native_ids]
+    native = [target for target in missing if target.get('joint_uuid') in native_ids]
+    new=common_document(regular,curves.stitch_mapping(ordered_pair_ids,required))
+    if native:
+        tuned=common_document(native,new_native=True)
+        new['tables'].extend(tuned['tables'])
+        new['bindings'].extend(tuned['bindings'])
     if document is None:document=new
     else:
         document['tables'].extend(new['tables']);document['bindings'].extend(new['bindings'])

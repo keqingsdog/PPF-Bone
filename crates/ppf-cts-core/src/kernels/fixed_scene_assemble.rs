@@ -21,6 +21,64 @@ use crate::kernels::proximity as prox;
 use crate::kernels::scene_build as sb;
 use crate::kernels::start_links::StartLinks;
 
+const SELF_INTERSECTION_DRAW_BUDGET: usize = 100;
+
+/// Reserve one geometry sample for each identifiable object pair, then
+/// fill the remaining budget in scan order. This only affects diagnostics;
+/// the total and the failure decision are taken from the full scan.
+fn representative_intersection_indices<K: Eq + std::hash::Hash>(
+    len: usize,
+    limit: usize,
+    key_at: impl Fn(usize) -> K,
+) -> Vec<usize> {
+    if len <= limit {
+        return (0..len).collect();
+    }
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut seen = std::collections::HashSet::with_capacity(limit);
+    let mut selected = Vec::with_capacity(limit);
+    let mut extras = Vec::with_capacity(limit);
+    for i in 0..len {
+        if seen.insert(key_at(i)) {
+            selected.push(i);
+            if selected.len() == limit {
+                break;
+            }
+        } else if extras.len() < limit {
+            extras.push(i);
+        }
+    }
+    selected.extend(extras.into_iter().take(limit - selected.len()));
+    selected.sort_unstable();
+    selected
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+enum IntersectionOwner {
+    Object(i32),
+    UnknownDynamic,
+    UnknownStatic,
+}
+
+fn intersection_owner(
+    ids: Option<&[i32]>,
+    vertices: &[i32],
+    fallback: IntersectionOwner,
+) -> IntersectionOwner {
+    let Some(ids) = ids else { return fallback };
+    let Some(&id) = vertices.first().and_then(|&v| ids.get(v as usize)) else {
+        return fallback;
+    };
+    if id == isect::NO_OBJECT_ID
+        || !vertices.iter().all(|&v| ids.get(v as usize) == Some(&id))
+    {
+        return fallback;
+    }
+    IntersectionOwner::Object(id)
+}
+
 /// One static wall (single-keyframe only). Kinematic walls are
 /// filtered out *before* assembly because the solver handles their
 /// violations on its own.
@@ -405,13 +463,15 @@ pub fn fixed_scene_assemble_with_mesh_collision_filter(input: AssembleInput<'_>,
                 combined_tris[t + 2] as u32,
             ]
         };
-        let mut pairs: Vec<(i32, i32)> = Vec::new();
+        // Keep rod index until selecting display samples; the existing payload
+        // still represents a rod hit by its intersected triangle.
+        let mut pairs: Vec<(i32, i32, Option<usize>)> = Vec::new();
         for &(ti, tj) in &found.tri_tri {
             let linked = links
                 .as_mut()
                 .is_some_and(|l| l.link_if_covered(&tri_of(ti), &tri_of(tj)));
             if !linked {
-                pairs.push((ti, tj));
+                pairs.push((ti, tj, None));
             }
         }
         for &(ri, tj) in &found.rod_tri {
@@ -420,27 +480,49 @@ pub fn fixed_scene_assemble_with_mesh_collision_filter(input: AssembleInput<'_>,
                 .as_mut()
                 .is_some_and(|l| l.link_if_covered(&rod, &tri_of(tj)));
             if !linked {
-                pairs.push((-1, tj));
+                pairs.push((-1, tj, Some(ri)));
             }
         }
         if !pairs.is_empty() {
             out.has_self_intersection = true;
             let mut tri_data: Vec<SelfIntersectionEntry> = Vec::new();
-            for &(p0, p1) in pairs.iter().take(100) {
-                let is_rod = p0 == -1;
+            let ids = extend_object_id.as_deref();
+            let triangle_owner = |index: i32| {
+                let ti = index as usize;
+                let fallback = if ti < n_tris {
+                    IntersectionOwner::UnknownDynamic
+                } else {
+                    IntersectionOwner::UnknownStatic
+                };
+                intersection_owner(ids, &combined_tris[3 * ti..3 * ti + 3], fallback)
+            };
+            let samples = representative_intersection_indices(
+                pairs.len(), SELF_INTERSECTION_DRAW_BUDGET, |i| {
+                    let (a, b, rod) = pairs[i];
+                    let owner_a = if let Some(ri) = rod {
+                        intersection_owner(
+                            ids, &input.rod[2 * ri..2 * ri + 2],
+                            IntersectionOwner::UnknownDynamic,
+                        )
+                    } else {
+                        triangle_owner(a)
+                    };
+                    let owner_b = triangle_owner(b);
+                    (rod.is_some(), owner_a.min(owner_b), owner_a.max(owner_b))
+                },
+            );
+            for index in samples {
+                let (p0, p1, rod) = pairs[index];
+                let is_rod = rod.is_some();
                 let mut positions: Vec<[f64; 3]> = Vec::new();
-                for &ti in [p0, p1].iter() {
-                    if ti >= 0 && (ti as usize) < n_tris {
-                        let t = [
-                            input.tri[3 * (ti as usize)] as usize,
-                            input.tri[3 * (ti as usize) + 1] as usize,
-                            input.tri[3 * (ti as usize) + 2] as usize,
-                        ];
-                        for &vi in t.iter() {
+                for ti in [p0, p1] {
+                    if ti >= 0 {
+                        for vi in tri_of(ti) {
+                            let vi = vi as usize;
                             positions.push([
-                                dyn_verts[3 * vi],
-                                dyn_verts[3 * vi + 1],
-                                dyn_verts[3 * vi + 2],
+                                combined_verts[3 * vi],
+                                combined_verts[3 * vi + 1],
+                                combined_verts[3 * vi + 2],
                             ]);
                         }
                     }
@@ -452,8 +534,8 @@ pub fn fixed_scene_assemble_with_mesh_collision_filter(input: AssembleInput<'_>,
             }
             let mut n_rod_tri = 0;
             let mut n_tri_tri = 0;
-            for &(p0, _) in pairs.iter() {
-                if p0 == -1 {
+            for &(_, _, rod) in &pairs {
+                if rod.is_some() {
                     n_rod_tri += 1;
                 } else {
                     n_tri_tri += 1;

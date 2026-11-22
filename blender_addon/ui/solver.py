@@ -8,6 +8,7 @@ from ..core.pin_reference import decode_stored_pin_identifier, PinReferenceError
 from .. import i18n as _ppf_i18n
 import os
 import textwrap
+import time
 
 import bpy  # pyright: ignore
 
@@ -57,6 +58,10 @@ from ..models.groups import (
     iterate_active_object_groups,
 )
 from .geometry_cleanup_ops import popup_transfer_error
+from .dynamics.bone_capture import (
+    SOLVER_OT_CaptureBoneMotion, SOLVER_OT_AbortBoneCapture, is_active as bone_capture_active,
+    standalone_progress, has_bones,
+)
 from .dynamics.bake_ops import bake_progress_snapshot, is_bake_running
 from .dynamics.pin_capture_ops import (
     is_pin_capture_running,
@@ -97,6 +102,9 @@ def _draw_export_buttons(box, capability=None):
 
 def _geometry_edit_blocks(cls):
     from ..core.bone_geometry_edit import active
+    if bone_capture_active():
+        cls.poll_message_set("Bone capture is running")
+        return True
     if not active():
         return False
     cls.poll_message_set('请先确认或取消代理缩放／网格编辑')
@@ -601,6 +609,7 @@ class SOLVER_PT_SolverPanel(Panel):
             row.label(text=iface_("Install it from the Backend Communicator panel"))
         row = box.row()
         row.operator(SOLVER_OT_Transfer.bl_idname, icon="EXPORT")
+        row.operator(SOLVER_OT_Transfer.bl_idname, text="Sliced Transfer").sliced_bones = True
         row.operator(SOLVER_OT_UpdateParams.bl_idname, icon="OPTIONS")
         row = box.row()
         row.operator(SOLVER_OT_Run.bl_idname, icon="PLAY")
@@ -678,6 +687,12 @@ class SOLVER_PT_SolverPanel(Panel):
             col.label(text=iface_("(not in any group)"))
             col.operator(SOLVER_OT_RemoveStaleCaches.bl_idname, icon="TRASH")
 
+        bone_progress = standalone_progress(context)
+        if bone_progress:
+            done, total, frame = bone_progress
+            _draw_progress(box, done, total, f"Bone preview | frame {frame}", "REC",
+                           SOLVER_OT_AbortBoneCapture.bl_idname)
+
         if is_bake_running():
             done, total, status, _ = bake_progress_snapshot()
             _draw_progress(
@@ -700,6 +715,9 @@ class SOLVER_PT_SolverPanel(Panel):
             if joint["pin_total"]:
                 box.label(text=iface_("Pin samples: {done}/{total}").format(
                     done=joint["pin_done"], total=joint["pin_total"]), translate=False)
+
+            if joint["bone_total"]:
+                box.label(text=f'Bone preview frames: {joint["bone_done"]}/{joint["bone_total"]}')
 
         if is_capture_running() and not joint_active:
             done, total, status, _ = capture_progress_snapshot()
@@ -779,8 +797,13 @@ class SOLVER_PT_SolverPanel(Panel):
         box = layout.box()
         box.label(text="Deformations", icon="MOD_SIMPLEDEFORM")
         batch_control = box.row()
-        batch_control.enabled = not (is_capture_running() or is_pin_capture_running())
+        batch_control.enabled = not (is_capture_running() or is_pin_capture_running() or bone_capture_active())
         batch_control.prop(context.window_manager, "ppf_capture_frame_batch")
+        if context.window_manager.ppf_capture_frame_batch and has_bones(context):
+            sub = box.row()
+            sub.enabled = batch_control.enabled
+            sub.prop(context.window_manager, "ppf_capture_bones_in_batch")
+        box.operator(SOLVER_OT_CaptureBoneMotion.bl_idname, icon="ARMATURE_DATA")
         box.operator(
             SOLVER_OT_RecaptureAllDeformations.bl_idname, icon="FILE_REFRESH"
         )
@@ -854,6 +877,10 @@ class SOLVER_OT_Transfer(AsyncOperator):
     bl_idname = "solver.transfer"
     bl_label = "Transfer"
 
+    sliced_bones: BoolProperty(
+        name="Sliced bone preparation (experimental)", options={"SKIP_SAVE"},
+        default=False,
+    )
     _mode = None
     timeout: float = 300.0
     auto_redraw: bool = True
@@ -916,17 +943,66 @@ class SOLVER_OT_Transfer(AsyncOperator):
         self._mode = "pipeline"
         self._payload = {}
         self._transfer_frame = (context.scene.frame_current, context.scene.frame_subframe)
-        self.start_stages(context, [
+        self._bone_stage = None
+        sliced = getattr(self, "sliced_bones", False)
+        self._stage_timer_interval = 0.02 if sliced else None
+        self._stage_next_tick = 0.0
+        stages = []
+        if sliced:
+            stages.append(("Preparing bone motion...", self._stage_bone_motion))
+        stages.extend([
             ("Encoding scene and parameters...", self._stage_encode_geometry),
             ("Uploading scene...", self._stage_upload),
         ])
+        self.start_stages(context, stages)
         return {"RUNNING_MODAL"}
+
+    def _stage_bone_motion(self, context):
+        from ..core.encoder.transfer_bone_stage import SlicedBoneStage
+        from ..core.async_op import STAGE_PENDING
+        from ..core import encode_progress
+        if self._bone_stage is None:
+            self._bone_stage = SlicedBoneStage(context)
+        stage = self._bone_stage
+        if stage.tick(context):
+            label = iface_("Sampling bone motion: {done}/{total} frames")
+            encode_progress.update(0, label.format(done=stage.next, total=stage.count))
+            return STAGE_PENDING
+
+    def modal(self, context, event):
+        from ..core.encoder.transfer_bone_stage import active
+        if getattr(self, "sliced_bones", False) and not self._remote_request_started:
+            if event.type == "ESC" and event.value == "PRESS":
+                self.cancel(context)
+                return {"CANCELLED"}
+            if self._bone_stage is not None and not active():
+                self.cancel(context)
+                return {"CANCELLED"}
+            if event.type != "TIMER":
+                return {"RUNNING_MODAL"}
+            # Blender's Python Event exposes the timer type, but no Timer handle.
+            # Pace the work even when other window timers post TIMER events.
+            now = time.monotonic()
+            if now < self._stage_next_tick:
+                return {"PASS_THROUGH"}
+            self._stage_next_tick = now + self._stage_timer_interval
+            if time.time() - self._start_time > self.timeout:
+                self.cancel(context)
+                self.on_timeout(context)
+                return {"CANCELLED"}
+        return super().modal(context,event)
 
     def _stage_encode_geometry(self, context):
         try:
             if (context.scene.frame_current, context.scene.frame_subframe) != self._transfer_frame:
                 raise ValueError(iface_("Timeline changed before Transfer encoding; start Transfer again"))
-            data, param, data_hash, param_hash = prepare_upload(context)
+            if getattr(self, "_bone_stage", None) is None:
+                data, param, data_hash, param_hash = prepare_upload(context)
+            else:
+                with self._bone_stage.encoding(context):
+                    data, param, data_hash, param_hash = prepare_upload(
+                        context, bone_motion=self._bone_stage)
+
         except (Cbor2NotInstalledError, ValueError) as e:
             com.set_error(str(e))
             # A degenerate tessellation is the one refusal that both costs the
@@ -950,6 +1026,12 @@ class SOLVER_OT_Transfer(AsyncOperator):
             raise StageAbort(_origin_cancel_message(self), 'WARNING')
         if (context.scene.frame_current, context.scene.frame_subframe) != self._transfer_frame:
             raise StageAbort(iface_("Timeline changed during Transfer; start Transfer again"), 'WARNING')
+        stage = getattr(self, "_bone_stage", None)
+        if stage is not None:
+            stage.require_upload_ready(context)
+            # The origin guards below own dispatch after this point.
+            stage.close()
+            self._bone_stage = None
         state = get_addon_data(context.scene).state
         state.commit_pending_mesh_hash()
         if self._origin_changed(context):
@@ -996,6 +1078,21 @@ class SOLVER_OT_Transfer(AsyncOperator):
             self._transfer_upload_listener = None
             raise
         self.mark_remote_requested()
+        if getattr(self, "_stage_timer_interval", None) is not None:
+            # Sampling needs quick yields; remote polling needs the normal interval.
+            from ..core.utils import get_timer_wait_time
+            try:
+                timer = context.window_manager.event_timer_add(
+                    get_timer_wait_time(), window=context.window)
+            except RuntimeError:
+                timer = None  # Keep receiving events from the existing timer.
+            if timer is not None:
+                try:
+                    context.window_manager.event_timer_remove(self._timer)
+                except (RuntimeError, ReferenceError):
+                    pass
+                self._timer = timer
+            self._stage_timer_interval = None
         # Submission has transferred ownership to the engine/worker queue.
         # Build completion needs only receipts, never the original bytes.
         self._payload = {}
@@ -1004,6 +1101,10 @@ class SOLVER_OT_Transfer(AsyncOperator):
         # Also release locally retained bytes after refusal/cancel/timeout.
         # Queued or in-flight upload commands keep their own references.
         self._payload = {}
+        stage = getattr(self, "_bone_stage", None)
+        if stage is not None:
+            stage.close()
+            self._bone_stage = None
         _remove_transfer_upload_listener(self)
         super().cleanup_modal(context)
 
@@ -1529,6 +1630,10 @@ class SOLVER_OT_UpdateParams(AsyncOperator):
     _mode = None
     timeout: float = 120.0
     auto_redraw: bool = True
+    _update_statuses = (
+        RemoteStatus.WAITING_FOR_BUILD, RemoteStatus.READY,
+        RemoteStatus.RESUMABLE, RemoteStatus.SIMULATION_FAILED,
+    )
 
     @classmethod
     def poll(cls, context):
@@ -1537,15 +1642,8 @@ class SOLVER_OT_UpdateParams(AsyncOperator):
         status = com.info.status
         response = com.info.response
         base = (
-            (
-                status == RemoteStatus.WAITING_FOR_BUILD
-                or status
-                in (
-                    RemoteStatus.READY,
-                    RemoteStatus.RESUMABLE,
-                    RemoteStatus.SIMULATION_FAILED,
-                )
-            )
+            status in cls._update_statuses
+            and not com.busy()
             and not _staged_encode_active()
             and com.is_connected()
             and com.is_server_running()
@@ -1560,68 +1658,210 @@ class SOLVER_OT_UpdateParams(AsyncOperator):
         if error:
             self.report({"ERROR"}, error)
             return {"CANCELLED"}
-        remote_root = com.normalized_remote_root()
-        if not remote_root:
+        self._remote_root = com.normalized_remote_root()
+        if not self._remote_root:
             self.report({"ERROR"}, iface_("Not connected; cannot send parameters"))
             return {"CANCELLED"}
-        if _has_bone_checkpoint_authoring(context) and com.saved_state_frames():
-            # A checkpoint owns its original sealed parameters and generation.
-            # A horizon request is validated locally and sent only by Resume.
-            from ..core.resume_horizon import prepare_request
-            try:
-                from_frame = _latest_nonzero_checkpoint()
-                _validate_checkpoint_geometry(context)
-                target_frame = prepare_request(context, com.info.response, from_frame)
-                if target_frame is None:
-                    raise ValueError(
-                        "CHECKPOINT_PARAMETERS_IMMUTABLE: no horizon extension; "
-                        "use Resume without Update Params, or Transfer/Run a fresh generation")
-            except (Cbor2NotInstalledError, ValueError) as e:
-                com.set_error(str(e))
-                self.report({"ERROR"}, str(e))
-                return {"CANCELLED"}
-            self.report({"INFO"},
-                        f"Resume target {target_frame + 1} samples validated locally; "
-                        "click Resume. Remote sealed parameters remain unchanged.")
-            return {"FINISHED"}
+
+        self._stage_communicator = com
+        self._mode = "local"
+        self._source_frame = (context.scene.frame_current, context.scene.frame_subframe)
+        self._source_generation = self._remote_generation()
+        self._bone_stage = None
+        self._param_payload = None
+        self._stage_next_tick = 0.0
+        has_bones = _has_bone_checkpoint_authoring(context)
+        self._checkpoint = has_bones and bool(com.saved_state_frames())
+        self._stage_timer_interval = None
+        if self._checkpoint:
+            stages = [
+                (iface_("Validating checkpoint geometry..."), self._stage_checkpoint_geometry),
+                (iface_("Validating checkpoint parameters..."), self._stage_checkpoint_parameters),
+            ]
+        else:
+            from ..core.encoder.transfer_bone_stage import can_slice_bone_motion
+            if has_bones and can_slice_bone_motion(context):
+                self._stage_timer_interval = 0.02
+                stages = [
+                    (iface_("Preparing bone motion..."), self._stage_bone_motion),
+                    (iface_("Encoding parameters..."), self._stage_parameters),
+                    (iface_("Uploading parameters..."), self._stage_submit),
+                ]
+            else:
+                stages = [(iface_("Encoding parameters..."), self._stage_parameters)]
+        self.start_stages(context, stages)
+        return {"RUNNING_MODAL"}
+
+    @staticmethod
+    def _remote_generation():
+        from ..core.facade import engine
+        remote = engine.state
+        return (remote.server_upload_id, remote.server_data_hash, remote.server_param_hash,
+                com.info.response.get("sealed_target_frame"))
+
+    def _require_current_inputs(self, context, *, check_frame=True):
+        if self._origin_changed(context):
+            raise StageAbort(iface_("Scene, project or connection changed before parameter update"), "WARNING")
+        if check_frame and (context.scene.frame_current, context.scene.frame_subframe) != self._source_frame:
+            raise StageAbort(iface_("Timeline changed before parameter update; start again"), "WARNING")
+        if (com.busy() or com.info.status not in self._update_statuses
+                or is_running(com.info.response)
+                or self._remote_generation() != self._source_generation):
+            raise StageAbort(iface_("Remote solver state changed before parameter update; start again"), "WARNING")
+        checkpoint = bool(com.saved_state_frames()) and _has_bone_checkpoint_authoring(context)
+        if checkpoint != self._checkpoint:
+            raise StageAbort(iface_("Checkpoint availability changed before parameter update; start again"), "WARNING")
+
+    def _stage_checkpoint_geometry(self, context):
+        self._require_current_inputs(context)
+        self._checkpoint_frame = _latest_nonzero_checkpoint()
+        _validate_checkpoint_geometry(context)
+
+    def _stage_checkpoint_parameters(self, context):
+        self._require_current_inputs(context)
+        if _latest_nonzero_checkpoint() != self._checkpoint_frame:
+            raise StageAbort(iface_("Latest checkpoint changed before parameter validation; start again"), "WARNING")
+        from ..core.resume_horizon import prepare_request
         try:
-            _, param_data, _, param_hash = prepare_upload(
-                context, want_data=False, want_param=True,
+            target_frame = prepare_request(context, com.info.response, self._checkpoint_frame)
+        except (Cbor2NotInstalledError, ValueError) as exc:
+            com.set_error(str(exc))
+            raise StageAbort(str(exc)) from exc
+        if target_frame is None:
+            raise StageAbort(
+                "CHECKPOINT_PARAMETERS_IMMUTABLE: no horizon extension; "
+                "use Resume without Update Params, or Transfer/Run a fresh generation"
             )
-        except (Cbor2NotInstalledError, ValueError) as e:
-            self.report({"ERROR"}, str(e))
-            return {"CANCELLED"}
-        # An identical update would replace the upload ID and drop the
-        # native launch status needed to resume existing checkpoints.
+        self._require_current_inputs(context)
+        self._mode = "local-finished"
+        self.report({"INFO"},
+                    f"Resume target {target_frame + 1} samples validated locally; "
+                    "click Resume. Remote sealed parameters remain unchanged.")
+
+    def _stage_bone_motion(self, context):
+        from ..core import encode_progress
+        from ..core.async_op import STAGE_PENDING
+        from ..core.encoder.transfer_bone_stage import BoneSamplingRequiresLegacy, SlicedBoneStage
+        self._require_current_inputs(context, check_frame=self._bone_stage is None)
+        if self._bone_stage is None:
+            self._bone_stage = SlicedBoneStage(context)
+        try:
+            if self._bone_stage.tick(context):
+                stage = self._bone_stage
+                label = iface_("Sampling bone motion: {done}/{total} frames")
+                encode_progress.update(0, label.format(done=stage.next, total=stage.count))
+                return STAGE_PENDING
+        except BoneSamplingRequiresLegacy:
+            # The sampler has not produced a payload. Restore the source
+            # before evaluating this supported authoring in its original order.
+            self._close_bone_stage()
+
+    def _stage_parameters(self, context):
+        from ..core.encoder.transfer_bone_stage import BoneSamplingRequiresLegacy
+        self._require_current_inputs(context)
+        stage = self._bone_stage
+        if stage is not None:
+            try:
+                with stage.encoding(context):
+                    _, param, _, param_hash = prepare_upload(
+                        context, want_data=False, bone_motion=stage,
+                    )
+            except BoneSamplingRequiresLegacy:
+                self._close_bone_stage()
+            else:
+                self._param_payload = (param, param_hash)
+                return
+
+        # Preserve the original evaluation order with third-party callbacks
+        # or author proxy synchronization. Queue in the same main-thread turn.
+        _, param, _, param_hash = prepare_upload(context, want_data=False)
+        self._submit_parameters(context, param, param_hash)
+
+    def _stage_submit(self, context):
+        if self._param_payload is None:
+            return  # The original-order path already handled its payload.
+        self._require_current_inputs(context)
+        self._bone_stage.require_upload_ready(context)
+        self._close_bone_stage()
+        param, param_hash = self._param_payload
+        self._param_payload = None
+        self._submit_parameters(context, param, param_hash)
+
+    def _submit_parameters(self, context, param, param_hash):
+        self._require_current_inputs(context)
+        from ..core.effect_runner import ConnectionOriginChanged
         from ..core.facade import engine
         remote = engine.state
         if (com.info.status in (RemoteStatus.READY, RemoteStatus.RESUMABLE)
-                and remote.remote_root.rstrip("/") == remote_root
+                and remote.remote_root.rstrip("/") == self._remote_root
                 and remote.server_upload_id
                 and param_hash
                 and param_hash == remote.server_param_hash):
+            self._mode = "local-finished"
             self.report({"INFO"}, "参数未更改，保留当前解算结果。")
-            return {"FINISHED"}
-        # Upload param-only atomically + auto-build. data_size=0 tells
-        # the server to keep the existing data.pickle untouched while a
-        # fresh upload_id is minted against the new param. The param
-        # hash rides along so the server's next status response echoes
-        # the new fingerprint and ``poll`` re-disables this button. We
-        # leave ``data_hash`` empty here: param-only uploads don't
-        # touch the server's data fingerprint, so omitting it
-        # preserves whatever's already on disk.
-        com.build_pipeline(
-            data=b"", param=param_data,
-            param_hash=param_hash,
-            preserve_output=True,
-            message="Updating parameters...",
-        )
+            return
+        try:
+            com.build_pipeline(
+                data=b"", param=param,
+                param_hash=param_hash,
+                preserve_output=True,
+                message="Updating parameters...",
+                expected_connection_ticket=getattr(self, "_stage_connection_ticket", None),
+            )
+        except ConnectionOriginChanged as exc:
+            raise StageAbort(str(exc), "WARNING") from exc
         self._mode = "pipeline"
-        self.setup_modal(context)
         self.mark_remote_requested()
-        return {"RUNNING_MODAL"}
+        if self._stage_timer_interval:
+            from ..core.utils import get_timer_wait_time
+            try:
+                timer = context.window_manager.event_timer_add(
+                    get_timer_wait_time(), window=context.window)
+            except RuntimeError:
+                return  # Keep the existing timer for remote polling.
+            try:
+                context.window_manager.event_timer_remove(self._timer)
+            except (RuntimeError, ReferenceError):
+                pass
+            self._timer = timer
+            self._stage_timer_interval = None
+
+    def modal(self, context, event):
+        if not getattr(self, "_remote_request_started", False):
+            from ..core.encoder.transfer_bone_stage import active
+            if event.type == "ESC" and event.value == "PRESS":
+                self.cancel(context)
+                return {"CANCELLED"}
+            if self._bone_stage is not None and not active():
+                self.cancel(context)
+                return {"CANCELLED"}
+            if event.type != "TIMER":
+                return {"RUNNING_MODAL"}
+            now = time.monotonic()
+            if self._stage_timer_interval and now < self._stage_next_tick:
+                return {"PASS_THROUGH"}
+            if self._stage_timer_interval:
+                self._stage_next_tick = now + self._stage_timer_interval
+            if time.time() - self._start_time > self.timeout:
+                self.cancel(context)
+                self.on_timeout(context)
+                return {"CANCELLED"}
+        return super().modal(context, event)
+
+    def _close_bone_stage(self):
+        if self._bone_stage is not None:
+            self._bone_stage.close()
+            self._bone_stage = None
+
+    def cleanup_modal(self, context):
+        self._close_bone_stage()
+        self._param_payload = None
+        super().cleanup_modal(context)
+
 
     def is_complete(self) -> bool:
+        if self._mode == "local-finished":
+            return True
         if self._mode != "pipeline":
             return False
         if com.busy():
@@ -1632,6 +1872,8 @@ class SOLVER_OT_UpdateParams(AsyncOperator):
         return com.is_aborting()
 
     def on_complete(self, context):
+        if self._mode == "local-finished":
+            return
         report_build_outcome(self)
         if (com.info.status == RemoteStatus.READY
                 and com.info.response.get("resume_block_reason") == "CHECKPOINTS_FROM_PREVIOUS_BUILD"):
@@ -1798,7 +2040,7 @@ class SOLVER_OT_RecaptureAllDeformations(Operator):
         # "no capturable objects" case) when nothing across the active
         # groups needs a deformation capture. Cheap, draw-safe predicates
         # only: this runs on every panel redraw.
-        if is_bake_running() or is_capture_running() or is_pin_capture_running():
+        if is_bake_running() or is_capture_running() or is_pin_capture_running() or bone_capture_active():
             return False
         # Fast stateless poll: early-returns on the first capturable static
         # via the cached uuid resolver (no per-object name reconciliation),
@@ -1884,7 +2126,13 @@ class SOLVER_OT_RecaptureAllDeformations(Operator):
         if self._capture_frame_batch_requested:
             try:
                 from .dynamics.capture_joint_schedule import JointCapture
-                self._joint_capture = JointCapture(context, static_objs, pin_specs)
+                from .dynamics.bone_capture import BoneSampling
+                sampling = None
+                if context.window_manager.ppf_capture_bones_in_batch and has_bones(context):
+                    if context.mode != "OBJECT" or com.busy() or is_running(com.info.response):
+                        raise RuntimeError("Bone sampling requires Object Mode and an idle solver")
+                    sampling = BoneSampling(context)
+                self._joint_capture = JointCapture(context, static_objs, pin_specs, bone_sampling=sampling)
                 self._joint_capture._timer_owner = self
                 self._queue = []
                 self._capture_frame_batch_active = True
@@ -2048,8 +2296,11 @@ class SOLVER_OT_RecaptureAllDeformations(Operator):
             counters[kind] = (job["total_frames_processed"], job["total_frames"])
         sd, st = counters["STATIC"]
         pd, pt = counters["PIN"]
+        bone = joint.bone_sampling
+        bd, bt = (bone.processed, bone.total) if bone else (0, 0)
         self._bulk_display["joint"] = {
-            "active": True, "frame": joint.seeded, "done": sd + pd, "total": st + pt,
+            "active": True, "frame": joint.seeded, "done": sd + pd + bd, "total": st + pt + bt,
+            "bone_done": bd, "bone_total": bt,
             "st_done": sd, "st_total": st, "pin_done": pd, "pin_total": pt,
         }
         _bulk_capture_display["joint"] = self._bulk_display["joint"]
@@ -2069,6 +2320,8 @@ class SOLVER_OT_RecaptureAllDeformations(Operator):
             commit_batch_capture(context.scene, tasks, recheck=lambda: joint.tasks(context))
             self._summary["objs"] = sum(kind == "STATIC" for kind, *_ in tasks)
             self._summary["pins"] = sum(kind == "PIN" for kind, *_ in tasks)
+            if joint.bone_sampling is not None:
+                self._summary["bone"] = len(joint.bone_sampling.document["bindings"])
             self._cleanup_active(context)
             return self._finish(context)
         except Exception as exc:
@@ -2174,6 +2427,8 @@ class SOLVER_OT_RecaptureAllDeformations(Operator):
             parts.append(iface_("{count} object(s)").format(count=self._summary["objs"]))
         if self._summary["pins"]:
             parts.append(iface_("{count} pin(s)").format(count=self._summary["pins"]))
+        if self._summary.get("bone"):
+            parts.append(f'{self._summary["bone"]} bone bindings (preview)')
         target = ", ".join(parts) if parts else iface_("nothing")
         self.report({"INFO"}, iface_("Re-captured deformation for {target}").format(target=target))
         return self._end_timer(context, {"FINISHED"})
@@ -2660,6 +2915,8 @@ classes = (
     SOLVER_OT_DiscardSingleBakeRecovery,
     SOLVER_OT_RemoveStaleCaches,
     SOLVER_OT_RecaptureAllDeformations,
+    SOLVER_OT_CaptureBoneMotion,
+    SOLVER_OT_AbortBoneCapture,
     SOLVER_OT_ClearAllDeformations,
     SOLVER_OT_MigratePC2Folder,
     SOLVER_OT_UpdateParams,
@@ -2669,6 +2926,10 @@ classes = (
 
 
 def register():
+    bpy.types.WindowManager.ppf_capture_bones_in_batch = BoolProperty(
+        name="Include Bone Preview", description="Share frame evaluation with authored bone input checks. "
+        "Preview only; Transfer still evaluates live inputs", default=False, options={"SKIP_SAVE"},
+    )
     bpy.types.WindowManager.ppf_capture_frame_batch = BoolProperty(
         name="Batch capture by frame",
         description=(
@@ -2683,6 +2944,11 @@ def register():
 
 
 def unregister():
+    from ..core.encoder.transfer_bone_stage import cancel as cancel_transfer_slice
+    cancel_transfer_slice()
+    from .dynamics.bone_capture import cancel_active
+    cancel_active()
+    del bpy.types.WindowManager.ppf_capture_bones_in_batch
     _bulk_capture_display.clear()
     del bpy.types.WindowManager.ppf_capture_frame_batch
     for cls in reversed(classes):

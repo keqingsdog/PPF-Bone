@@ -1093,7 +1093,7 @@ def sand_scene_radius_conflict(scene, groups=None):
     return rows if len({float(np.float32(radius)) for _name, radius in rows}) > 1 else None
 
 
-def _build_param_dict(context, *, pre_mmd_default=None) -> dict:
+def _build_param_dict(context, *, pre_mmd_default=None, bone_motion=None) -> dict:
     """Assemble the parameter dict that ``encode_param`` serializes.
 
     Factored out so ``compute_param_hash`` and ``encode_param_with_hash``
@@ -1159,9 +1159,14 @@ def _build_param_dict(context, *, pre_mmd_default=None) -> dict:
         from .bones import encode_bones
         cone_restoring_joint_ids = set()
         mmd_automatic_channels = []
-        bone_data = encode_bones(context, state, fps, start_frame,
-                                 cone_restoring_joint_ids=cone_restoring_joint_ids,
-                                 mmd_automatic_channels=mmd_automatic_channels)
+        options = dict(cone_restoring_joint_ids=cone_restoring_joint_ids,
+                       mmd_automatic_channels=mmd_automatic_channels)
+        if bone_motion is None:
+            bone_data = encode_bones(context, state, fps, start_frame, **options)
+        else:
+            from .bones import prepare_transport_bones
+            fresh = prepare_transport_bones(context, state, fps, start_frame, **options)
+            bone_data = bone_motion.consume(context, state, fresh)
         joint_curve_owners = _active_restoring_joint_owners(bone_data)
         from ...models.restoring_curves import export_scene
         restoring_curves = export_scene(
@@ -1262,7 +1267,7 @@ def encode_param(context) -> bytes:
         return dumps_envelope("Param", _build_param_dict(context))
 
 
-def encode_param_with_hash(context) -> tuple[bytes, str]:
+def encode_param_with_hash(context, *, bone_motion=None) -> tuple[bytes, str]:
     """Encode the param tree and hash the encoded bytes in one pass.
 
     Avoids the build-twice cost of calling ``encode_param`` then
@@ -1273,7 +1278,7 @@ def encode_param_with_hash(context) -> tuple[bytes, str]:
     from ..bone_mass import producer_mass_transaction
     with producer_mass_transaction(context):
         from .cbor_encode import dumps_envelope
-        tree = _build_param_dict(context)
+        tree = _build_param_dict(context, bone_motion=bone_motion)
         encoded = dumps_envelope("Param", tree)
         return encoded, hashlib.sha256(encoded).hexdigest()
 

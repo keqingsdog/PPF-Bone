@@ -102,6 +102,9 @@ class StageAbort(Exception):
         self.level = level
 
 
+STAGE_PENDING = object()
+
+
 class AsyncOperator(Operator):
     """Base class for modal operators with timer-based polling.
 
@@ -144,7 +147,8 @@ class AsyncOperator(Operator):
             self._capture_origin(context)
         self._start_time = time.time()
         self._timer = context.window_manager.event_timer_add(
-            get_timer_wait_time(), window=context.window
+            getattr(self, '_stage_timer_interval', None) or get_timer_wait_time(),
+            window=context.window
         )
         context.window_manager.modal_handler_add(self)
 
@@ -239,7 +243,7 @@ class AsyncOperator(Operator):
             return _cancel_origin(self, context)
         _label, fn = self._stages[self._stage_index]
         try:
-            fn(context)
+            pending = fn(context)
         except StageAbort as exc:
             self._end_stages()
             self.cleanup_modal(context)
@@ -262,6 +266,9 @@ class AsyncOperator(Operator):
             return {"CANCELLED"}
         if self._origin_changed(context):
             return _cancel_origin(self, context)
+        if pending is STAGE_PENDING:
+            redraw_all_areas(context)
+            return {"PASS_THROUGH"}
         self._stage_index += 1
         if self._stage_index >= len(self._stages):
             # All stages done; the dispatching stage (if any) has set the

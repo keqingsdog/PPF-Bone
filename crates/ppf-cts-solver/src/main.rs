@@ -716,33 +716,66 @@ fn remove_files(dirpath: &str, base: &str, ext: &str, load: i32) {
     }
 }
 
-fn remove_files_in_dir(path: &str) -> std::io::Result<()> {
-    if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.into_iter().flatten() {
-            // ``save_and_quit`` is a control sentinel the server may
-            // write between launch and the solver's setup(). Wiping
-            // it here would lose the save request and the solver
-            // would run to completion. Preserve it. The server's
-            // launch_solver already cleared stale sentinels before
-            // spawning, so anything present now is fresh.
-            //
-            // ``hold_at_frame`` is preserved for the same reason: a
-            // frontend asking to hold at an early frame writes it before
-            // it launches, and a hold wiped here runs the whole scene.
-            // Keep the already acquired lock's file on every platform; removing
-            // it would let another process lock a newly created file.
-            if entry.file_name() == ppf_cts_formats::files::SAVE_AND_QUIT
-                || entry.file_name() == ppf_cts_formats::files::HOLD_AT_FRAME
-                || entry.file_name() == ppf_cts_formats::files::STATUS_LOCK
+fn remove_output_entry(path: &std::path::Path, is_dir: bool) -> std::io::Result<()> {
+    let remove = || {
+        if is_dir {
+            std::fs::remove_dir_all(path)
+        } else {
+            std::fs::remove_file(path)
+        }
+    };
+    let start = std::time::Instant::now();
+    loop {
+        match remove() {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            // A frame reader may still hold the old output for a short time.
+            // Retry Windows sharing and lock violations, with a bounded wait.
+            Err(err)
+                if cfg!(windows)
+                    && matches!(err.raw_os_error(), Some(32 | 33))
+                    && start.elapsed() < std::time::Duration::from_millis(750) =>
             {
-                continue;
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            let path = entry.path();
-            if path.is_file() {
-                std::fs::remove_file(path)?;
-            } else if path.is_dir() {
-                std::fs::remove_dir_all(path)?;
-            }
+            result => return result,
+        }
+    }
+}
+
+fn remove_files_in_dir(dir: &std::path::Path) -> Result<(), String> {
+    let path_error = |path: &std::path::Path, err: std::io::Error| {
+        format!("{}: {err}", path.display())
+    };
+    let entries = std::fs::read_dir(dir).map_err(|err| path_error(dir, err))?;
+    for entry in entries {
+        let entry = entry.map_err(|err| path_error(dir, err))?;
+        // ``save_and_quit`` is a control sentinel the server may
+        // write between launch and the solver's setup(). Wiping
+        // it here would lose the save request and the solver
+        // would run to completion. Preserve it. The server's
+        // launch_solver already cleared stale sentinels before
+        // spawning, so anything present now is fresh.
+        //
+        // ``hold_at_frame`` is preserved for the same reason: a
+        // frontend asking to hold at an early frame writes it before
+        // it launches, and a hold wiped here runs the whole scene.
+        // Keep the already acquired lock's file on every platform; removing
+        // it would let another process lock a newly created file.
+        if entry.file_name() == ppf_cts_formats::files::SAVE_AND_QUIT
+            || entry.file_name() == ppf_cts_formats::files::HOLD_AT_FRAME
+            || entry.file_name() == ppf_cts_formats::files::STATUS_LOCK
+        {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(path_error(&path, err)),
+        };
+        if metadata.is_file() || metadata.is_dir() {
+            remove_output_entry(&path, metadata.is_dir())
+                .map_err(|err| path_error(&path, err))?;
         }
     }
     Ok(())
@@ -838,9 +871,13 @@ fn begin_output(program_args:&ProgramArgs) {
         eprintln!("OUTPUT_LOCK_ERROR: cannot acquire output lock: {e}");
         std::process::exit(2);
     });
-    setup(program_args);
+    let cleanup = if program_args.load == 0 {
+        remove_files_in_dir(output)
+    } else {
+        Ok(())
+    };
 
-    // Begin the structured status record after setup's fresh output wipe and before any
+    // Begin the structured status record after attempting fresh output cleanup and before any
     // backend work, so the lock covers the whole compute lifetime and a
     // fresh run never reads its own scrubbed record. launch_id only needs
     // to be unique across launches in the same output dir, so a
@@ -855,13 +892,16 @@ fn begin_output(program_args:&ProgramArgs) {
         format!("{mixed:012x}")
     };
     status_writer::init(&program_args.output, launch_id, program_args.load > 0, lock);
-
-
+    if let Err(detail) = cleanup {
+        let detail = format!("OUTPUT_CLEANUP_ERROR: cannot clear previous output at {detail}");
+        eprintln!("{detail}");
+        status_writer::terminal_crash(ppf_cts_formats::status::CrashKind::LaunchFailed, detail);
+        std::process::exit(2);
+    }
+    setup(program_args);
 }
 fn prune_output_prefix(program_args: &ProgramArgs) {
-    if program_args.load == 0 {
-        remove_files_in_dir(&program_args.output).unwrap();
-    } else {
+    if program_args.load > 0 {
         remove_files(&program_args.output, "vert", "bin", program_args.load);
         remove_files(&program_args.output, "display_pin", "bin", program_args.load);
         prune_pose_tail(&program_args.output, program_args.load)
@@ -914,7 +954,6 @@ fn prune_output_prefix(program_args: &ProgramArgs) {
 }
 
 fn setup(program_args: &ProgramArgs) {
-    if program_args.load==0 {prune_output_prefix(program_args);}
     if !std::path::Path::new(&program_args.output).exists() {
         std::fs::create_dir_all(&program_args.output).unwrap_or(());
     }

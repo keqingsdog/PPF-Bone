@@ -928,6 +928,13 @@ def transfer_author_transaction(context):
                 bpy.data.meshes.remove(mesh)
 
 
+def transfer_author_geometry_changed():
+    """Whether the open encode transaction moved or rebuilt author proxies."""
+    if _transfer_deferred is None:
+        raise RuntimeError('Author geometry queried outside the transfer transaction')
+    return _transfer_deferred
+
+
 def sync_for_transfer(context):
     """Flush before geometry/mass sampling; usable without a Window or timer.
 

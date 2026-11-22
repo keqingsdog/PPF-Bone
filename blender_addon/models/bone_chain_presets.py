@@ -26,23 +26,35 @@ class BoneChainPreset:
 
 PRESETS = {
     'LIGHT_HAIR': BoneChainPreset(
-        '轻质发束', 'LIGHT_HAIR', 5.0, 3.0, 18.0, .85,
+        '轻质发束', 'LIGHT_HAIR', 6.0, 4.5, 18.0, .85,
         '未标定起点；采用轻质代理密度与质量/惯量自适应恢复力'),
     'FLEXIBLE_STRAP': BoneChainPreset(
-        '柔软织带', 'SOFT_CLOTH', 8.0, 4.0, 25.0, .9,
+        '柔软织带', 'SOFT_CLOTH', 10.0, 6.0, 25.0, .9,
         '未标定起点；采用柔软代理材质与质量/惯量自适应恢复力'),
     'STRAP': BoneChainPreset(
-        '织带', 'STIFF_STRAP', 12.0, 8.0, 35.0, .78,
+        '织带', 'STIFF_STRAP', 14.0, 12.0, 35.0, .78,
         '未标定起点；采用织带代理材质与质量/惯量自适应恢复力'),
-    'STIFF_RIBBON': BoneChainPreset(
-        '挺括飘带', 'STIFF_RIGID', 25.0, 15.0, 50.0, .72,
-        '未标定起点；采用较高密度代理材质与质量/惯量自适应恢复力'),
     'HARD_WEBBING': BoneChainPreset(
-        '硬质织带', 'HARD_WEBBING', 20.0, 12.0, 45.0, .8,
+        '硬质织带', 'HARD_WEBBING', 24.0, 18.0, 45.0, .8,
         '未标定起点；采用硬挺织带代理材质与质量/惯量自适应恢复力'),
 }
 
-PRESET_ITEMS = [(key, value.label, value.evidence) for key, value in PRESETS.items()]
+# Blender persists enum numbers, not IDs. Keep 4 assigned to hard
+# webbing, and do not reuse the retired ribbon's slot (3).
+_SCENE_PRESET_NUMBERS = {'LIGHT_HAIR': 0, 'STRAP': 1, 'FLEXIBLE_STRAP': 2, 'HARD_WEBBING': 4}
+PRESET_ITEMS = [(key, PRESETS[key].label, PRESETS[key].evidence, number)
+                for key, number in _SCENE_PRESET_NUMBERS.items()]
+# The Apply operator originally iterated PRESETS, so its strap IDs are reversed.
+_OPERATOR_PRESET_NUMBERS = {**_SCENE_PRESET_NUMBERS, 'STRAP': 2, 'FLEXIBLE_STRAP': 1}
+OPERATOR_PRESET_ITEMS = [(key, PRESETS[key].label, PRESETS[key].evidence, number)
+                         for key, number in _OPERATOR_PRESET_NUMBERS.items()]
+
+def get_scene_preset(owner):
+    stored_value = owner.get('bone_chain_preset', 0)
+    return stored_value if isinstance(stored_value, int) and stored_value in _SCENE_PRESET_NUMBERS.values() else 0
+
+def set_scene_preset(owner, number):
+    owner['bone_chain_preset'] = number
 
 
 def _physical_changed(self,context):

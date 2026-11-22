@@ -190,6 +190,8 @@ def detach_capture_timer(operator, context=None):
 def cancel_capture_jobs(*, restore=True):
     """Invalidate modal owners before teardown; Undo must not re-evaluate RNA."""
     from ..ui.dynamics import static_deform_ops, pin_capture_ops
+    from ..ui.dynamics.bone_capture import cancel_active
+    cancel_active(restore=restore)
     errors = []
     combined_seen = set()
     for module in (static_deform_ops, pin_capture_ops):

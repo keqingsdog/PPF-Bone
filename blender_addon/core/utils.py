@@ -789,7 +789,7 @@ _DEFORMING_MODIFIER_TYPES = frozenset({
 
 
 def _has_shape_key_animation(obj) -> bool:
-    """True if *obj* has any shape-key value fcurve.
+    """True if *obj* has shape-key animation curves or drivers.
 
     Shape keys with animated `.value` deform the evaluated mesh even
     though the modifier list looks empty. The encoder must not silently
@@ -800,7 +800,8 @@ def _has_shape_key_animation(obj) -> bool:
     sk = getattr(obj.data, "shape_keys", None)
     if sk is None:
         return False
-    return bool(get_id_fcurves(sk))
+    ad = getattr(sk, "animation_data", None)
+    return bool(get_id_fcurves(sk) or (ad is not None and ad.drivers))
 
 
 # Geometry Nodes node types that can move existing mesh vertices off

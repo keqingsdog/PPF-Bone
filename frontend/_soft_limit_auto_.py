@@ -119,7 +119,8 @@ def resolve_and_finalize(fixed,path,finalizer):
         if context.get('complete') is not True:fail('complete provisional Build required')
         request=dict(kind='ppf.restoring_curves.mass_request',version=1,scene_uuid=fixed._scene_uuid,basis_sha256=context['scene_inputs_sha256'],targets=targets(intent))
         exe=Path(_run_directory(contract=getattr(fixed,'_build_contract',None)))/('ppf-contact-solver.exe' if __import__('os').name=='nt' else 'ppf-contact-solver')
-        authority,staging=query(exe,path,request)
+        authority,staging=query(exe,path,request,
+                                statistics_objects=getattr(fixed,'_statistics_objects',()))
         rows=plan(intent,authority);apply_plan(fixed,rows)
         receipt=dict(kind='ppf.soft_limit_auto',version=1,policy='AUTO_INERTIA',scene_uuid=fixed._scene_uuid,provisional_basis_sha256=context['scene_inputs_sha256'],authority_staging=staging,resolved=rows)
         (path/'bin/soft_limit_auto_v1.json').write_bytes(encode(receipt))

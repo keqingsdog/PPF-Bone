@@ -2225,6 +2225,8 @@ if let Some(input)=scene.joint_input.as_ref() {
             #[cfg(all(test, feature="cpu"))]
             backend_save_fixture::capture_if_ready(self, &dataset, &param);
             let logical_start_time = self.state.time;
+            // The controller increments this count only when enabled and accepted.
+            let diagnostic_logical_step = adaptive_retry.then_some(adaptive_controller.accepted);
             let cg_limit = param.cg_max_iter;
             let cg_tolerance = param.cg_tol;
             let retry_run = crate::driver::adaptive_controller::logical_step(
@@ -2371,9 +2373,27 @@ if let Some(input)=scene.joint_input.as_ref() {
                 // failure while writing them cannot cost the crash report
                 // itself.
                 let records = fetch_records();
+                let context = serde_json::json!({
+                    "schema_version": 1,
+                    "process_id": std::process::id(),
+                    "scene_inputs_sha256": (adaptive_configuration != "unsealed")
+                        .then_some(adaptive_configuration.as_str()),
+                    "last_accepted_solver_frame": self.state.curr_frame,
+                    "step_start_seconds": logical_start_time,
+                    "logical_step": diagnostic_logical_step,
+                    "attempt_index": retry_run.retry_count,
+                    "requested_step_seconds": retry_run.requested_h,
+                    "mesh_toi_stream": "data/advance.contact_toi.out",
+                    "mesh_toi_scope": "normalized mesh-only sweep fraction per recorded line search; not a pair ID",
+                    "stage": "final_candidate_intersection_check",
+                    "accepted": false,
+                });
                 write_intersection_records(
                     &program_args.output,
                     &records,
+                    &dataset,
+                    timeline_statistics.as_ref(),
+                    context,
                     if sim_args.world_scaling > 0.0 {
                         1.0 / sim_args.world_scaling
                     } else {
@@ -2639,7 +2659,50 @@ fn fetch_records() -> Vec<IntersectionRecord> {
     records
 }
 
-fn write_intersection_records(output_dir: &str, records: &[IntersectionRecord], inv_world: f32) {
+
+// Read the report's native topology, not a separately rebuilt mesh. The
+// constraint collision mesh has its own vertex namespace, unlike the scene's
+// soft/static mesh vertices, which can already be in the solved namespace.
+fn intersection_ids(
+    faces: &[crate::data::Vec3u],
+    edges: &[crate::data::Vec2u],
+    collider_faces: &[crate::data::Vec3u],
+    vertex_count: usize,
+    record: &IntersectionRecord,
+    side: usize,
+) -> Option<(&'static str, Vec<u32>)> {
+    let (elem, count) = if side == 0 {
+        (record.elem0, record.num_verts0)
+    } else {
+        (record.elem1, record.num_verts1)
+    };
+    let index = elem as usize;
+    let namespace = "solver_vertex";
+    let ids = match (record.itype, side, count) {
+        (0, 0, 3) => faces.get(index)?.as_slice().to_vec(),
+        (0, 1, 2) | (1, _, 2) | (2, 1, 2) => {
+            edges.get(index)?.as_slice().to_vec()
+        }
+        (2, 0, 3) => {
+            return Some((
+                "constraint_collision_mesh_vertex",
+                collider_faces.get(index)?.as_slice().to_vec(),
+            ));
+        }
+        (3, _, 1) if index < vertex_count => vec![elem],
+        _ => return None,
+    };
+    Some((namespace, ids))
+}
+
+fn write_intersection_records(
+    output_dir: &str,
+    records: &[IntersectionRecord],
+    dataset: &DataSet,
+    statistics: Option<&crate::statistics::TimelineStatistics>,
+    context: serde_json::Value,
+    inv_world: f32,
+) {
     if records.is_empty() {
         return;
     }
@@ -2675,13 +2738,47 @@ fn write_intersection_records(output_dir: &str, records: &[IntersectionRecord], 
                     r.positions[base + 2] * inv_world,
                 ]);
             }
-            serde_json::json!({
+            let mut record = serde_json::json!({
                 "type": type_name(r.itype),
                 "elem0": r.elem0,
                 "elem1": r.elem1,
                 "positions0": pos0,
                 "positions1": pos1,
-            })
+            });
+            for (side, id_key, namespace_key, object_key) in [
+                (0, "vertex_ids0", "vertex_namespace0", "object_refs0"),
+                (1, "vertex_ids1", "vertex_namespace1", "object_refs1"),
+            ] {
+                if let Some((namespace, ids)) = intersection_ids(
+                    dataset.mesh.mesh.face.as_slice(),
+                    dataset.mesh.mesh.edge.as_slice(),
+                    dataset.constraint.mesh.face.as_slice(),
+                    dataset.vertex.curr.as_slice().len(),
+                    r,
+                    side,
+                ) {
+                    let owners = match namespace {
+                        "solver_vertex" => dataset.statistics_object_index.as_slice(),
+                        "constraint_collision_mesh_vertex" => {
+                            dataset.statistics_static_object_index.as_slice()
+                        }
+                        _ => &[],
+                    };
+                    if let Some(owner) = statistics
+                        .and_then(|stats| stats.intersection_object(owners, &ids))
+                    {
+                        record[object_key] = serde_json::json!({
+                            "object_index": owner.object_index,
+                            "object_name": owner.object_name,
+                            "object_uuid": owner.object_uuid,
+                        });
+                    }
+                    record[id_key] = serde_json::json!(ids);
+                    record[namespace_key] = serde_json::json!(namespace);
+                }
+            }
+            record["runtime"] = context.clone();
+            record
         })
         .collect();
     let json = serde_json::json!({
@@ -2710,6 +2807,30 @@ fn write_intersection_records(output_dir: &str, records: &[IntersectionRecord], 
             let _ = std::fs::remove_file(&tmp);
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn runtime_intersection_ids_preserve_record_vertex_order() {
+    use crate::data::{Vec2u, Vec3u};
+    let faces = [Vec3u::new(7, 4, 9)];
+    let edges = [Vec2u::new(12, 11), Vec2u::new(6, 5)];
+    let collider_faces = [Vec3u::new(3, 2, 1)];
+    let lookup = |itype, elem0, elem1, num_verts0, num_verts1, side| {
+        let record = IntersectionRecord {
+            itype, elem0, elem1, num_verts0, num_verts1, ..Default::default()
+        };
+        intersection_ids(&faces, &edges, &collider_faces, 16, &record, side)
+    };
+    assert_eq!(lookup(0, 0, 0, 3, 2, 0), Some(("solver_vertex", vec![7, 4, 9])));
+    assert_eq!(lookup(0, 0, 0, 3, 2, 1), Some(("solver_vertex", vec![12, 11])));
+    assert_eq!(lookup(1, 0, 1, 2, 2, 1), Some(("solver_vertex", vec![6, 5])));
+    assert_eq!(lookup(2, 0, 0, 3, 2, 0), Some(("constraint_collision_mesh_vertex", vec![3, 2, 1])));
+    assert_eq!(lookup(3, 5, 6, 1, 1, 0), Some(("solver_vertex", vec![5])));
+    assert_eq!(lookup(3, 5, 16, 1, 1, 1), None);
+    assert_eq!(lookup(0, 1, 0, 3, 2, 0), None);
+    assert_eq!(lookup(0, 0, 0, 2, 2, 0), None);
+    assert_eq!(lookup(99, 0, 0, 3, 2, 0), None);
 }
 
 #[cfg(test)]

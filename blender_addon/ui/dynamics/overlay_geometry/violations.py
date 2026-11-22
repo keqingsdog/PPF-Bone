@@ -4,6 +4,8 @@
 # Review: Ryoichi Ando (ryoichi.ando@zozo.com)
 # License: Apache v2.0
 
+import math
+
 import gpu  # pyright: ignore
 from ...gpu_compat import point_uniform_shader
 
@@ -37,6 +39,7 @@ def _build_violation_batches(scene, depsgraph, violations):
     # Alpha is a flat 0.5 (50-50 blend) so the highlight tints the
     # offending geometry without obscuring the mesh underneath.
     COLORS = {
+        "degenerate_shell_face": (1.0, 0.24, 0.08, 0.95),
         "self_intersection": (1.0, 0.1, 0.1, 0.5),
         "contact_offset": (1.0, 0.5, 0.0, 0.5),
         "wall": (1.0, 0.1, 0.1, 0.5),
@@ -48,6 +51,7 @@ def _build_violation_batches(scene, depsgraph, violations):
         "existing_intersection": (0.1, 0.8, 1.0, 0.35),
     }
     LABELS = {
+        "degenerate_shell_face": "Degenerate Triangle",
         "self_intersection": "Self-Intersections",
         "contact_offset": "Contact-Offset Violations",
         "wall": "Wall Violations",
@@ -70,7 +74,33 @@ def _build_violation_batches(scene, depsgraph, violations):
         label_text = iface(LABELS.get(vtype, "Violation"))
         count = violation.get("count", 0)
 
-        if vtype in ("wall", "sphere"):
+        if vtype == "degenerate_shell_face":
+            edges = []
+            points = []
+            for entry in violation.get("entries", []):
+                coords = entry.get("triangle", [])
+                if not (isinstance(coords, list) and len(coords) == 3
+                        and all(isinstance(p, list) and len(p) == 3
+                                and all(type(x) in (int, float) and math.isfinite(x)
+                                        for x in p) for p in coords)):
+                    continue
+                a, b, c = (_solver_to_blender(p) for p in coords)
+                # A degenerate triangle can have zero visible fill area.
+                points.extend((a, b, c))
+                edges.extend((a, b, b, c, c, a))
+                name = entry.get("object_name", "")
+                labels.append({
+                    "pos_3d": (a + b + c) / 3.0 + Vector((0, 0, 0.025)),
+                    "text": f"{name}: {label_text}" if name else label_text,
+                    "color": color,
+                })
+            if edges:
+                batches.append((batch_for_shader(tri_shader, "LINES", {"pos": edges}),
+                                "LINES", color))
+                batches.append((batch_for_shader(point_shader, "POINTS", {"pos": points}),
+                                "POINTS", color))
+
+        elif vtype in ("wall", "sphere"):
             points = []
             for entry in violation.get("vertices", []):
                 pos = entry.get("pos")
@@ -117,7 +147,8 @@ def _build_violation_batches(scene, depsgraph, violations):
         elif vtype == "self_intersection":
             tri_verts = []
             centers = []
-            for tri_pair in violation.get("tris", []):
+            tri_pairs = violation.get("tris", [])
+            for tri_pair in tri_pairs:
                 for tri_pos in tri_pair:
                     if len(tri_pos) >= 3:
                         bv = [_solver_to_blender(p) for p in tri_pos]
@@ -128,9 +159,14 @@ def _build_violation_batches(scene, depsgraph, violations):
                 batch = batch_for_shader(tri_shader, "TRIS", {"pos": tri_verts})
                 batches.append((batch, "TRIS", color))
                 if centers:
+                    label = f"{count} {label_text}"
+                    if type(count) is int and count > len(tri_pairs):
+                        sample_label = iface("Showing {shown}/{total} examples").format(
+                            shown=len(tri_pairs), total=count)
+                        label += f" ({sample_label})"
                     labels.append({
                         "pos_3d": centers[0] + Vector((0, 0, 0.05)),
-                        "text": f"{count} {label_text}",
+                        "text": label,
                         "color": color[:3] + (1.0,),
                     })
 

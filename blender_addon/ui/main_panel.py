@@ -9,6 +9,7 @@
 
 from .. import i18n as _ppf_i18n
 import os
+import re
 import textwrap
 from dataclasses import dataclass
 
@@ -19,6 +20,7 @@ from ..i18n import pgettext_iface as iface_, pgettext_tip as tip_
 from ..core.client import RemoteStatus
 from ..core.client import communicator as com
 from ..core.status import crash_cause_summary
+from ..core.runtime_intersection import intersection_rows
 from ..core.derived import (
     is_server_busy_from_response as is_running,
     is_sim_running_from_response as is_simulating,
@@ -95,6 +97,19 @@ from .geometry_cleanup_ops import (
     MESH_OT_TriangulateDegenerateFaces,
     classes as geometry_cleanup_classes,
 )
+
+
+_SIMULATION_PROGRESS = re.compile(r"Simulation Running, frame ([0-9]+)/([0-9]+)")
+
+
+def _localized_remote_progress(message):
+    frame_progress = _SIMULATION_PROGRESS.fullmatch(message)
+    if frame_progress:
+        frame, total = frame_progress.groups()
+        return iface_("Simulation Running, frame {frame}/{total}").format(
+            frame=frame, total=total,
+        )
+    return iface_(message)
 
 
 # Tiny TTL cache for the port-error probe in the panel draw. The panel
@@ -941,7 +956,10 @@ class MAIN_PT_RemotePanel(Panel):
         status_text = iface_(status.value)
         if status == RemoteStatus.SIMULATION_FAILED and len(com.saved_state_frames()) > 0:
             status_text = iface_("{status} (Resumable)").format(status=iface_(status.value))
-        message = com.message or iface_("Status: {status}").format(status=status_text)
+        message = (
+            _localized_remote_progress(com.message)
+            if com.message else iface_("Status: {status}").format(status=status_text)
+        )
         if com.is_connecting():
             layout.label(text=message, icon=status.icon)
             layout.operator(REMOTE_OT_CancelConnect.bl_idname, text="Cancel", icon="X")
@@ -1031,6 +1049,9 @@ class MAIN_PT_RemotePanel(Panel):
                 # Drawn untranslated: it is machine data (a CUDA error name, a
                 # signal name, a file and line), not prose.
                 layout.label(text=detail)
+            if crash_kind == "intersection":
+                for template, values in intersection_rows(com.info.violations):
+                    layout.label(text=iface_(template).format(**values))
         elif server_error:
             # Any server error can carry supporting lines below its first one
             # (a build failure appends the worker's traceback), and
@@ -1091,7 +1112,7 @@ class MAIN_PT_RemotePanel(Panel):
 
         response = com.response
         if com.info.status.in_progress() or is_running(response):
-            progress_text = com.message or com.info.status.value
+            progress_text = _localized_remote_progress(com.message or com.info.status.value)
             layout.progress(
                 factor=com.info.progress, type="BAR", text=progress_text
             )

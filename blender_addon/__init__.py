@@ -95,7 +95,11 @@ _deferred_timers: list = []
 @persistent
 def _abort_capture_before_save(*_args):
     """Save stable author state rather than a capture job's temporary state."""
+    from .core.encoder.transfer_bone_stage import cancel as cancel_sliced
+    cancel_sliced()
     from .core.capture_origin import abort_before_save
+    from .ui.dynamics.bone_capture import cancel_active
+    cancel_active()
     from .ui.dynamics import static_deform_ops, pin_capture_ops
     for module in (static_deform_ops, pin_capture_ops):
         abort_before_save(module._capture_job)
@@ -105,12 +109,16 @@ def _abort_capture_before_save(*_args):
 def _cancel_captures_before_change(*_args):
     from .core.capture_origin import cancel_capture_jobs
     cancel_capture_jobs()
+    from .core.encoder.transfer_bone_stage import cancel as cancel_sliced
+    cancel_sliced()
 
 
 @persistent
 def _cancel_captures_before_undo(*_args):
     from .core.capture_origin import cancel_capture_jobs
     cancel_capture_jobs(restore=False)
+    from .core.encoder.transfer_bone_stage import cancel as cancel_sliced
+    cancel_sliced(restore=False)
 
 
 @persistent
