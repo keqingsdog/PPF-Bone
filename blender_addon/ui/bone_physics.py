@@ -712,6 +712,7 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
             _draw_pmx_connection(body.column(align=True), context, arm, bone)
         elif body:
             restoring=bone.ppf_bone_restoring_controls
+            body.prop(s, 'angular_restoring_multiplier', text='恢复刚度倍率')
             direct=body.column(align=True)
             from ..ops.bone_chain_presets import _joint_parent_status
             valid_parent,_parent_reason=_joint_parent_status(bone, arm)

@@ -1,4 +1,6 @@
 {
+  "恢复刚度倍率": "Restoring Stiffness Multiplier",
+  "缩放原生关节旋转恢复力，保持阻尼不变": "Scale rotational restoring effort for native joints while preserving damping",
   "Transfer was cancelled before a scene change": "Transfer was cancelled before a scene change",
   "Sampling collider motion: {done}/{total} frames": "Sampling collider motion: {done}/{total} frames",
   "Validating bone scales: {done}/{total} frames": "Validating bone scales: {done}/{total} frames",

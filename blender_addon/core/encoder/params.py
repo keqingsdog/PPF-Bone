@@ -1169,6 +1169,7 @@ def _build_param_dict_steps(context, *, pre_mmd_default=None, bone_motion=None):
             bone_data = bone_motion.consume(context, state, fresh)
         joint_curve_owners = _active_restoring_joint_owners(bone_data)
         from ...models.restoring_curves import export_scene
+        backup_count = len(pre_mmd_default) if pre_mmd_default is not None else 0
         restoring_curves = export_scene(
             scene, ordered_pair_ids=ordered_pair_ids,
             active_joint_ids=joint_curve_owners,
@@ -1176,6 +1177,15 @@ def _build_param_dict_steps(context, *, pre_mmd_default=None, bone_motion=None):
             mmd_automatic_channels=mmd_automatic_channels,
             pre_mmd_default=pre_mmd_default,
         )
+        from ...models.restoring_curves import scale_angular_export
+        multipliers = {bone.ppf_bone_physics.joint_uuid: float(bone.ppf_bone_physics.angular_restoring_multiplier)
+                       for arm in scene.objects if arm.type == 'ARMATURE'
+                       for bone in arm.data.bones
+                       if bone.ppf_bone_physics.enabled and bone.ppf_bone_physics.joint_control_mode == 'NATIVE'
+                       and bone.ppf_bone_physics.joint_uuid in joint_curve_owners}
+        restoring_curves = scale_angular_export(restoring_curves, multipliers)
+        if pre_mmd_default is not None and len(pre_mmd_default) > backup_count:
+            pre_mmd_default[-1] = scale_angular_export(pre_mmd_default[-1], multipliers)
         # Scene settings the artist keyframed, sampled from their own
         # F-curves. This is the authoring path; `_encode_dyn_params` reads the
         # addon's legacy keyframe list and stays only until every saved scene

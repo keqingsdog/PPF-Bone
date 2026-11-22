@@ -17,7 +17,7 @@ FIELDS=('collide_connected','collision_filter_enabled','collision_group_layers',
     'new_binding_physical_model','mass_mode','target_mass_kg','density','material_preset',
     'solid_model','solid_young_modulus','solid_young_mpa','solid_poisson_ratio','solid_deformation_damping',
     'joint_control_mode','use_hierarchy_joint','auto_follow_parent','root_mode','root_motion_source','anchor_stiffness','angular_stiffness','angular_damping',
-    'angular_restoring_mode','swing_restoring_stiffness','swing_restoring_damping',
+    'angular_restoring_multiplier','angular_restoring_mode','swing_restoring_stiffness','swing_restoring_damping',
     'swing_restoring_stiffness_degree','swing_restoring_damping_degree',
     'soft_limits_enabled','soft_lower','soft_upper','soft_stiffness','soft_stiffness_degree',
     'soft_limit_mode','swing_cone_half_angle','swing_cone_stiffness','swing_cone_stiffness_degree',
@@ -220,6 +220,8 @@ def set_selected_parameter(context,field,value,*,assign=None,_indices=None):
         raise ValueError('自动关键帧开启：摩擦请沿原材质RNA单项编辑')
     rows=resolve_selected_authors(context)
     source=active_author(context)
+    if field == 'angular_restoring_multiplier':
+        rows = [(arm, bone) for arm, bone in rows if bone.ppf_bone_physics.joint_control_mode == 'NATIVE']
     if not rows or source is None or not any(a==source[0] and b==source[1] for a,b in rows):
         raise ValueError('请选中要统一修改的骨骼或已绑定代理')
     from ..models.bone_bindings import validate_proxy_owner,check_soft_supported,has_physical_joint_parent

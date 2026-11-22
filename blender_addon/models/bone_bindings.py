@@ -482,6 +482,8 @@ def _angular_control(settings):
         for axis in AXES[1:]:
             stiffness[axis] = float(settings.swing_restoring_stiffness)
             damping[axis] = float(settings.swing_restoring_damping)
+    if settings.joint_control_mode == 'NATIVE':
+        stiffness = {axis: value * settings.angular_restoring_multiplier for axis, value in stiffness.items()}
     return dict(coordinate_model=MODEL, stiffness_Nm_per_rad=stiffness,
                 damping_Nms_per_rad=damping)
 
@@ -550,6 +552,7 @@ class PPF_BonePhysics(PropertyGroup):
     anchor_stiffness: FloatProperty(name="Anchor Stiffness (N/m)", default=200000., min=0., options=NOT_ANIMATED)
     angular_stiffness: FloatVectorProperty(name="Angular Stiffness (Nm/rad)", size=3, default=(.02, .04, .04), min=0., precision=5, options=NOT_ANIMATED)
     angular_damping: FloatVectorProperty(name="Angular Damping (Nms/rad)", size=3, default=(.001, .001, .001), min=0., precision=5, options=NOT_ANIMATED)
+    angular_restoring_multiplier: FloatProperty(name='恢复刚度倍率', description='缩放原生关节旋转恢复力，保持阻尼不变', default=1.0, min=0.0, options=NOT_ANIMATED)
     angular_restoring_mode: EnumProperty(name='摆动回正', items=[('AXES','分轴','分别设置 Y/Z 摆动回正'),('CONE','圆锥','各个摆动方向共用回正刚度和阻尼，从中立姿态起生效，X 扭转独立')], default='AXES', options=NOT_ANIMATED)
     swing_restoring_stiffness: FloatProperty(name='圆锥回正刚度（N·m/rad）', default=.04, min=0., precision=5, options=NOT_ANIMATED)
     swing_restoring_damping: FloatProperty(name='圆锥回正阻尼（N·m·s/rad）', default=.001, min=0., precision=5, options=NOT_ANIMATED)

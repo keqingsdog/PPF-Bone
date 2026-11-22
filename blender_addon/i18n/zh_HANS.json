@@ -1,4 +1,6 @@
 {
+  "恢复刚度倍率": "恢复刚度倍率",
+  "缩放原生关节旋转恢复力，保持阻尼不变": "缩放原生关节旋转恢复力，保持阻尼不变",
   "Transfer was cancelled before a scene change": "场景即将更改，传输已取消",
   "Sampling collider motion: {done}/{total} frames": "正在采样碰撞体动作（{done}/{total} 帧）",
   "Validating bone scales: {done}/{total} frames": "正在校验骨骼缩放（{done}/{total} 帧）",

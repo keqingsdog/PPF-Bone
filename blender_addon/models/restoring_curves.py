@@ -372,6 +372,39 @@ def export_scene(scene, ordered_pair_ids=None, active_joint_ids=None, *,
     return export_author({'mode': 'ADVANCED', 'document': projected})
 
 
+def scale_angular_export(document, multipliers):
+    """Scale consumed native angular curves without changing the author library."""
+    if document is None or not multipliers:
+        return document
+    result = copy.deepcopy(document)
+    tables = {table['table_id']: table for table in result['tables']}
+    derived = {}
+    for binding in result['bindings']:
+        target = binding['target']
+        if target['kind'] != 'JOINT' or target['channel'] == 'anchor':
+            continue
+        multiplier = multipliers.get(target['joint_uuid'], 1.0)
+        if multiplier == 1.0:
+            continue
+        key = (binding['table_id'], multiplier)
+        if key not in derived:
+            table = copy.deepcopy(tables[key[0]])
+            index = len(derived)
+            while 'ppf_mult_%d' % index in tables:
+                index += 1
+            table['table_id'] = 'ppf_mult_%d' % index
+            table['nodes'] = [[x, effort * multiplier] for x, effort in table['nodes']]
+            tables[table['table_id']] = table
+            result['tables'].append(table)
+            derived[key] = table['table_id']
+        binding['table_id'] = derived[key]
+    if not derived:
+        return document
+    used = {binding['table_id'] for binding in result['bindings']}
+    result['tables'] = [table for table in result['tables'] if table['table_id'] in used]
+    return validate_author_map(result)
+
+
 def preview_table(table, coordinate):
     """Author preview only: E, positive gradient and curvature in table units."""
     table = validate_table(table)
