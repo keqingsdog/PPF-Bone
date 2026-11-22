@@ -150,6 +150,121 @@ def _is_constant_positive_scale_curve(curve):
     return True
 
 
+def _known_scale_validation_handlers(scene):
+    """Only allow the plugin's own reviewed callbacks, with pose playback off."""
+    import bpy
+    from .. import bone_author_follow, bone_mass, live_timeline, pc2, rigid_pose, uuid_registry
+    from ...ui import bone_overlay, joint_axes_overlay
+    from ...ui.dynamics import group_ops, statistics
+
+    if (scene.get(rigid_pose.CACHE_KEY) or rigid_pose._detached_display_pending(scene)
+            or getattr(getattr(scene, 'rigidbody_world', None), 'enabled', False)):
+        return False
+    allowed = {
+        'frame_change_pre': (bone_overlay._frame_placement_pre,),
+        'frame_change_post': (
+            bone_overlay._frame_placement_post, bone_author_follow._observe_frame_object_basis,
+            live_timeline._observe_frame_change, pc2.curve_frame_change_handler,
+            rigid_pose.bone_pose_frame_change, statistics.statistics_frame_change_handler,
+        ),
+        'depsgraph_update_pre': (),
+        'depsgraph_update_post': (
+            bone_overlay._depsgraph_changed, bone_author_follow._mark_author_motion,
+            joint_axes_overlay._invalidate_armature_index,
+            bone_mass.mass_depsgraph_updated, uuid_registry._on_depsgraph_update,
+            group_ops._cleanup_deleted_objects,
+        ),
+    }
+    return all(all(any(handler is own for own in known)
+                   for handler in getattr(bpy.app.handlers, name))
+               for name, known in allowed.items())
+
+
+def _provably_fixed_fk_scale(arm, names, paths):
+    """First pass: plain FK with bounded transform curves on an unparented rig.
+
+    Unknown actions, inheritance, controllers or curve interpolation retain
+    evaluation. This is not a general dependency graph proof.
+    """
+    from ...models.bone_bindings import _rest_frame_for_drift
+
+    if arm.parent is not None or arm.constraints or any(
+            pose.constraints for pose in arm.pose.bones):
+        return False  # Sibling/descendant IK can affect relevant bones.
+    ad = arm.animation_data
+    if ad is None or ad.drivers or ad.nla_tracks or ad.use_tweak_mode:
+        return False
+    if (ad.action_blend_type != 'REPLACE' or ad.action_influence != 1.
+            or ad.action_extrapolation != 'HOLD'):
+        return False
+    action = ad.action
+    if action is None or (getattr(action, 'is_action_layered', False)
+                          and getattr(ad, 'action_slot', None) is None):
+        return False
+    layers = getattr(action, 'layers', ())
+    if len(layers) > 1 or any(len(layer.strips) != 1 for layer in layers):
+        return False
+
+    def constant_basis(owner):
+        return (all(math.isfinite(float(value)) and abs(float(value)) <= 1.e3
+                    for field in ('location', 'rotation_euler', 'rotation_quaternion',
+                                  'rotation_axis_angle')
+                    for value in getattr(owner, field))
+                and 0.25 <= owner.scale[0] <= 4.
+                and all(value == owner.scale[0] for value in owner.scale))
+
+    if (not constant_basis(arm) or not all(math.isfinite(float(value)) and abs(value) <= 1.e3
+            for value in (*arm.delta_location, *arm.delta_rotation_euler,
+                          *arm.delta_rotation_quaternion))
+            or any(value != 1. for value in arm.delta_scale)):
+        return False
+    movement = {'location'}
+    if arm.rotation_mode not in {'QUATERNION', 'AXIS_ANGLE'}:
+        movement.add('rotation_euler')
+        movement.add('delta_rotation_euler')
+    for name in names:
+        pose = arm.pose.bones[name]
+        bone = pose.bone
+        rest = _rest_frame_for_drift(bone.matrix_local)
+        if (not constant_basis(pose) or bone.inherit_scale != 'FULL'
+                or rest is None or rest[1] > 5.e-7
+                or len(pose.parent_recursive) > 12):
+            return False
+        # Uniform factors can be composed without shear; bound the aggregate
+        # to avoid overflow/near-singularity along an otherwise simple chain.
+        effective = arm.scale[0] * pose.scale[0] * math.prod(
+            parent.scale[0] for parent in pose.parent_recursive)
+        if not 0.25 <= effective <= 4.:
+            return False
+        if pose.rotation_mode not in {'QUATERNION', 'AXIS_ANGLE'}:
+            movement.add(pose.path_from_id('rotation_euler'))
+        movement.add(pose.path_from_id('location'))
+    for curve in _action_curves(action, getattr(ad, 'action_slot', None)):
+        if curve.mute:
+            continue
+        if curve.data_path in paths:
+            # The explicit validator already checked constancy. Verify the
+            # keyed axes match the effective channels observed at entry.
+            if (not 0 <= curve.array_index < 3
+                    or not _is_constant_positive_scale_curve(curve)
+                    or abs(curve.keyframe_points[0].co.y
+                           - arm.path_resolve(curve.data_path)[curve.array_index]) > 1.e-7):
+                return False
+            continue
+        if (curve.data_path not in movement or not 0 <= curve.array_index < 3
+                or curve.extrapolation != 'CONSTANT' or curve.modifiers
+                or curve.sampled_points or not curve.keyframe_points):
+            return False
+        for key in curve.keyframe_points:
+            if (key.interpolation not in {'BEZIER', 'LINEAR', 'CONSTANT'}
+                    or not all(math.isfinite(float(v)) and abs(v) <= 1.e3
+                               for v in (key.co.y, key.handle_left.y, key.handle_right.y))
+                    or not all(math.isfinite(float(v)) for v in
+                               (key.co.x, key.handle_left.x, key.handle_right.x))):
+                return False
+    return True
+
+
 def _pose_scale_sources(context, *, explicit_only=False):
     """Collect the frozen scale references needed by the frame sampler.
 
@@ -159,6 +274,7 @@ def _pose_scale_sources(context, *, explicit_only=False):
     from ...models.bone_bindings import bone_world_frame_scale
     sources = {}
     sample_needed = False
+    fast = None
     for arm in context.scene.objects:
         if arm.type != 'ARMATURE':
             continue
@@ -187,6 +303,14 @@ def _pose_scale_sources(context, *, explicit_only=False):
             ancestor = ancestor.parent
         if explicit_only:
             continue
+        if ad is not None and arm.parent is None:
+            if fast is None:
+                fast = _known_scale_validation_handlers(context.scene)
+            if fast and _provably_fixed_fk_scale(arm, names, paths):
+                # Keep the entry-frame validation even when no frame walk is needed.
+                for name in names:
+                    bone_world_frame_scale(arm, arm.data.bones[name])
+                continue
         for name in names:
             sources[(arm.name, name)] = (arm, arm.data.bones[name], bone_world_frame_scale(arm, arm.data.bones[name])[1])
     return sources.values() if sample_needed and not explicit_only else ()
