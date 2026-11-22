@@ -93,25 +93,6 @@ def _pmx_parameters(record):
             yield field, spring_field, index, axis, mode, lower, upper, spring
 
 
-def _uses_default_native_joint_axes(settings):
-    # collect_bindings uses bone_world @ Rz(90°) @ Euler(offset) for automatic
-    # frames. Manual frames and imported PMX use a different axis source.
-    return (settings.joint_control_mode == 'NATIVE'
-            and settings.use_auto_frames
-            and all(value == 0.0 for value in settings.joint_axis_euler))
-
-
-def _draw_joint_axes_note(layout, settings):
-    if _uses_default_native_joint_axes(settings):
-        layout.label(text='Joint axes → child bone local', icon='INFO')
-        layout.label(text='X (twist) → +Y')
-        layout.label(text='Y (bend) → −X')
-        layout.label(text='Z (bend) → +Z')
-    else:
-        layout.label(text='Axes use the configured joint frame.', icon='INFO')
-        layout.label(text='May differ from bone local axes.')
-
-
 def _draw_pmx_connection(layout, context, arm, bone):
     try:
         connections = _pmx_connections(arm, bone, _read_rows(arm.get('ppf_mmd_joints_v1', '[]')))
@@ -130,7 +111,6 @@ def _draw_pmx_connection(layout, context, arm, bone):
         layout.menu('PPF_MT_pmx_connection', text=label, translate=False)
     else:
         layout.label(text=label, translate=False)
-    _draw_joint_axes_note(layout, bone.ppf_bone_physics)
     for field, label, unit, _spring_field, spring_unit in _PMX_FIELDS:
         layout.label(text=f'{iface(label)} ({unit}) · {iface("弹簧")} ({spring_unit})', translate=False)
         for kind, _, _, axis, mode, lower, upper, spring in parameters:
@@ -560,8 +540,11 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
 
     def _draw_read_contents(self, context, frozen=False):
         from ..core.bone_selection_parameters import SelectionLayout,active_author,resolve_selected_authors
+        from .dynamics.bone_capture import draw_preview_controls
         base = _FrozenPropertyLayout(self.layout, context) if frozen else self.layout
         layout = SelectionLayout(base, context)
+        layout.prop(context.scene.ppf_bone_display, 'show_joint_axes')
+        draw_preview_controls(layout, context)
         bone = active_bone(context)
         if active_armature(context) is None and not (context.object and context.object.get('ppf_bone_proxy_owned')):
             header, editor = layout.panel('ppf_bone_editor_workspace', default_closed=False)
@@ -705,7 +688,6 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
         mmd = s.joint_control_mode == 'MMD'
         pmx_parent = effective_parent_joint_pair(bone, parent_joint_pairs(arm)) if mmd else None
         has_joint_parent=has_physical_joint_parent(bone, arm=arm)
-        valid_parent=None
         header,body=layout.panel('ppf_bone_essentials',default_closed=False)
         header.label(text='常用物理参数')
         if body and mmd:
@@ -719,8 +701,6 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
             direct.enabled=bool(context.mode in {'OBJECT','POSE'} and s.enabled and s.proxy and valid_parent and s.joint_mode == 'SOFT')
             target_loaded=bool(getattr(restoring,'draft_loaded',False) and getattr(restoring,'loaded_bone_uuid','')==getattr(s,'bone_uuid','') and getattr(restoring,'loaded_joint_uuid','')==getattr(s,'joint_uuid',''))
             direct.label(text='回正力矩（每度）',icon='CONSTRAINT_BONE')
-            if s.enabled and s.proxy and valid_parent and s.joint_mode == 'SOFT':
-                _draw_joint_axes_note(direct,s)
             if not valid_parent:direct.label(text='无父关节；使用下方根控制',icon='INFO')
             physical_loaded=bool(restoring.physical_draft_loaded and target_loaded)
             if physical_loaded and restoring.physical_status:
@@ -773,12 +753,6 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
             header,limits=layout.panel('ppf_bone_simple_limits',default_closed=True)
             header.label(text='软角度范围')
             if limits:
-                if s.enabled and s.proxy:
-                    if valid_parent is None:
-                        from ..ops.bone_chain_presets import _joint_parent_status
-                        valid_parent,_parent_reason=_joint_parent_status(bone, arm)
-                    if valid_parent:
-                        _draw_joint_axes_note(limits,s)
                 limits.prop(s,'soft_limit_mode',text='摆动范围')
                 limits.prop(s,'soft_limit_policy',text='力度')
                 if s.soft_limit_mode=='CONE':

@@ -1,4 +1,21 @@
 {
+  "Capture Bone Motion (Preview)": "본 모션 캡처（미리 보기）",
+  "Abort Bone Capture": "본 미리 보기 중단",
+  "Include Bone Preview": "본 모션 미리 보기 포함",
+  "Share frame evaluation with authored bone input checks. Preview only; Transfer still evaluates live inputs": "변형 캡처의 프레임 평가를 공유해 본 모션을 미리 봅니다. 전송 시 다시 평가합니다",
+  "Bone preview complete: {bindings} bindings, {frames} frame evaluations, {seconds:.2f} s": "본 미리 보기 완료（바인딩 {bindings}개, 프레임 평가 {frames}회, {seconds:.2f}초）",
+  "Stop playback and clear displayed solver bone animation before bone capture": "본을 캡처하기 전에 재생을 중지하고 표시 중인 솔버 본 애니메이션을 지우세요",
+  "Bone capture requires at least one solver frame": "본 캡처에는 솔버 프레임이 하나 이상 필요합니다",
+  "Bone capture timing or unit settings changed": "본 캡처 중 시간 또는 단위 설정이 변경되었습니다",
+  "Bone capture armature identity changed": "본 캡처 중 아마추어가 변경되었습니다",
+  "No enabled bone transport bindings found": "활성화된 본 바인딩을 찾지 못했습니다",
+  "Another deformation capture is in progress": "다른 변형 캡처가 진행 중입니다",
+  "Bone capture view layer changed": "본 캡처 중 뷰 레이어가 변경되었습니다",
+  "Bone capture frame callbacks or rigid body world changed": "본 캡처 중 프레임 콜백 또는 강체 월드가 변경되었습니다",
+  "Timeline changed during bone capture": "본 캡처 중 타임라인이 변경되었습니다",
+  "Bone sampling requires Object Mode and an idle solver": "본 샘플링에는 오브젝트 모드와 대기 중인 솔버가 필요합니다",
+  "Transfer the scene and parameters to the solver": "씬과 매개변수를 솔버로 전송합니다",
+  "显示关节轴向": "관절 축 표시",
   "恢复刚度倍率": "복원 강성 배율",
   "缩放原生关节旋转恢复力，保持阻尼不变": "네이티브 관절의 회전 복원력에 배율을 적용하고 감쇠를 유지합니다",
   "Transfer was cancelled before a scene change": "씬이 변경되기 전에 전송이 취소되었습니다",
@@ -2138,6 +2155,5 @@
   "PMX 限位下限须小于上限": "PMX 하한은 상한보다 작아야 합니다.",
   "代理惯量预览": "프록시 관성 미리 보기",
   "等待有效代理惯量": "유효한 프록시 관성을 기다리는 중",
-  "自动自定义曲线": "적응형 사용자 곡선",
-  "自动值按当前代理和质量估计；实际值由构建计算": "현재 프록시와 질량으로 자동 값을 추정합니다. 빌드에서 최종 값을 계산합니다."
+  "自动自定义曲线": "적응형 사용자 곡선"
 }

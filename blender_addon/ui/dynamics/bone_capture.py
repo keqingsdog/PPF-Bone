@@ -7,6 +7,7 @@ from ...core import capture_origin as origin
 from ...core.encoder import resolve_solver_fps, resolve_start_frame
 from ...core.encoder import bones
 from ...core.rigid_pose import has_bone_pose_cache, _detached_display_pending
+from ...i18n import pgettext_iface as iface_
 from ...models.bone_bindings import bone_frame_cache
 from ...models.groups import get_addon_data
 from . import capture_frame_batch as guard
@@ -29,7 +30,7 @@ def _require_idle(context):
     if ((context.screen is not None and context.screen.is_animation_playing)
             or has_bone_pose_cache(context.scene)
             or _detached_display_pending(context.scene)):
-        raise RuntimeError("Stop playback and clear displayed solver bone animation before bone capture")
+        raise RuntimeError(iface_("Stop playback and clear displayed solver bone animation before bone capture"))
 
 
 class BoneSampling:
@@ -41,7 +42,7 @@ class BoneSampling:
         self.stamp = _stamp(context)
         self.start, self.count, self.fps, *_ = self.stamp
         if self.count <= 0:
-            raise ValueError("Bone capture requires at least one solver frame")
+            raise ValueError(iface_("Bone capture requires at least one solver frame"))
         # Freeze the author scale reference at the original playhead/subframe,
         # separately from the document's reference at the solver start frame.
         self.author_start = int(context.scene.frame_current)
@@ -66,11 +67,11 @@ class BoneSampling:
         origin.require_origin(self.job, context)
         _require_idle(context)
         if _stamp(context) != self.stamp:
-            raise RuntimeError("Bone capture timing or unit settings changed")
+            raise RuntimeError(iface_("Bone capture timing or unit settings changed"))
         for arm, data, pointer in self.actor_sources:
             if (arm.as_pointer() != pointer or arm.data != data
                     or context.scene.objects.get(arm.name) != arm):
-                raise RuntimeError("Bone capture armature identity changed")
+                raise RuntimeError(iface_("Bone capture armature identity changed"))
 
     def sample(self, context, f):
         if self.pending != f:
@@ -86,7 +87,7 @@ class BoneSampling:
                 self.solver_plan = bones.prepare_transport_bones(
                     context, get_addon_data(context.scene).state, self.fps, self.start)
                 if self.solver_plan is None:
-                    raise RuntimeError("No enabled bone transport bindings found")
+                    raise RuntimeError(iface_("No enabled bone transport bindings found"))
                 self._has_track = any(self.solver_plan[2:])
             if self._has_track:
                 _, _, scale_sources, anchors, roots = self.solver_plan
@@ -105,7 +106,7 @@ class StandaloneBoneCapture:
     def __init__(self, context):
         from . import pin_capture_ops as pin, static_deform_ops as static
         if is_active() or pin.is_pin_capture_running() or static.is_capture_running():
-            raise RuntimeError("Another deformation capture is in progress")
+            raise RuntimeError(iface_("Another deformation capture is in progress"))
         self.bones = BoneSampling(context)
         self.context = context
         self.scene = context.scene
@@ -119,13 +120,13 @@ class StandaloneBoneCapture:
 
     def _require(self, context):
         if self.closed or self.layer != context.view_layer.as_pointer():
-            raise RuntimeError("Bone capture view layer changed")
+            raise RuntimeError(iface_("Bone capture view layer changed"))
         self.bones.require_valid(context)
         if self.world != guard._world_stamp(context.scene) or not guard._same_callbacks(self.callbacks):
-            raise RuntimeError("Bone capture frame callbacks or rigid body world changed")
+            raise RuntimeError(iface_("Bone capture frame callbacks or rigid body world changed"))
         if self.seeded is not None and (context.scene.frame_current != self.seeded
                                        or context.scene.frame_subframe):
-            raise RuntimeError("Timeline changed during bone capture")
+            raise RuntimeError(iface_("Timeline changed during bone capture"))
 
     def tick(self, context, *, budget_ms=35):
         try:
@@ -165,6 +166,19 @@ def standalone_progress(context):
         return None
     job = _active._job
     return job.bones.processed, job.bones.total, job.seeded
+
+
+def draw_preview_controls(layout, context):
+    progress = standalone_progress(context)
+    if progress is None:
+        layout.operator(SOLVER_OT_CaptureBoneMotion.bl_idname, icon="ARMATURE_DATA")
+        return
+    done, total, _frame = progress
+    layout.progress(
+        factor=done / max(total, 1), type="BAR",
+        text=iface_("Sampling bone motion: {done}/{total} frames").format(done=done, total=total),
+    )
+    layout.operator(SOLVER_OT_AbortBoneCapture.bl_idname, icon="CANCEL")
 
 
 def cancel_active(*, restore=True):
@@ -232,9 +246,11 @@ class SOLVER_OT_CaptureBoneMotion(bpy.types.Operator):
                 from ..solver import redraw_all_areas
                 redraw_all_areas(context)
                 return {'RUNNING_MODAL'}
-            self.report({'INFO'}, f"Bone preview: {len(job.bones.document['bindings'])} bindings, "
-                        f"{job.frame_sets} frame evaluations, {time.perf_counter() - job.started:.2f}s. "
-                        "Transfer still evaluates live inputs.")
+            self.report({'INFO'}, iface_("Bone preview complete: {bindings} bindings, {frames} frame evaluations, {seconds:.2f} s").format(
+                bindings=len(job.bones.document['bindings']),
+                frames=job.frame_sets,
+                seconds=time.perf_counter() - job.started,
+            ))
             return self._finish(context, {'FINISHED'})
         except Exception as exc:
             self.report({'ERROR'}, str(exc))

@@ -75,7 +75,7 @@ def _refresh(context,bone,metrics):
         owner.physical_channel_labels=json.dumps(labels,ensure_ascii=False)
         owner.physical_loaded_values=json.dumps(_values(owner))
         owner.physical_live=True
-        owner.physical_status='自动值按当前代理和质量估计；实际值由构建计算' if _AUTO_PREVIEW_LABEL in labels else ''
+        owner.physical_status=''
         return owner
     finally:_refresh_depth-=1
 
@@ -83,10 +83,14 @@ def _refresh(context,bone,metrics):
 def refresh_active():
     """Refresh author controls when the selected joint or cached mass changes."""
     global _refresh_key
+    from ..core import encode_progress
+    context = bpy.context
+    if encode_progress.is_active() or (context.screen is not None and context.screen.is_animation_playing):
+        return .3
     try:
         from ..models.bone_bindings import active_armature,active_bone
         from .bone_chain_presets import _joint_parent_status
-        context=bpy.context;arm=active_armature(context);bone=active_bone(context)
+        arm=active_armature(context);bone=active_bone(context)
         if arm is None or bone is None or context.mode not in {'OBJECT','POSE'}:
             _refresh_key=None;return .3
         s=bone.ppf_bone_physics

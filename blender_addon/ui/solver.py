@@ -60,7 +60,7 @@ from ..models.groups import (
 from .geometry_cleanup_ops import popup_transfer_error
 from .dynamics.bone_capture import (
     SOLVER_OT_CaptureBoneMotion, SOLVER_OT_AbortBoneCapture, is_active as bone_capture_active,
-    standalone_progress, has_bones,
+    has_bones,
 )
 from .dynamics.bake_ops import bake_progress_snapshot, is_bake_running
 from .dynamics.pin_capture_ops import (
@@ -609,7 +609,6 @@ class SOLVER_PT_SolverPanel(Panel):
             row.label(text=iface_("Install it from the Backend Communicator panel"))
         row = box.row()
         row.operator(SOLVER_OT_Transfer.bl_idname, icon="EXPORT")
-        row.operator(SOLVER_OT_Transfer.bl_idname, text="Sliced Transfer").sliced_bones = True
         row.operator(SOLVER_OT_UpdateParams.bl_idname, icon="OPTIONS")
         row = box.row()
         row.operator(SOLVER_OT_Run.bl_idname, icon="PLAY")
@@ -686,12 +685,6 @@ class SOLVER_PT_SolverPanel(Panel):
             )
             col.label(text=iface_("(not in any group)"))
             col.operator(SOLVER_OT_RemoveStaleCaches.bl_idname, icon="TRASH")
-
-        bone_progress = standalone_progress(context)
-        if bone_progress:
-            done, total, frame = bone_progress
-            _draw_progress(box, done, total, f"Bone preview | frame {frame}", "REC",
-                           SOLVER_OT_AbortBoneCapture.bl_idname)
 
         if is_bake_running():
             done, total, status, _ = bake_progress_snapshot()
@@ -803,7 +796,6 @@ class SOLVER_PT_SolverPanel(Panel):
             sub = box.row()
             sub.enabled = batch_control.enabled
             sub.prop(context.window_manager, "ppf_capture_bones_in_batch")
-        box.operator(SOLVER_OT_CaptureBoneMotion.bl_idname, icon="ARMATURE_DATA")
         box.operator(
             SOLVER_OT_RecaptureAllDeformations.bl_idname, icon="FILE_REFRESH"
         )
@@ -876,6 +868,7 @@ class SOLVER_OT_Transfer(AsyncOperator):
 
     bl_idname = "solver.transfer"
     bl_label = "Transfer"
+    bl_description = "Transfer the scene and parameters to the solver"
 
     sliced_bones: BoolProperty(
         name="Sliced bone preparation (experimental)", options={"SKIP_SAVE"},
@@ -2173,7 +2166,7 @@ class SOLVER_OT_RecaptureAllDeformations(Operator):
                 sampling = None
                 if context.window_manager.ppf_capture_bones_in_batch and has_bones(context):
                     if context.mode != "OBJECT" or com.busy() or is_running(com.info.response):
-                        raise RuntimeError("Bone sampling requires Object Mode and an idle solver")
+                        raise RuntimeError(iface_("Bone sampling requires Object Mode and an idle solver"))
                     sampling = BoneSampling(context)
                 self._joint_capture = JointCapture(context, static_objs, pin_specs, bone_sampling=sampling)
                 self._joint_capture._timer_owner = self
