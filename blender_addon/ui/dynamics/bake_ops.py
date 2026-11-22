@@ -2212,8 +2212,7 @@ class _ModalBakeBase:
                         break
                 redraw_all_areas(context)
                 return {"RUNNING_MODAL"}
-            except StopIteration as completed:
-                n_objs, n_frames = completed.value
+            except StopIteration:
                 self._bake_steps = None
             except Exception as exc:
                 _abort_job();self._teardown(context);self.report({"ERROR"}, str(exc));return {"CANCELLED"}
@@ -2221,12 +2220,7 @@ class _ModalBakeBase:
             from .overlay import apply_object_overlays
             apply_object_overlays()
             redraw_all_areas(context)
-            self.report(
-                {"INFO"},
-                iface_("Baked {frame_count} frame(s) for {object_count} object(s)").format(
-                    frame_count=n_frames, object_count=n_objs
-                ),
-            )
+            self.report({"INFO"}, iface_("Animation bake complete"))
             return {"FINISHED"}
         try:
             more = _tick_job(budget_ms=20)

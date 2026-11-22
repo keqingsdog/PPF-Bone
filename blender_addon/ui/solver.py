@@ -118,7 +118,7 @@ def _ascii_bar(factor: float) -> str:
     return "[" + "#" * filled + "." * (_ASCII_BAR_WIDTH - filled) + "]"
 
 
-def _draw_progress(layout, done, total, status_text, icon, abort_op, *, capture_samples=False):
+def _draw_progress(layout, done, total, status_text, icon, abort_op, *, capture_samples=False, count_text=None):
     """Draw one progress block (status label, native ``progress`` bar with an
     ASCII fallback, and an abort operator) into a fresh sub-box of ``layout``.
 
@@ -128,13 +128,14 @@ def _draw_progress(layout, done, total, status_text, icon, abort_op, *, capture_
     factor = (done / total) if total > 0 else 0.0
     prog_box = layout.box()
     prog_box.label(text=status_text, icon=icon)
-    label_text = (iface_("Samples: {done}/{total}").format(done=done, total=total)
-                  if capture_samples else f"{int(factor * 100)}% ({done}/{total})")
+    if count_text is None:
+        count_text = (iface_("Samples: {done}/{total}").format(done=done, total=total)
+                      if capture_samples else f"{int(factor * 100)}% ({done}/{total})")
     try:
-        prog_box.progress(factor=factor, type="BAR", text=label_text)
+        prog_box.progress(factor=factor, type="BAR", text=count_text)
     except (AttributeError, TypeError):
         bar = _ascii_bar(factor)
-        prog_box.label(text=f"{bar} {label_text}")
+        prog_box.label(text=f"{bar} {count_text}")
     if abort_op:
         prog_box.operator(abort_op, icon="X")
     else:
@@ -694,6 +695,7 @@ class SOLVER_PT_SolverPanel(Panel):
             _draw_progress(
                 box, done, total, status or "Baking...", "TIME",
                 None if bake_scene_locked() else "solver.bake_abort",
+                count_text=iface_("{done}/{total} work items").format(done=done, total=total),
             )
 
         joint = (_bulk_capture_display.get("joint") if

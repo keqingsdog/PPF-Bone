@@ -243,6 +243,8 @@
   "Baked {frame_count} frame(s) for {object_count} object(s)": "{object_count} 個のオブジェクトの {frame_count} フレームをベイクしました",
   "Baking {name} [{done}/{total}]": "{name} をベイク中 [{done}/{total}]",
   "Baking...": "ベイク中...",
+  "{done}/{total} work items": "処理項目 {done}/{total}",
+  "Animation bake complete": "アニメーションのベイクが完了しました",
   "Esc to cancel": "Esc でキャンセル",
   "Preparing animation bake...": "アニメーションベイクを準備中...",
   "Finalizing baked animation...": "ベイクしたアニメーションを確定中...",

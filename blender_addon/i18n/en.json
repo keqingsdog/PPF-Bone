@@ -269,6 +269,8 @@
   "Baked {frame_count} frame(s) for {object_count} object(s)": "Baked {frame_count} frame(s) for {object_count} object(s)",
   "Baking {name} [{done}/{total}]": "Baking {name} [{done}/{total}]",
   "Baking...": "Baking...",
+  "{done}/{total} work items": "{done}/{total} work items",
+  "Animation bake complete": "Animation bake complete",
   "Esc to cancel": "Esc to cancel",
   "Preparing animation bake...": "Preparing animation bake...",
   "Finalizing baked animation...": "Finalizing baked animation...",
