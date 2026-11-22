@@ -144,8 +144,12 @@ def _read_direct_values(context, bone):
     """Return authored normalized controls only for compatible linear AUTO curves."""
     state = read_state(context.scene)
     if state['mode'] == 'LEGACY':
-        return {'bend_strength': frequency_to_strength(curve_author.COMMON_ANGULAR_FREQUENCY_HZ),
-                'twist_strength': frequency_to_strength(curve_author.COMMON_ANGULAR_FREQUENCY_HZ),
+        settings = bone.ppf_bone_physics
+        frequency = (curves.mmd_automatic_frequency(settings)
+                     if curves.mmd_automatic_angular_channels(settings)
+                     else curve_author.COMMON_ANGULAR_FREQUENCY_HZ)
+        return {'bend_strength': frequency_to_strength(frequency),
+                'twist_strength': frequency_to_strength(frequency),
                 'damping_ratio': .7, 'defaults': True}
     document = state['document']
     if document is None:

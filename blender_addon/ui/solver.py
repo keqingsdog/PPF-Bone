@@ -62,7 +62,7 @@ from .dynamics.bone_capture import (
     SOLVER_OT_CaptureBoneMotion, SOLVER_OT_AbortBoneCapture, is_active as bone_capture_active,
     has_bones,
 )
-from .dynamics.bake_ops import bake_progress_snapshot, is_bake_running
+from .dynamics.bake_ops import bake_progress_snapshot, bake_scene_locked, is_bake_running
 from .dynamics.pin_capture_ops import (
     is_pin_capture_running,
     pin_capture_progress_snapshot,
@@ -135,7 +135,10 @@ def _draw_progress(layout, done, total, status_text, icon, abort_op, *, capture_
     except (AttributeError, TypeError):
         bar = _ascii_bar(factor)
         prog_box.label(text=f"{bar} {label_text}")
-    prog_box.operator(abort_op, icon="X")
+    if abort_op:
+        prog_box.operator(abort_op, icon="X")
+    else:
+        prog_box.label(text=iface_("Esc to cancel"))
 
 
 # Session-only, single most recent bulk run (no data saved in the .blend).
@@ -689,7 +692,8 @@ class SOLVER_PT_SolverPanel(Panel):
         if is_bake_running():
             done, total, status, _ = bake_progress_snapshot()
             _draw_progress(
-                box, done, total, status or "Baking...", "TIME", "solver.bake_abort"
+                box, done, total, status or "Baking...", "TIME",
+                None if bake_scene_locked() else "solver.bake_abort",
             )
 
         joint = (_bulk_capture_display.get("joint") if

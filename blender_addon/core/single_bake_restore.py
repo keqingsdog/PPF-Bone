@@ -94,12 +94,46 @@ def _validate_proxy_snapshot(rows):
             raise ValueError('物理代理几何或变换已改变；未修改场景。')
 
 
-def _curve_signatures(curves, *, strict=False):
+def _bulk_point_proof(points):
+    """Capture point coordinates and writable scalar fields in native batches."""
+    import hashlib
+    import numpy
+    from array import array
+    if not len(points): return []
+    first=points[0]; fields=[]
+    for prop in first.bl_rna.properties:
+        name=prop.identifier
+        if name=='rna_type' or (prop.is_readonly and name!='co'): continue
+        if prop.type in {'POINTER','COLLECTION'}:
+            raise ValueError('原Action关键帧含未知嵌套属性。')
+        width=prop.array_length if getattr(prop,'is_array',False) else 1
+        code={'FLOAT':'f','INT':'i','BOOLEAN':'b','ENUM':'i'}.get(prop.type)
+        if code is None:
+            # Preserve the strict legacy reader for uncommon field types.
+            return None
+        try:
+            values=array(code,[0])*(len(points)*width)
+            points.foreach_get(name,values)
+        except (TypeError,ValueError,RuntimeError,AttributeError):
+            return None
+        if code=='f' and not numpy.isfinite(numpy.frombuffer(values, dtype=numpy.float32)).all():
+            raise ValueError('原Action关键帧包含非有限数值。')
+        fields.append([name,code,width,hashlib.sha256(values).hexdigest()])
+    return [len(points),fields]
+
+
+def _curve_signatures(curves, *, strict=False, point_proofs=None):
     rows=[]
     for fc in curves:
-        points=[]
-        for p in fc.keyframe_points:
-            points.append([list(p.co),list(p.handle_left),list(p.handle_right),p.interpolation,p.easing,p.handle_left_type,p.handle_right_type,p.amplitude,p.back,p.period])
+        points = samples = None
+        if point_proofs is not None:
+            points = _bulk_point_proof(fc.keyframe_points)
+            samples = _bulk_point_proof(fc.sampled_points)
+            point_proofs.append((points is not None, samples is not None))
+        if points is None:
+            points=[]
+            for p in fc.keyframe_points:
+                points.append([list(p.co),list(p.handle_left),list(p.handle_right),p.interpolation,p.easing,p.handle_left_type,p.handle_right_type,p.amplitude,p.back,p.period])
         modifiers=[]
         for mod in fc.modifiers:
             props={}
@@ -116,21 +150,29 @@ def _curve_signatures(curves, *, strict=False):
             if mod.type == 'ENVELOPE':
                 props['control_points']=[[p.frame,p.min,p.max] for p in mod.control_points]
             modifiers.append([mod.type,props])
-        rows.append([fc.data_path,fc.array_index,fc.extrapolation,fc.mute,points,[list(p.co) for p in fc.sampled_points],modifiers,
+        if samples is None:
+            samples = [list(p.co) for p in fc.sampled_points]
+        rows.append([fc.data_path,fc.array_index,fc.extrapolation,fc.mute,points,samples,modifiers,
                      [fc.group.name,fc.group.mute] if fc.group else None])
     return rows
 
 
-def _action_signature(obj):
+def _action_signature(obj, *, compact=False):
     from .utils import get_id_fcurves
-    return json.dumps(_curve_signatures(get_id_fcurves(obj)),sort_keys=True)
+    curves = _curve_signatures(get_id_fcurves(obj), point_proofs=[] if compact else None)
+    signature = json.dumps(curves, sort_keys=True)
+    if compact:
+        import hashlib
+        return 'curves-v3:' + hashlib.sha256(signature.encode('utf-8')).hexdigest()
+    return signature
 
 
-def _source_action_snapshot(action):
+def _source_action_snapshot(action, *, expected=None):
     """Snapshot detached Action itself, including all slots and layers."""
     if action is None:
         return '', []
     import math
+    compact = expected is None or expected.startswith('action-v3:')
     refs = []
     def custom(value):
         if isinstance(value, bpy.types.ID):
@@ -151,8 +193,10 @@ def _source_action_snapshot(action):
         raise ValueError('原Action自定义属性类型尚不支持；未开始烘焙。')
     def source_curves(curves):
         curves=list(curves)
+        point_proofs = [] if compact else None
+        signatures = _curve_signatures(curves, strict=True, point_proofs=point_proofs)
         extra=[]
-        for fc in curves:
+        for index, fc in enumerate(curves):
             def scalar(item, structural=()):
                 out={}
                 for prop in item.bl_rna.properties:
@@ -165,10 +209,12 @@ def _source_action_snapshot(action):
                     elif isinstance(value,(str,int,float,bool)):out[name]=value
                     else:raise ValueError('原Action曲线属性无法确认。')
                 return out
+            keys_proven, samples_proven = point_proofs[index] if compact else (False, False)
             extra.append([scalar(fc,{'group','driver','keyframe_points','sampled_points','modifiers'}),
                           scalar(fc.group,{'channels'}) if fc.group else None,
-                          [scalar(k) for k in fc.keyframe_points], [scalar(k) for k in fc.sampled_points]])
-        return [_curve_signatures(curves,strict=True),extra]
+                          [] if keys_proven else [scalar(k) for k in fc.keyframe_points],
+                          [] if samples_proven else [scalar(k) for k in fc.sampled_points]])
+        return [signatures,extra]
     def values(item):
         out={}
         for prop in item.bl_rna.properties:
@@ -192,7 +238,11 @@ def _source_action_snapshot(action):
         layers.append([values(layer),strips])
     legacy=source_curves(getattr(action,'fcurves',()) or []) if not layers else []
     payload=[values(action),slots,layers,legacy,['group',[[key,custom(action[key])] for key in sorted(action.keys())]]]
-    return json.dumps(payload,sort_keys=True,allow_nan=False), refs
+    serialized=json.dumps(payload,sort_keys=True,allow_nan=False)
+    if compact:
+        import hashlib
+        serialized='action-v3:'+hashlib.sha256(serialized.encode('utf-8')).hexdigest()
+    return serialized, refs
 
 
 def _source_action_signature(action):
@@ -211,7 +261,7 @@ def _preflight_source_owners(objects):
 
 def _recheck_source_owners(owners, proofs, graph):
     from . import recovery_anim_graph
-    actual=_source_action_proofs(owners)
+    actual=_source_action_proofs(owners, expected=proofs)
     if len(actual)!=len(proofs) or any(a['obj']!=b['obj'] or a['action']!=b['action'] or a['signature']!=b['signature'] or not _source_refs_equal(a['source_refs'],b['source_refs']) for a,b in zip(actual,proofs)):
         raise ValueError('源动画在预验后改变；未继续烘焙。')
     recovery_anim_graph.validate(graph,_source_action_snapshot)
@@ -248,28 +298,28 @@ def _validate_bone_commit_snapshot(tx, entry):
 
 
 def _validate_bone_source_snapshots(entries):
-    from . import recovery_anim_graph
     arms=[]
     for entry in entries:
         for snap in entry.get('snapshots',[]):
             if snap.get('source_snapshot_schema')!=2:raise ValueError('骨骼源动画证明版本不匹配；未开始烘焙。')
             arm=snap['arm'];action=arm.animation_data.action if arm.animation_data else None
             if action!=snap.get('action'):raise ValueError('骨骼源动画绑定已改变。')
-            if action is not None:
-                signature,refs=_source_action_snapshot(action)
-                if signature!=snap.get('source_action_proof') or not _source_refs_equal(refs,snap.get('source_action_refs',[])):
-                    raise ValueError('骨骼源动画在预验后改变。')
             _recheck_source_owners(_recovery_owners([arm]),_bone_snapshot_rows(snap),snap['source_graph_proof'])
             arms.append(arm)
     return arms
 
 
-def _source_action_proofs(objects):
+def _source_action_proofs(objects, *, expected=()):
     rows=[]
+    cache={}
     for obj in objects:
         action=obj.animation_data.action if obj.animation_data else None
         if action is not None:
-            signature,refs=_source_action_snapshot(action)
+            prior=next((p for p in expected if p.get('obj')==obj and p.get('action')==action),None)
+            signature_format=prior.get('signature') if prior else None
+            key=(action.as_pointer(), bool(signature_format and not signature_format.startswith('action-v3:')))
+            if key not in cache:cache[key]=_source_action_snapshot(action, expected=signature_format)
+            signature,refs=cache[key]
             rows.append(dict(obj=obj,action=action,signature=signature,source_refs=refs))
     return rows
 
@@ -299,7 +349,7 @@ def _validate_source_action_proofs(tx, *, permitted_bindings=()):
         action=row.get('action')
         if action is None:
             raise ValueError('原始Action已删除；未恢复或消费记录。')
-        signature,refs=_source_action_snapshot(action)
+        signature,refs=_source_action_snapshot(action, expected=row.get('signature'))
         if signature!=row.get('signature') or not _source_refs_equal(refs,row.get('source_refs',[])):
             raise ValueError('原始Action已修改或不可用；未恢复或消费记录。请保留烘焙并备份源Action。')
         owner=row.get('obj')
@@ -471,7 +521,7 @@ def _slot_row(row):
     return (row['slot_handle'],row['slot_identifier']) if 'slot_handle' in row else None
 
 
-def _bone_row(entry):
+def _bone_row(entry, *, compact=False):
     if entry is None:return {}
     result={'key':entry['key'],'frame':entry['entry_time'][0],'subframe':entry['entry_time'][1],'arms':[]}
     for snap in entry['snapshots']:
@@ -481,7 +531,7 @@ def _bone_row(entry):
             row['source_fake_promoted']=snap['action'] in entry.get('retained_source_actions',[])
         if snap['slot']:row['slot_handle']=snap['slot'][0];row['slot_identifier']=snap['slot'][1]
         if snap['arm'].animation_data and snap['arm'].animation_data.action:row['baked_action']=snap['arm'].animation_data.action
-        row['baked_signature']=_action_signature(snap['arm'])
+        row['baked_signature']=_action_signature(snap['arm'], compact=compact)
         row['baked_static_scales']={n:[float(v) for v in snap['arm'].pose.bones[n].scale] for n in snap.get('static_scale_names',[])}
         result['arms'].append(row)
     return result

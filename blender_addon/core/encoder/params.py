@@ -1168,6 +1168,11 @@ def _build_param_dict_steps(context, *, pre_mmd_default=None, bone_motion=None):
             fresh = prepare_transport_bones(context, state, fps, start_frame, **options)
             bone_data = bone_motion.consume(context, state, fresh)
         joint_curve_owners = _active_restoring_joint_owners(bone_data)
+        multipliers = {bone.ppf_bone_physics.joint_uuid: float(bone.ppf_bone_physics.angular_restoring_multiplier)
+                       for arm in scene.objects if arm.type == 'ARMATURE'
+                       for bone in arm.data.bones
+                       if bone.ppf_bone_physics.enabled and bone.ppf_bone_physics.joint_control_mode == 'NATIVE'
+                       and bone.ppf_bone_physics.joint_uuid in joint_curve_owners}
         from ...models.restoring_curves import export_scene
         backup_count = len(pre_mmd_default) if pre_mmd_default is not None else 0
         restoring_curves = export_scene(
@@ -1175,14 +1180,13 @@ def _build_param_dict_steps(context, *, pre_mmd_default=None, bone_motion=None):
             active_joint_ids=joint_curve_owners,
             cone_restoring_joint_ids=cone_restoring_joint_ids,
             mmd_automatic_channels=mmd_automatic_channels,
+            mmd_v2_joints={bone.ppf_bone_physics.joint_uuid
+                           for arm in scene.objects if arm.type == 'ARMATURE'
+                           for bone in arm.data.bones
+                           if bone.ppf_bone_physics.mmd_auto_epoch == 'MMD_AUTO_V2'},
             pre_mmd_default=pre_mmd_default,
         )
         from ...models.restoring_curves import scale_angular_export
-        multipliers = {bone.ppf_bone_physics.joint_uuid: float(bone.ppf_bone_physics.angular_restoring_multiplier)
-                       for arm in scene.objects if arm.type == 'ARMATURE'
-                       for bone in arm.data.bones
-                       if bone.ppf_bone_physics.enabled and bone.ppf_bone_physics.joint_control_mode == 'NATIVE'
-                       and bone.ppf_bone_physics.joint_uuid in joint_curve_owners}
         restoring_curves = scale_angular_export(restoring_curves, multipliers)
         if pre_mmd_default is not None and len(pre_mmd_default) > backup_count:
             pre_mmd_default[-1] = scale_angular_export(pre_mmd_default[-1], multipliers)

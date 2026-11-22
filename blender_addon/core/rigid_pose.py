@@ -19,14 +19,18 @@ _busy = False
 _cache = {}
 _scene_cache_keys = {}
 _completion = {}
+_verified_playback = {}
+_capture_for_bake = None
 _completion_serial = 0
 
 
 def clear_pose_completion(scene=None):
     if scene is None:
         _completion.clear()
+        _verified_playback.clear()
     else:
         _completion.pop(scene.as_pointer(), None)
+        _verified_playback.pop(scene.as_pointer(), None)
 
 
 def pose_completion(scene):
@@ -41,6 +45,54 @@ def pose_completion(scene):
         return None
     return packet
 
+
+
+
+@contextmanager
+def capture_verified_playback_for_bake(scene, key, frame_index, digest):
+    global _capture_for_bake
+    previous = _capture_for_bake
+    _capture_for_bake = (scene.as_pointer(), key, frame_index, digest)
+    try:
+        yield
+    except BaseException:
+        _verified_playback.pop(scene.as_pointer(), None)
+        raise
+    finally:
+        _capture_for_bake = previous
+
+
+def _evaluated_packet_matrices(scene, packet, depsgraph):
+    rows = []
+    for name, session_uid, _arm_uuid, bone_name, _bone_uuid, _body_uuid, _kind, _expected in packet[9]:
+        arm = scene.objects.get(name)
+        if arm is None or arm.session_uid != session_uid:
+            return None
+        evaluated = arm.evaluated_get(depsgraph)
+        pb = evaluated.pose.bones.get(bone_name)
+        if pb is None:
+            return None
+        world = evaluated.matrix_world @ pb.matrix
+        rows.append(tuple(float(world[i][j]) for i in range(4) for j in range(4)))
+    return tuple(rows) if rows else None
+
+def verified_playback_matches(scene, key, frame_index, digest, depsgraph, receipt):
+    """Prove the last verified handler result survived later frame handlers."""
+    packet = pose_completion(scene)
+    proof = _verified_playback.pop(scene.as_pointer(), None)
+    if packet is None or proof is None:
+        return False
+    try:
+        if (proof[:4] != (packet[1], key, frame_index, digest)
+                or proof[6] != json.dumps(receipt, sort_keys=True, separators=(',', ':'))):
+            return False
+        path = _io_path(Path(key).parent / f'pose_{frame_index}.cbor')
+        stat = path.stat()
+        if (stat.st_size, stat.st_mtime_ns) != proof[4]:
+            return False
+        return _evaluated_packet_matrices(scene, packet, depsgraph) == proof[5]
+    except (OSError, ValueError, RuntimeError, ReferenceError, AttributeError):
+        return False
 
 def _publish_pose_completion(scene, receipt, pose, targets, plan):
     """Observer only: failed serialization must never roll back a committed pose."""
@@ -1860,10 +1912,23 @@ def bone_pose_frame_change(scene, _depsgraph=None):
         n = scene.frame_current - receipt["start_frame"]
         if scene.frame_subframe or str(n) not in index["frames"]:
             return  # Missing downloaded frames are not generated or duplicated.
-        raw = _io_path(Path(key).parent / f"pose_{n}.cbor").read_bytes()
-        if hashlib.sha256(raw).hexdigest() != index["frames"][str(n)]:
+        path = _io_path(Path(key).parent / f"pose_{n}.cbor")
+        requested = _capture_for_bake == (scene.as_pointer(), key, n, index["frames"][str(n)])
+        before = path.stat() if requested else None
+        raw = path.read_bytes()
+        digest = hashlib.sha256(raw).hexdigest()
+        if digest != index["frames"][str(n)]:
             raise ValueError("bone pose: cached frame digest mismatch")
         _apply(scene, receipt, _load(raw))
+        if requested:
+            import bpy
+            packet = pose_completion(scene)
+            after = path.stat()
+            if packet is not None and (before.st_size, before.st_mtime_ns) == (after.st_size, after.st_mtime_ns):
+                bpy.context.view_layer.update()
+                matrices = _evaluated_packet_matrices(scene, packet, bpy.context.evaluated_depsgraph_get())
+                if matrices is not None:
+                    _verified_playback[scene.as_pointer()] = (packet[1], key, n, digest, (after.st_size, after.st_mtime_ns), matrices, json.dumps(receipt, sort_keys=True, separators=(',', ':')))
     except Exception as exc:
         from ..models.console import console
         console.write(f"bone pose playback: {exc}")

@@ -547,12 +547,59 @@ class PPF_OT_ImportMMDPhysics(bpy.types.Operator):
             settings = row['settings']
             if settings.get('mass_mode') == 'MASS':
                 settings['target_mass_kg'] *= self.mass_multiplier
+        # Capture the creation boundary before the proxy transaction assigns
+        # UUIDs or creates its default author document; existing data is never
+        # migrated by a repeated MMD import.
+        from .restoring_curve_operators import read_state, write_state
+        from ..models import restoring_curves as restoring
+        curve_owner=context.scene.ppf_restoring_curves
+        dormant=curve_owner.mode=='LEGACY' and bool(curve_owner.document_json or curve_owner.editor_target_json or len(curve_owner.nodes))
+        previous_curves={'document':None} if dormant else read_state(context.scene)
+        old_targets={restoring.target_key(b['target']) for b in (previous_curves.get('document') or {}).get('bindings', [])}
+        fresh_names={bone.name for bone in bones
+                     if not bone.ppf_bone_physics.enabled and not bone.ppf_bone_physics.proxy
+                     and not any(getattr(bone.ppf_bone_physics,k) for k in ('bone_uuid','body_uuid','joint_uuid','group_uuid'))
+                     and not any(bone.ppf_bone_physics.is_property_set(k) for k in (
+                         'angular_stiffness', 'angular_damping', 'angular_restoring_multiplier',
+                         'angular_restoring_mode', 'swing_restoring_stiffness', 'swing_restoring_damping',
+                         'soft_limit_mode', 'swing_cone_half_angle', 'swing_cone_stiffness',
+                         'soft_limits_enabled', 'soft_lower', 'soft_upper', 'soft_stiffness',
+                         'soft_limit_policy', 'soft_limit_frequency_hz', 'soft_limit_strength',
+                         'anchor_stiffness', 'material_preset', 'mmd_auto_epoch'))
+                     and not (bone.is_property_set('ppf_bone_restoring_controls') and any(
+                         bone.ppf_bone_restoring_controls.is_property_set(k) for k in (
+                             'bend_strength', 'twist_strength', 'damping_ratio',
+                             'anchor_strength', 'anchor_damping_ratio')))}
         result = {}
         def after_apply(a, bs):
             if self.import_mode == 'MMD':
                 result.update(_apply(context, a, bs, rows, plans, mode_targets))
             else:
                 result.update({'cross': 0, 'skipped': 0})
+            fresh_ids=set()
+            for bone in bs:
+                if bone.name not in fresh_names:continue
+                settings=bone.ppf_bone_physics
+                settings.mmd_auto_epoch='MMD_AUTO_V2'
+                if settings.proxy and not settings.proxy.get('ppf_mmd_source'):
+                    settings.proxy['ppf_mmd_source']=rows[bone.name]['source']
+                fresh_ids.add(settings.joint_uuid)
+            # Only creation-generated, previously absent angular bindings are
+            # calibrated. Existing bindings, tables and all other channels stay.
+            state={'document':None} if dormant else read_state(context.scene)
+            document=state.get('document')
+            changed=False
+            if document:
+                for binding in document['bindings']:
+                    target=binding['target']
+                    if (target.get('kind')=='JOINT' and target.get('joint_uuid') in fresh_ids
+                            and target.get('channel') in ('twist_x','swing_y','swing_z')
+                            and restoring.target_key(target) not in old_targets
+                            and binding.get('mode')=='AUTO_FREQUENCY'
+                            and binding.get('frequency_hz')==restoring.COMMON_ANGULAR_FREQUENCY_HZ):
+                        binding['frequency_hz']=restoring.MMD_DEFAULT_ANGULAR_FREQUENCY_HZ
+                        changed=True
+            if changed:write_state(context.scene,state)
         authoring = {name: {'settings': row['settings'], 'geometry': row['geometry']} for name, row in rows.items()}
         from ..core import cross_links
         old_links = cross_links._records(arm)

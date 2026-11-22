@@ -5,6 +5,7 @@ import bpy
 from mathutils import Matrix
 from . import rigid_pose as rp
 from .utils import get_id_fcurves
+from ..i18n import pgettext_iface as iface_
 
 class BoneBakeError(ValueError):
     code='BONE_BAKE_UNREPRESENTABLE'
@@ -57,13 +58,19 @@ def make_entry(scene,single=None):
 
 def sample(entry):
     scene=entry['scene'];frame=entry['sample_frames'][entry['frames_done']]
-    scene.frame_set(frame)
-    n=frame-entry['start_frame'];raw=rp._io_path(Path(entry['key']).parent/f'pose_{n}.cbor').read_bytes()
-    # Reuse the existing production per-frame cache integrity gate, not an audit.
-    if rp.hashlib.sha256(raw).hexdigest()!=entry['index']['frames'][str(n)]:raise BoneBakeError('Bone cache frame integrity mismatch')
-    rp._apply(scene,entry['index']['receipt'],rp._load(raw));bpy.context.view_layer.update()
+    n=frame-entry['start_frame']
+    with rp.capture_verified_playback_for_bake(scene,entry['key'],n,entry['index']['frames'][str(n)]):
+        scene.frame_set(frame)
+    # Settle changes made by later frame handlers before proving reuse.
+    bpy.context.view_layer.update()
+    dg=bpy.context.evaluated_depsgraph_get()
+    if not rp.verified_playback_matches(scene,entry['key'],n,entry['index']['frames'][str(n)],dg,entry['index']['receipt']):
+        raw=rp._io_path(Path(entry['key']).parent/f'pose_{n}.cbor').read_bytes()
+        if rp.hashlib.sha256(raw).hexdigest()!=entry['index']['frames'][str(n)]:raise BoneBakeError('Bone cache frame integrity mismatch')
+        rp._apply(scene,entry['index']['receipt'],rp._load(raw));bpy.context.view_layer.update()
+        dg=bpy.context.evaluated_depsgraph_get()
     if scene.get(rp.CACHE_KEY)!=entry['key']:raise BoneBakeError('Bone cache detached while sampling')
-    dg=bpy.context.evaluated_depsgraph_get();row={}
+    row={}
     for snap in entry['snapshots']:
         arm=snap['arm'];ev=arm.evaluated_get(dg)
         row[arm.name]={n:ev.pose.bones[n].matrix.copy() for n in arm.pose.bones.keys()}
@@ -246,7 +253,7 @@ def _omit_constant_generated_scales(arm, names, created_action, frames, created_
     return [pb.name for pb, _curves in plans]
 
 
-def finish(entry):
+def _finish_steps(entry, *, fast):
     if entry['frames_done']!=entry['n_frames']:raise BoneBakeError('Incomplete bone samples')
     scene=entry['scene']
     # A caller must distinguish a completed rollback from a rollback that
@@ -255,23 +262,28 @@ def finish(entry):
     try:
         # Restore authored graph/source before assigning the new Action. This
         # also detaches cache override without deleting any external files.
+        yield iface_("Preparing bone Actions")
         warnings=rp.clear_bone_pose_cache(scene)
         if warnings:raise BoneBakeError('; '.join(warnings))
         for snap in entry['snapshots']:
+            yield iface_("Preparing bone Action {name}").format(name=snap['arm'].name)
             arm=snap['arm'];old=snap['action'];static_scales=_static_pdrd_author_scales(entry,snap) if not entry['single'] else {}
             proven_static_names=set(static_scales)
             new=old.copy() if old else bpy.data.actions.new(arm.name+' Solver Bake')
             new.name=arm.name+' Solver Bake';entry['created'].append(new);_assign(arm,new,snap['slot']);_remove_target_channels(arm,snap['names'])
             previous={}
+            collected={}
             # Bindings may arrive in arbitrary order; emit parent channels first.
             ordered_names=sorted(snap['names'], key=lambda name: len(arm.pose.bones[name].parent_recursive))
             for sample_index,(frame,rows) in enumerate(entry['samples']):
+                yield iface_("Writing bone frame {done}/{total}").format(done=sample_index + 1, total=len(entry['samples']))
                 output_frame=frame
                 poses=rows[arm.name]
-                scene.frame_set(output_frame);bpy.context.view_layer.update()
+                if not fast:
+                    scene.frame_set(output_frame);bpy.context.view_layer.update()
                 for name in ordered_names:
                     pb=arm.pose.bones[name];bone=pb.bone;parent=pb.parent
-                    parent_pose=(poses[parent.name] if parent and parent.name in snap['names'] else (arm.evaluated_get(bpy.context.evaluated_depsgraph_get()).pose.bones[parent.name].matrix.copy() if parent else None))
+                    parent_pose=(poses[parent.name] if parent and (fast or parent.name in snap['names']) else (arm.evaluated_get(bpy.context.evaluated_depsgraph_get()).pose.bones[parent.name].matrix.copy() if parent else None))
                     kwargs=dict(parent_matrix=parent_pose,parent_matrix_local=parent.bone.matrix_local) if parent else {}
                     basis=bone.convert_local_to_pose(poses[name],bone.matrix_local,invert=True,**kwargs)
                     loc,q,scale=basis.decompose(); solved_scale=scale.copy()
@@ -283,7 +295,7 @@ def finish(entry):
                         if name in static_scales and sample_index == 0:
                             del static_scales[name]; scale=solved_scale; rebuilt=Matrix.LocRotScale(loc,q,scale)
                         if max(abs(basis[i][j]-rebuilt[i][j]) for i in range(4) for j in range(4))>2e-5:
-                            raise BoneBakeError('Author flags require shear not expressible as TRS: '+name)
+                            raise _FastPoseMismatch('Author flags require shear not expressible as TRS: '+name) if fast else BoneBakeError('Author flags require shear not expressible as TRS: '+name)
                     pb.location=loc;pb.scale=scale;mode=snap['modes'][name]
                     if mode=='QUATERNION':
                         if name in previous and q.dot(previous[name])<0:q.negate()
@@ -296,7 +308,26 @@ def finish(entry):
                     # would make the later transfer reject it as animated.
                     paths = ('location', channel) if entry['single'] or name in static_scales else ('location', channel, 'scale')
                     for path in paths:
-                        if not pb.keyframe_insert(data_path=path,frame=output_frame,group=pb.name):raise BoneBakeError('Key insertion failed: '+name)
+                        if fast:
+                            collected.setdefault((name,path), []).append((output_frame, tuple(getattr(pb,path))))
+                        if not fast or sample_index == 0:
+                            if not pb.keyframe_insert(data_path=path,frame=output_frame,group=pb.name):raise BoneBakeError('Key insertion failed: '+name)
+            if fast:
+                from array import array
+                curves=list(get_id_fcurves(arm))
+                for (name,path), values in collected.items():
+                    yield iface_("Finalizing bone Action {name}").format(name=arm.name)
+                    data_path=arm.pose.bones[name].path_from_id(path)
+                    for index in range(len(values[0][1])):
+                        matches=[fc for fc in curves if fc.data_path==data_path and fc.array_index==index]
+                        if len(matches)!=1 or len(matches[0].keyframe_points)!=1:
+                            raise _FastPoseMismatch('Bone channel cannot be bulk written: '+name)
+                        fc=matches[0]
+                        if len(values)>1:fc.keyframe_points.add(len(values)-1)
+                        coordinates=array('f', (component for frame, vector in values for component in (frame, vector[index])))
+                        fc.keyframe_points.foreach_set('co',coordinates)
+                        fc.update()
+            yield iface_("Finalizing bone Action {name}").format(name=arm.name)
             for fc in get_id_fcurves(arm):
                 if any(fc.data_path.startswith(arm.pose.bones[n].path_from_id()+'.') for n in snap['names']):
                     for kp in fc.keyframe_points:kp.interpolation='LINEAR'
@@ -307,7 +338,8 @@ def finish(entry):
         # The real depsgraph, under restored author flags and without cache,
         # is the acceptance gate; no successful-but-offset fallback.
         maximum=0.
-        for frame,rows in entry['samples']:
+        for sample_index,(frame,rows) in enumerate(entry['samples']):
+            yield iface_("Validating bone frame {done}/{total}").format(done=sample_index + 1, total=len(entry['samples']))
             out=frame
             scene.frame_set(out);bpy.context.view_layer.update();dg=bpy.context.evaluated_depsgraph_get()
             for snap in entry['snapshots']:
@@ -325,7 +357,8 @@ def finish(entry):
                             world=snap['arm'].matrix_world
                             gap=((world @ target_head)-(world @ parent_tail)).length
                             detail+='; '+snap['arm'].name+'/'+n+' at frame '+str(frame)+' has authored use_connect=True; mapped head-to-parent-tail world gap='+str(gap)+'. The connected rig may not express this solver pose; source Action and rig are preserved.'
-                        raise BoneBakeError(detail)
+                        raise _FastPoseMismatch(detail) if fast else BoneBakeError(detail)
+        yield iface_("Completing bone Action")
         scene.frame_set(entry['entry_time'][0],subframe=entry['entry_time'][1])
         bpy.context.view_layer.update()
         # A successful bake must not discard its now-unused source Action on
@@ -341,6 +374,54 @@ def finish(entry):
         rollback(entry)
         entry['_finish_rollback_complete'] = True
         raise
+
+class _FastPoseMismatch(BoneBakeError):
+    pass
+
+
+def _can_bulk_finish(entry):
+    if entry['single'] or not entry['samples']:
+        return False
+    for snap in entry['snapshots']:
+        arm=snap['arm']
+        for _frame, rows in entry['samples']:
+            poses=rows.get(arm.name,{})
+            if any(n not in poses or (arm.pose.bones[n].parent and arm.pose.bones[n].parent.name not in poses) for n in snap['names']):
+                return False
+        action=snap['action']
+        if action is None:
+            continue
+        if not hasattr(action,'layers') and not hasattr(action,'slots'):
+            if not hasattr(action,'fcurves'):
+                return False
+            continue
+        layers=getattr(action, 'layers', ())
+        if len(getattr(action,'slots',()))!=1 or len(layers)!=1 or len(layers[0].strips)!=1 or layers[0].strips[0].type!='KEYFRAME':
+            return False
+    return True
+
+
+def finish_steps(entry):
+    fast=_can_bulk_finish(entry)
+    try:
+        yield from _finish_steps(entry, fast=fast)
+    except _FastPoseMismatch as first:
+        if not entry.get('_finish_rollback_complete'):
+            raise
+        for snap in entry['snapshots']:
+            snap.pop('static_scale_names',None)
+        yield iface_("Preparing bone Actions")
+        try:
+            yield from _finish_steps(entry, fast=False)
+        except BoneBakeError as retry:
+            raise BoneBakeError(str(first) + '; frame-evaluated retry: ' + str(retry)) from retry
+
+
+def finish(entry):
+    """Synchronously finish for callers that do not run a modal job."""
+    for _status in finish_steps(entry):
+        pass
+
 
 def single(scene):
     entry=make_entry(scene,single=scene.frame_current)

@@ -3,7 +3,7 @@ import json
 import bpy
 
 
-def _snapshot(owner, action_signature):
+def _snapshot(owner, action_signature, expected_refs=()):
     refs = []
 
     def properties(item, skip=()):
@@ -21,7 +21,8 @@ def _snapshot(owner, action_signature):
                 if value is None:
                     out[name] = None
                 elif isinstance(value, bpy.types.ID):
-                    signature, action_refs = action_signature(value) if isinstance(value, bpy.types.Action) else ('', [])
+                    expected = expected_refs[len(refs)].get('action_signature') if len(refs) < len(expected_refs) else None
+                    signature, action_refs = action_signature(value, expected=expected) if isinstance(value, bpy.types.Action) else ('', [])
                     out[name] = len(refs)
                     refs.append({'id': value, 'action_signature': signature, 'action_refs': action_refs})
                 elif name == 'action_slot' and hasattr(value, 'handle') and hasattr(value, 'identifier'):
@@ -82,7 +83,18 @@ def _snapshot(owner, action_signature):
     return json.dumps(state, sort_keys=True, ensure_ascii=False), refs
 
 
+def _memoized_action_signature(action_signature):
+    cache = {}
+    def snapshot(action, *, expected=None):
+        key=(action.as_pointer(), bool(expected and not expected.startswith('action-v3:')))
+        if key not in cache:
+            cache[key]=action_signature(action, expected=expected)
+        return cache[key]
+    return snapshot
+
+
 def capture(owners, action_signature):
+    action_signature = _memoized_action_signature(action_signature)
     rows = []
     for owner in owners:
         if owner is None or any(row['owner'] == owner for row in rows):
@@ -98,14 +110,15 @@ def _same_ref_rows(actual, expected):
 
 
 def validate(proof, action_signature):
+    action_signature = _memoized_action_signature(action_signature)
     if proof.get('schema') != 2:
         raise ValueError('恢复记录缺少动画依赖证明；请保留原动画。')
     for row in proof.get('owners', []):
         owner = row.get('owner')
         if owner is None:
             raise ValueError('恢复动画依赖对象已删除。')
-        state, refs = _snapshot(owner, action_signature)
         old_refs = row.get('refs', [])
+        state, refs = _snapshot(owner, action_signature, old_refs)
         if state != row.get('state') or len(refs) != len(old_refs):
             raise ValueError('恢复动画驱动或NLA已改变；未恢复。')
         from .single_bake_restore import _source_refs_equal

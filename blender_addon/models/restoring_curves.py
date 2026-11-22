@@ -19,6 +19,7 @@ MAX_BINDINGS = 65536
 MAX_NODES = 262144
 ID_PATTERN = re.compile(r'[A-Za-z0-9_-]{1,64}\Z')
 COMMON_ANGULAR_FREQUENCY_HZ = 1.0
+MMD_DEFAULT_ANGULAR_FREQUENCY_HZ = 10.0
 COMMON_DAMPING_RATIO = .7
 
 
@@ -35,7 +36,11 @@ def mmd_automatic_angular_channels(settings):
     return ('twist_x', 'swing_y', 'swing_z')
 
 
-def mmd_automatic_angular_curve(joint_uuid, channel):
+def mmd_automatic_frequency(settings):
+    return MMD_DEFAULT_ANGULAR_FREQUENCY_HZ if getattr(settings, 'mmd_auto_epoch', '') == 'MMD_AUTO_V2' else COMMON_ANGULAR_FREQUENCY_HZ
+
+
+def mmd_automatic_angular_curve(joint_uuid, channel, *, frequency_hz=COMMON_ANGULAR_FREQUENCY_HZ):
     """Use the standard linear angular frequency on native rest inertia."""
     return {
         'table': {'table_id': 'mmd_default_angular', 'domain': 'ODD',
@@ -43,7 +48,7 @@ def mmd_automatic_angular_curve(joint_uuid, channel):
         'binding': {
             'target': {'kind': 'JOINT', 'joint_uuid': joint_uuid, 'channel': channel},
             'enabled': True, 'table_id': 'mmd_default_angular', 'mode': 'AUTO_FREQUENCY',
-            'frequency_hz': COMMON_ANGULAR_FREQUENCY_HZ, 'damping_ratio': COMMON_DAMPING_RATIO,
+            'frequency_hz': frequency_hz, 'damping_ratio': COMMON_DAMPING_RATIO,
             'coordinate_scale': 1, 'mass_policy': 'LOCAL_REST_V1',
         },
     }
@@ -311,7 +316,7 @@ def state_from_scene(scene):
 
 
 def export_scene(scene, ordered_pair_ids=None, active_joint_ids=None, *,
-                 cone_restoring_joint_ids=(), mmd_automatic_channels=(),
+                 cone_restoring_joint_ids=(), mmd_automatic_channels=(), mmd_v2_joints=(),
                  pre_mmd_default=None):
     """Export the author library entries consumed by this payload only.
 
@@ -355,7 +360,8 @@ def export_scene(scene, ordered_pair_ids=None, active_joint_ids=None, *,
         return export_author({'mode': state['mode'], 'document': projected})
     # A disabled author record is still an explicit choice and takes precedence.
     occupied={target_key(binding['target']) for binding in document['bindings']}
-    generated=[mmd_automatic_angular_curve(joint_uuid, channel)
+    v2_joints=set(mmd_v2_joints)
+    generated=[mmd_automatic_angular_curve(joint_uuid, channel, frequency_hz=(MMD_DEFAULT_ANGULAR_FREQUENCY_HZ if joint_uuid in v2_joints else COMMON_ANGULAR_FREQUENCY_HZ))
                for joint_uuid, channel in mmd_automatic_channels
                if joint_uuid in joint_ids and ('JOINT', joint_uuid, channel) not in occupied]
     if not generated:

@@ -2,7 +2,7 @@
 import copy,json,uuid,math
 import bpy
 from ..core.bone_physical_units import CHANNELS,to_display,to_si,linear_constants,resolved_channels,trusted_build
-from ..core.bone_restoring_preview import angular_constants, angular_metrics
+from ..core.bone_restoring_preview import angular_constants, angular_metrics, angular_input_signature, angular_mass_pending
 from ..models import restoring_curves as curves
 from .restoring_curve_operators import read_state,write_state
 
@@ -18,7 +18,7 @@ def _author_key(context,bone):
     s=bone.ppf_bone_physics;author=context.scene.ppf_restoring_curves
     return (context.scene.as_pointer(),bone.as_pointer(),s.bone_uuid,s.joint_uuid,
             author.mode,author.document_json,tuple(s.angular_stiffness),tuple(s.angular_damping),
-            s.anchor_stiffness,s.angular_restoring_mode,curves.mmd_automatic_angular_channels(s))
+            s.anchor_stiffness,s.angular_restoring_mode,s.mmd_auto_epoch,curves.mmd_automatic_angular_channels(s))
 
 
 def _mmd_auto_channels(context, bone, state):
@@ -52,7 +52,7 @@ def _refresh(context,bone,metrics):
             saved=_channel_state(state,s.joint_uuid,channel);value=None
             implicit=saved is None and channel in auto_channels
             if implicit:
-                saved=curves.mmd_automatic_angular_curve(s.joint_uuid, channel)
+                saved=curves.mmd_automatic_angular_curve(s.joint_uuid, channel, frequency_hz=curves.mmd_automatic_frequency(s))
             if not implicit and (state['mode']=='LEGACY' or saved is None or not saved['binding']['enabled']):
                 value=(s.anchor_stiffness,0.) if channel=='anchor' else (s.angular_stiffness[index],s.angular_damping[index])
                 label='固定 SI（旧线性）'
@@ -98,8 +98,12 @@ def refresh_active():
             _refresh_key=None;return .3
         from ..core.bone_physical_units import display_build_key
         from ..models.bone_bindings import has_physical_joint_parent
-        metrics=angular_metrics(context,arm,bone)
-        key=(_author_key(context,bone),display_build_key(context),has_physical_joint_parent(bone, arm=arm),metrics)
+        author_key=_author_key(context,bone)
+        if (_refresh_key is not None and _refresh_key[0] == author_key
+                and bone.ppf_bone_restoring_controls.physical_live
+                and angular_mass_pending(context,arm,bone)):
+            return .3
+        key=(author_key,display_build_key(context),has_physical_joint_parent(bone, arm=arm),angular_input_signature(context,arm,bone))
         if key!=_refresh_key:
             owner=bone.ppf_bone_restoring_controls
             if (not owner.physical_live and owner.physical_draft_loaded
@@ -108,7 +112,7 @@ def refresh_active():
                          or (owner.physical_loaded_values
                              and _values(owner)!=json.loads(owner.physical_loaded_values)))):
                 return .3
-            _refresh(context,bone,metrics);_refresh_key=key
+            _refresh(context,bone,angular_metrics(context,arm,bone));_refresh_key=key
     except (ValueError,RuntimeError,ReferenceError,AttributeError,KeyError,TypeError):
         _refresh_key=None
     return .3
@@ -305,7 +309,7 @@ def _load(context,bone):
         value=None
         implicit=saved is None and channel in auto_channels
         if implicit:
-            saved=curves.mmd_automatic_angular_curve(s.joint_uuid, channel)
+            saved=curves.mmd_automatic_angular_curve(s.joint_uuid, channel, frequency_hz=curves.mmd_automatic_frequency(s))
         if not implicit and (state['mode']=='LEGACY' or saved is None or not saved['binding']['enabled']):
             value=(s.anchor_stiffness,0.) if channel=='anchor' else (s.angular_stiffness[index],s.angular_damping[index])
         elif saved['binding']['mode']=='ABSOLUTE_SI':

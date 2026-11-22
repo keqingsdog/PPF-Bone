@@ -150,8 +150,17 @@ def rollback_working_mesh(row):
 
 
 def begin(scene, queue):
+    steps = begin_steps(scene, queue)
+    try:
+        while True:
+            next(steps)
+    except StopIteration as completed:
+        return completed.value
+
+
+def begin_steps(scene, queue):
     rows=[]
-    try:return _begin(scene,queue,rows)
+    try:return (yield from _begin(scene,queue,rows))
     except BaseException:
         discard_pending({'items':rows})
         raise
@@ -365,13 +374,14 @@ def _begin(scene, queue, rows):
     from .uuid_registry import get_object_by_uuid
     if available(scene):raise ValueError('请先恢复或保留上一次完整烘焙。')
     bone_arms=single._validate_bone_source_snapshots([e for e in queue if e['obj_type']=='BONE'])
+    yield
     owners,proofs,graph=single._preflight_source_owners([get_object_by_uuid(e['obj_uuid']) for e in queue if e['obj_type'] in {'MESH','CURVE'}]+bone_arms)
+    yield
     actions=single.source_action_flags(get_object_by_uuid(e['obj_uuid']) for e in queue if e['obj_type'] in {'MESH','CURVE'})
     for entry in queue:
         if entry['obj_type'] not in {'MESH','CURVE'}:continue
         obj=get_object_by_uuid(entry['obj_uuid'])
         if obj is None:raise ValueError('烘焙对象已删除。')
-        single._recheck_source_owners(owners,proofs,graph)
         retain_original = bool(entry.get('use_working_mesh'))
         backup = obj.data if retain_original else obj.data.copy()
         original_fake_user = backup.use_fake_user
@@ -402,6 +412,7 @@ def _begin(scene, queue, rows):
         slot=single._slot(obj)
         if slot:row['slot_handle']=slot[0];row['slot_identifier']=slot[1]
         row['source_signature']=_source_mesh_signature(row)
+        yield
     from .facade import runner
     from . import recovery_anim_graph
     graphs=[graph]
@@ -410,6 +421,8 @@ def _begin(scene, queue, rows):
         for snap in entry.get('snapshots',[]):
             if 'source_graph_proof' not in snap:raise ValueError('骨骼动画依赖证明缺失；未提交烘焙。')
             graphs.append(snap['source_graph_proof'])
+    # The backup loop runs synchronously and only creates recovery copies.
+    # Check the full source set once before handing it to the bake writer.
     single._recheck_source_owners(owners,proofs,graph)
     return dict(working_action_signature_schema=2, source_action_proof_schema=2, source_action_proofs=proofs, source_graph_proof_schema=2, source_graph_proofs=graphs, items=rows, groups=single._group_bindings(scene),
                 fetched=get_addon_data(scene).state.convert_fetched_frames_to_list(),
@@ -643,6 +656,11 @@ def _validated_commit_bindings(queue):
 
 
 def preflight_sources(tx, queue):
+    for _ in preflight_source_steps(tx, queue):
+        pass
+
+
+def preflight_source_steps(tx, queue):
     """Read-only source admission before any target is finalized.
 
     Plan permitted writer bindings on independent row dictionaries only. Keep
@@ -651,6 +669,7 @@ def preflight_sources(tx, queue):
     bones=[entry for entry in queue if entry['obj_type']=='BONE']
     for entry in bones:single._validate_bone_commit_snapshot(tx,entry)
     single._validate_bone_source_snapshots(bones)
+    yield
     bindings=_validated_commit_bindings(queue)
     view=dict(tx.items());rows=[]
     for original in tx.get('items',[]):
@@ -694,7 +713,7 @@ def commit(scene, tx, queue):
     scene.frame_set(scene.frame_current,subframe=scene.frame_subframe)
     bpy.context.view_layer.update()
     bone=next((e for e in queue if e['obj_type']=='BONE'),None)
-    tx['bone']=single._bone_row(bone) if bone else {}
+    tx['bone']=single._bone_row(bone, compact=True) if bone else {}
     relevant=single._recovery_owners([r['obj'] for r in tx['items']]+[r['arm'] for r in tx['bone'].get('arms',[])])
     for backup in _original_meshes(tx).values():
         relevant.extend((backup, backup.shape_keys))
@@ -717,7 +736,22 @@ def commit(scene, tx, queue):
         row['mod_signatures']=[single._modifier_signature(m) for m in obj.modifiers]
     tx['validation_frame']=scene.frame_current
     tx['validation_subframe']=scene.frame_subframe
-    scene[KEY]=tx
+    # Bones now follow the baked Action. Owned rigid proxy display must leave
+    # the old simulation cache at the same transaction boundary.
+    from . import bake_proxy_display
+    proxy_rows = bake_proxy_display.suspend(scene, bone) if bone and bone.get('committed') else []
+    if proxy_rows:
+        tx['proxy_display'] = proxy_rows
+    try:
+        scene[KEY]=tx
+    except BaseException:
+        if proxy_rows:
+            bake_proxy_display.restore(scene, proxy_rows)
+            tx.pop('proxy_display', None)
+        raise
+    if proxy_rows:
+        from ..ui import bone_overlay
+        bone_overlay._invalidate_snapshots()
     get_addon_data(scene).state.clear_fetched_frames()
     from .facade import runner
     from .effects import DoClearAnimation
@@ -815,7 +849,7 @@ def _validation_backup_signatures(tx):
 
 
 def restore(scene):
-    from . import bone_bake
+    from . import bake_proxy_display, bone_bake
     frame,sub=scene.frame_current,scene.frame_subframe
     tx=scene.get(KEY)
     if not tx:raise ValueError('没有可恢复的完整烘焙。')
@@ -832,6 +866,7 @@ def restore(scene):
         if row.get('arm') is not None:single._validate_static_scales(row)
     _validate_backup_source_signatures(tx)
     validation_signatures = _validation_backup_signatures(tx)
+    proxy_flags = bake_proxy_display.snapshot(scene, tx.get('proxy_display', []))
     saved_tx=tx.to_dict()
     objects=[]
     arms=[]
@@ -867,6 +902,14 @@ def restore(scene):
                 for name,basis in bases.items():
                     if name in arm.pose.bones:arm.pose.bones[name].matrix_basis=basis
             except Exception as rollback_error:errors.append(str(rollback_error))
+        for proxy, filepath, view, render in proxy_flags:
+            try:
+                mod = proxy.modifiers.get(pc2.MODIFIER_NAME)
+                if mod is None or mod.filepath != filepath:
+                    raise ValueError('Baked rigid proxy cache changed during Restore')
+                mod.show_viewport, mod.show_render = view, render
+            except Exception as rollback_error:
+                errors.append(str(rollback_error))
         if bone_key:scene[rigid_pose.CACHE_KEY]=bone_key
         elif rigid_pose.CACHE_KEY in scene:del scene[rigid_pose.CACHE_KEY]
         state.clear_fetched_frames();state.fetch_frames_from_list(fetched)
@@ -884,10 +927,14 @@ def _restore(scene, validation_signatures):
     tx=scene.get(KEY)
     if not tx:raise ValueError('没有可恢复的完整烘焙。')
     if tx.get('invalidated'):raise ValueError('代理几何已改变，不能恢复旧缓存。')
-    scene.frame_set(tx['validation_frame'],subframe=tx['validation_subframe'])
-    bpy.context.view_layer.update()
-    single._validate_source_action_proofs(tx,permitted_bindings=_validated_restore_key_bindings(tx)+_validated_restore_curve_bindings(tx))
-    _validate_full_source_graph_proofs(tx)
+    if (scene.frame_current, scene.frame_subframe) != (tx['validation_frame'], tx['validation_subframe']):
+        # Frame evaluation may run author handlers: recheck source proofs after it.
+        # At the receipt frame no evaluation is needed, so restore's immediately
+        # preceding full source checks remain valid in this synchronous call.
+        scene.frame_set(tx['validation_frame'],subframe=tx['validation_subframe'])
+        bpy.context.view_layer.update()
+        single._validate_source_action_proofs(tx,permitted_bindings=_validated_restore_key_bindings(tx)+_validated_restore_curve_bindings(tx))
+        _validate_full_source_graph_proofs(tx)
     if single._group_bindings(scene)!=tx['groups']:raise ValueError('物理组已改绑，未覆盖当前工程。')
     single._validate_proxy_snapshot(tx.get('proxies',[]))
     for index,row in enumerate(tx['items']):
@@ -919,9 +966,12 @@ def _restore(scene, validation_signatures):
         if arm is None or any(name not in arm.pose.bones or arm.data.bones[name].ppf_bone_physics.bone_uuid!=uid for name,uid in row['bone_ids'].items()):raise ValueError('目标骨骼已删除或改绑，未修改场景。')
         if 'action' in row and row.get('action') is None:raise ValueError('原骨骼动画已删除，未修改场景。')
         if not single._valid_action_slot(row.get('action'),row):raise ValueError('原骨骼动画槽不可用，未修改场景。')
-        if arm is None or not arm.animation_data or arm.animation_data.action!=row.get('baked_action') or single._action_signature(arm)!=row['baked_signature']:
+        if arm is None or not arm.animation_data or arm.animation_data.action!=row.get('baked_action') or single._action_signature(arm, compact=row['baked_signature'].startswith('curves-v3:'))!=row['baked_signature']:
             raise ValueError('烘焙后骨骼动画已修改，未覆盖作者修改。')
         single._validate_static_scales(row)
+    from . import bake_proxy_display
+    proxy_rows = tx.get('proxy_display', [])
+    bake_proxy_display.validate(scene, proxy_rows)
     # Everything is admitted before any source data is reassigned.
     for row in tx['items']:
         obj=row['obj'];obj.data=row['backup']
@@ -937,6 +987,10 @@ def _restore(scene, validation_signatures):
         for name,values in row['basis'].items():
             if name not in arm.pose.bones:raise ValueError('目标骨骼已删除。')
             arm.pose.bones[name].matrix_basis=Matrix([values[i:i+4] for i in range(0,16,4)])
+    if proxy_rows:
+        bake_proxy_display.restore(scene, proxy_rows)
+        from ..ui import bone_overlay
+        bone_overlay._invalidate_snapshots()
     if tx['bone_key']:scene[rigid_pose.CACHE_KEY]=tx['bone_key']
     state=get_addon_data(scene).state;state.clear_fetched_frames();state.fetch_frames_from_list(list(tx['fetched']))
     from .facade import runner
@@ -1058,8 +1112,8 @@ def _keep_curve_outputs(scene, tx):
 def discard(scene):
     tx=scene.get(KEY)
     if tx:single._validate_restore_ownership(scene, tx)
-    if tx:_validate_backup_key_graph(tx)
     if tx and any(row.get('obj') is not None and row['obj'].type == 'CURVE' for row in tx.get('items', [])):
+        _validate_backup_key_graph(tx)
         return _keep_curve_outputs(scene, tx)
     frame,sub=scene.frame_current,scene.frame_subframe
     try:return _discard(scene)
@@ -1080,23 +1134,24 @@ def _discard(scene):
             from .uuid_registry import resolve_assigned
             obj=resolve_assigned(group.assigned_objects[i])
             if obj is not None and obj.as_pointer() in targets:group.assigned_objects.remove(i)
+    # The recovery record may be the last user of an original Action. Keep its
+    # datablock alive after consuming the record, including old proof schemas.
+    source_actions=[row.get('action') for row in tx.get('items', [])]
+    source_actions.extend(row.get('action') for row in tx.get('bone', {}).get('arms', []))
+    source_actions.extend(row.get('action') for row in tx.get('source_action_proofs', []))
+    for action in source_actions:
+        if isinstance(action, bpy.types.Action):action.use_fake_user=True
     for row in tx['items']:
+        # Keep must not consume the retained author graph merely to release a
+        # disposable snapshot. Preserve every backup, including legacy rows
+        # whose Action proofs would require rebuilding very large JSON.
         if row.get('backup'):
-            if row.get('retains_original_mesh'):
-                row['backup'].use_fake_user = True
-            else:
-                row['backup'].use_fake_user=not single._release_backup_safe(scene,tx,row['backup'],own_key=KEY)
+            row['backup'].use_fake_user=True
         obj=row.get('obj')
         if obj is None:continue
-        unchanged=(obj.data==row['data'] and data_signature(obj.data, legacy=not row['signature'].startswith(('mesh-v2:', 'mesh-v3:')), compact_version=2 if row['signature'].startswith('mesh-v2:') else 3)==row['signature'] and single._action_signature(obj)==row['object_action'])
-        if obj.type=='CURVE':
-            if unchanged:
-                from .curve_output import mark_detached
-                mark_detached(obj)
-        else:
-            mod=obj.modifiers.get(pc2.MODIFIER_NAME)
-            expected=next((signature for signature in row['mod_signatures'] if json.loads(signature).get('name')==pc2.MODIFIER_NAME),None)
-            if mod is not None and not mod.show_viewport and expected is not None and single._modifier_matches(mod,expected,row.get('cache_path')):obj.modifiers.remove(mod)
+        mod=obj.modifiers.get(pc2.MODIFIER_NAME)
+        expected=next((signature for signature in row['mod_signatures'] if json.loads(signature).get('name')==pc2.MODIFIER_NAME),None)
+        if mod is not None and not mod.show_viewport and expected is not None and single._modifier_matches(mod,expected,row.get('cache_path')):obj.modifiers.remove(mod)
     scene['ppf_single_bake_session_stale']=True
     del scene[KEY]
 

@@ -552,6 +552,7 @@ class PPF_BonePhysics(PropertyGroup):
     anchor_stiffness: FloatProperty(name="Anchor Stiffness (N/m)", default=200000., min=0., options=NOT_ANIMATED)
     angular_stiffness: FloatVectorProperty(name="Angular Stiffness (Nm/rad)", size=3, default=(.02, .04, .04), min=0., precision=5, options=NOT_ANIMATED)
     angular_damping: FloatVectorProperty(name="Angular Damping (Nms/rad)", size=3, default=(.001, .001, .001), min=0., precision=5, options=NOT_ANIMATED)
+    mmd_auto_epoch: StringProperty(default='', options={'HIDDEN'})
     angular_restoring_multiplier: FloatProperty(name='恢复刚度倍率', description='缩放原生关节旋转恢复力，保持阻尼不变', default=1.0, min=0.0, options=NOT_ANIMATED)
     angular_restoring_mode: EnumProperty(name='摆动回正', items=[('AXES','分轴','分别设置 Y/Z 摆动回正'),('CONE','圆锥','各个摆动方向共用回正刚度和阻尼，从中立姿态起生效，X 扭转独立')], default='AXES', options=NOT_ANIMATED)
     swing_restoring_stiffness: FloatProperty(name='圆锥回正刚度（N·m/rad）', default=.04, min=0., precision=5, options=NOT_ANIMATED)

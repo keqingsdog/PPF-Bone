@@ -99,7 +99,11 @@ def cancel_bake_before_file_change(*_args):
         return
     owner = _bake_modal_owner
     try:
-        _abort_job()
+        try:
+            if owner is not None:
+                owner._close_steps()
+        finally:
+            _abort_job()
     finally:
         try:
             if owner is not None:
@@ -113,6 +117,10 @@ def cancel_bake_before_file_change(*_args):
 def is_bake_running() -> bool:
     """True while a modal Bake Animation job is still processing frames."""
     return bool(_bake_job.get("active"))
+
+
+def bake_scene_locked() -> bool:
+    return _bake_job.get("phase") in {"preparing", "finalizing"}
 
 
 def bake_progress_snapshot() -> tuple[int, int, str, int]:
@@ -830,7 +838,16 @@ def _validate_live_bake_ownership(entry, obj):
 
 
 def _start_job(queue: list, kind: str) -> tuple[bool, str]:
-    if _bake_job["active"]:
+    steps = _start_job_steps(queue, kind)
+    try:
+        while True:
+            next(steps)
+    except StopIteration as completed:
+        return completed.value
+
+
+def _start_job_steps(queue, kind, *, reserved=False):
+    if _bake_job["active"] and not reserved:
         return False, iface_("Another bake job is in progress")
     if not queue:
         return False, iface_("No bakeable objects")
@@ -861,7 +878,7 @@ def _start_job(queue: list, kind: str) -> tuple[bool, str]:
         entry['_owner_scene'] = origin_scene
     from ...core import full_bake_restore
     try:
-        recovery = full_bake_restore.begin(origin_scene, queue)
+        recovery = yield from full_bake_restore.begin_steps(origin_scene, queue)
     except (ValueError, RuntimeError, OSError) as exc:
         return False, str(exc)
     from ...core import source_materials
@@ -1179,6 +1196,15 @@ def _remove_finalized_members(context, uuids_per_group):
 
 
 def _finalize_job(context) -> tuple[int, int]:
+    steps = _finalize_job_steps(context)
+    try:
+        while True:
+            next(steps)
+    except StopIteration as completed:
+        return completed.value
+
+
+def _finalize_job_steps(context):
     """Finalize with truthful partial-commit boundaries, never blind rollback.
 
     All known cleanup refusals are checked before any finalizer writes. A later
@@ -1230,13 +1256,14 @@ def _finalize_job(context) -> tuple[int, int]:
         from ...core import full_bake_restore
         from ...core import source_materials
         source_materials.verify(_bake_job)
-        full_bake_restore.preflight_sources(_bake_job['recovery'], _bake_job['objects'])
+        for _ in full_bake_restore.preflight_source_steps(_bake_job['recovery'], _bake_job['objects']):
+            yield iface_("Finalizing baked animation...")
         from ...core import bone_bake
         for entry in _bake_job["objects"]:
             if entry["obj_type"] == "BONE":
                 current = entry
                 entry['_finalize_state'] = 'attempted'
-                bone_bake.finish(entry)
+                yield from bone_bake.finish_steps(entry)
                 entry['_finalize_state'] = 'committed'
         for entry in _bake_job["objects"]:
             if entry["obj_type"] == "BONE":
@@ -1291,6 +1318,11 @@ def _finalize_job(context) -> tuple[int, int]:
         result = (objects_baked, _bake_job['total_frames_processed'])
         _bake_job['finalize_result'] = result
         return result
+    except GeneratorExit:
+        if current is not None and current.get('_finalize_state') == 'attempted':
+            current['_finalize_state'] = ('rolled_back' if current.get('_finish_rollback_complete')
+                                          else 'output_preserved')
+        raise
     except Exception as exc:
         if current is not None and current.get('_finalize_state') == 'attempted':
             receipt = current.get('_finalize_receipt', {})
@@ -1370,6 +1402,8 @@ def _abort_job() -> None:
     abort_materials.retain(_bake_job)
     from ...core.uuid_registry import get_object_by_uuid
     for entry in _bake_job["objects"]:
+        if entry.get('_finalize_state') == 'rolled_back':
+            continue
         if entry.get('_finalize_state') in {'committed', 'output_preserved'}:
             # Its cache may be gone: abort must not delete the only baked output.
             _retain_bake_source_action(entry)
@@ -2058,6 +2092,7 @@ class _ModalBakeBase:
         self._wm = wm
         self._start_scene = context.scene
         self._externally_cancelled = False
+        self._bake_steps = None
         self._timer = wm.event_timer_add(0.02, window=context.window)
         wm.modal_handler_add(self)
         _bake_modal_owner = self
@@ -2109,8 +2144,8 @@ class _ModalBakeBase:
                 ).format(conflicts=joined),
             )
             return {"CANCELLED"}
-        _bake_job["active"] = False  # Hand the modal reservation to the job.
-        ok, err = _start_job(queue, kind=self._kind)
+        yield
+        ok, err = yield from _start_job_steps(queue, self._kind, reserved=True)
         if not ok:
             self.report({"WARNING"}, err)
             return {"CANCELLED"}
@@ -2130,16 +2165,35 @@ class _ModalBakeBase:
             _bake_job["aborted"] = True
             return {"RUNNING_MODAL"}
         if event.type != "TIMER" or getattr(event, "timer", self._timer) != self._timer:
+            if bake_scene_locked():
+                return {"RUNNING_MODAL"}
             return {"PASS_THROUGH"}
+        if context.scene != self._start_scene:
+            _bake_job["aborted"] = True
         if _bake_job["aborted"]:
-            _abort_job()
-            self._teardown(context)
-            redraw_all_areas(context)
+            try:
+                try:
+                    self._close_steps()
+                finally:
+                    _abort_job()
+            except Exception as exc:
+                self.report({"ERROR"}, str(exc))
+                return {"CANCELLED"}
+            finally:
+                self._teardown(context)
+                redraw_all_areas(context)
             self.report({"INFO"}, iface_("Bake aborted"))
             return {"CANCELLED"}
         if _bake_job["phase"] == "preparing":
+            if self._bake_steps is None:
+                self._bake_steps = self._prepare_job(context)
             try:
-                result = self._prepare_job(context)
+                next(self._bake_steps)
+                redraw_all_areas(context)
+                return {"RUNNING_MODAL"}
+            except StopIteration as completed:
+                result = completed.value
+                self._bake_steps = None
             except Exception as exc:
                 self.report({"ERROR"}, str(exc))
                 result = {"CANCELLED"}
@@ -2148,8 +2202,19 @@ class _ModalBakeBase:
             redraw_all_areas(context)
             return result
         if _bake_job["phase"] == "finalizing":
+            if self._bake_steps is None:
+                self._bake_steps = _finalize_job_steps(context)
             try:
-                n_objs, n_frames = _finalize_job(context)
+                deadline = time.perf_counter() + 0.020
+                while True:
+                    _bake_job["status"] = next(self._bake_steps)
+                    if time.perf_counter() >= deadline:
+                        break
+                redraw_all_areas(context)
+                return {"RUNNING_MODAL"}
+            except StopIteration as completed:
+                n_objs, n_frames = completed.value
+                self._bake_steps = None
             except Exception as exc:
                 _abort_job();self._teardown(context);self.report({"ERROR"}, str(exc));return {"CANCELLED"}
             self._teardown(context)
@@ -2173,10 +2238,15 @@ class _ModalBakeBase:
         return {"RUNNING_MODAL"}
 
     def cancel(self, context):
-        if _bake_modal_owner is self and _bake_job["active"]:
-            _abort_job()
-        self._teardown(context)
-        redraw_all_areas(context)
+        try:
+            if _bake_modal_owner is self and _bake_job["active"]:
+                try:
+                    self._close_steps()
+                finally:
+                    _abort_job()
+        finally:
+            self._teardown(context)
+            redraw_all_areas(context)
 
     def _detach_timer(self):
         timer = getattr(self, "_timer", None)
@@ -2192,8 +2262,15 @@ class _ModalBakeBase:
         global _bake_modal_owner
         self._detach_timer()
         if _bake_modal_owner is self:
+            self._close_steps()
             _bake_modal_owner = None
             _reset_job()
+
+    def _close_steps(self):
+        steps = self._bake_steps
+        self._bake_steps = None
+        if steps is not None:
+            steps.close()
 
 
 # ---------------------------------------------------------------------------
