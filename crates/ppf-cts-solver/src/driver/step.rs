@@ -3790,6 +3790,7 @@ unsafe fn advance_trial<D: Device>(
     let _=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||analytic_assembly_ledger.cleanup(device)));
     let _=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||frozen_newton_witness.cleanup(device)));
     if result.success() {
+        let mut reverse_pin_face_edges = Vec::new();
         // STEP C1 and C2. The final AABB refresh and `check_intersection`: the
         // SECOND of the two things that make this solver penetration-free. The
         // ACCD filter refuses a step that would cross; this reports a crossing
@@ -3805,7 +3806,10 @@ unsafe fn advance_trial<D: Device>(
             let SolverState {
                 contact: contact_state,
                 eval_x,
+                positions: last_accepted,
                 prop_vertex,
+                fix,
+                pull,
                 ..
             } = &mut *state;
             let pose = eval_x.handle();
@@ -3843,8 +3847,26 @@ unsafe fn advance_trial<D: Device>(
             // gate costs today.
             let _gate = std::time::Instant::now();
             eval_x.download(device)?;
-            let report =
-                contact.check_intersection(device, data, mesh_refs, pose, eval_x.host(), prop_vertex.host(), windows)?;
+            let mut report =
+                contact.check_intersection(device, data, mesh_refs, pose, last_accepted.handle(), eval_x.host(), prop_vertex.host(), windows, !prm.disable_pin_dof_removal)?;
+            if !prm.disable_pin_dof_removal {
+                reverse_pin_face_edges = super::reverse_pin_contacts::filter_trial(
+                    device, data, last_accepted, eval_x.host(), prop_vertex.host(), fix,
+                    pull.host(), &contact.reverse_pin_face_edges, &mut report,
+                )?;
+                if !reverse_pin_face_edges.is_empty() {
+                    log::message!(
+                        "REVERSE_PIN_FE_SCOPED: start={:.17e} scoped_pairs={} rejected_pairs={}",
+                        prm.time, reverse_pin_face_edges.len(), report.found
+                    );
+                }
+            }
+            if report.scoped_soft_static_fe > 0 {
+                log::message!(
+                    "NARROW_FE_SCOPED: start={:.17e} scoped_pairs={} rejected_pairs={}",
+                    prm.time, report.scoped_soft_static_fe, report.found
+                );
+            }
             if report.is_clean() {
                 // THE CLEAN PATH IS `debug!`, SO THE TRANSCRIPT ONLY SPEAKS
                 // WHEN THE GATE FINDS SOMETHING. A line per committed pose puts
@@ -4068,6 +4090,9 @@ unsafe fn advance_trial<D: Device>(
         let fem_material_commit=if state.joints.soft.material_spin_active(){Some(state.joints.soft.prepare_material_spin_commit((*param).time)?)}else{None};
         state.positions_prev.copy_from(device, &state.positions)?;
         state.positions.copy_from(device, &state.eval_x)?;
+        if let Some(contact) = &mut state.contact {
+            contact.reverse_pin_face_edges = reverse_pin_face_edges;
+        }
         if let Some(accepted)=twist_commit {state.joints.finish_twist_commit(accepted);}
         if let Some(accepted)=material_commit {state.joints.finish_material_spin_commit(accepted);}
         if let Some(accepted)=fem_material_commit {state.joints.soft.finish_material_spin_commit(accepted);}

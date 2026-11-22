@@ -224,6 +224,7 @@ pub struct Contact {
     /// across steps for the reason every other buffer here is, and the only
     /// state the scan carries now that its four walks run on the device.
     scan: intersection::ScanState,
+    pub(super) reverse_pin_face_edges: Vec<super::reverse_pin_contacts::Pair>,
     /// Per-primitive time of impact, one slot per query, min-folded by the six
     /// CCD sweeps and reduced once by `reduce::min`.
     ///
@@ -369,6 +370,7 @@ impl Contact {
             flat: super::dyncsr::Flat::default(),
             transpose: super::dyncsr::Transpose::default(),
             scan: intersection::ScanState::default(),
+            reverse_pin_face_edges: Vec::new(),
             toi_vertex: ReadbackBuffer::default(),
             toi_edge: ReadbackBuffer::default(),
             overlap_vertex: ReadbackBuffer::default(),
@@ -1876,13 +1878,11 @@ impl Contact {
     pub unsafe fn check_intersection<D: Device>(
         &mut self,
         device: &mut D,
-        // NAMED AND UNREAD, as `refresh_leaves` names it: every array the four
-        // walks touch reaches them through `mesh`, through `positions` or
-        // through a buffer this struct owns, and the `DataSet` stays in the
-        // signature because both call sites hand it to every phase.
-        _data: &DataSet,
+        // DataSet gives the explicit rods prefix in native edge indexing.
+        data: &DataSet,
         mesh: MeshRefs,
         positions: ppf_cts_compute::Handle,
+        accepted_positions: ppf_cts_compute::Handle,
         // NAMED AND UNREAD. The four walks run on the device and read the pose
         // and the per-vertex properties by handle; these two host mirrors are
         // what the host walk they replaced needed. They stay in the signature
@@ -1891,9 +1891,11 @@ impl Contact {
         _positions_host: &[f32],
         _vertex_prop_host: &[crate::data::VertexProp],
         windows: Windows,
+        allow_soft_static_fe: bool,
     ) -> FatalResult<Report> {
         let scene = intersection::Scene {
             vert: positions,
+            accepted_vert: accepted_positions,
             face: mesh.face,
             edge: mesh.edge,
             face_prop: mesh.face_prop,
@@ -1903,6 +1905,8 @@ impl Contact {
             vertex_param: mesh.vertex_param,
             start_link: mesh.start_link,
             faces: self.faces,
+            allow_soft_static_fe,
+            rod_count: data.rod_count,
             edges: self.edges,
             surface_vertices: self.surface_vertices,
         };

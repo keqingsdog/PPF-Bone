@@ -227,9 +227,27 @@ point_point_intersect_proximity(const Vec3f &p,
 // one.
 // ---------------------------------------------------------------------------
 
+// Transition-only reporting scope. All other contact primitives keep stock
+// admission. Pin and collider facts must be present on every participating node.
+[[seam::device_fn]] inline bool is_soft_follow_static_corner(const VertexProp &v,
+                                                             unsigned owner) {
+    return v.collider && !v.pin_allow_intersection && v.fix_index == 0u &&
+           v.pull_index != 0u && v.pdrd_body_index == 0u && v.object_index == owner;
+}
+[[seam::device_fn]] inline bool is_permitted_hard_endpoint(const VertexProp &v) {
+    return !v.collider && v.pin_allow_intersection && v.fix_index != 0u &&
+           v.pull_index == 0u && v.pdrd_body_index == 0u && v.volume == 0.0f;
+}
+[[seam::device_fn]] inline bool is_ordinary_free_cloth_endpoint(const VertexProp &v) {
+    return !v.collider && !v.pin_allow_intersection && v.fix_index == 0u &&
+           v.pull_index == 0u && v.pdrd_body_index == 0u && v.volume == 0.0f &&
+           v.mass > 0.0f;
+}
+
 // The edge-versus-face visitor: the query element is an edge, each leaf a face.
 struct IntersectFaceEdgeVisitor {
     const Vec3f *vert;
+    const Vec3f *accepted_vert;
     const Vec3u *face;
     const Vec2u *edge;
     const VertexProp *vertex_prop;
@@ -243,6 +261,8 @@ struct IntersectFaceEdgeVisitor {
     unsigned capacity;
     unsigned edge_index;
     unsigned face_count;
+    unsigned allow_soft_static_fe;
+    unsigned rod_count;
     DiagHandle diag;
 
     // BOTH METHODS CARRY THE EXECUTION SPACE, and neither may go without it:
@@ -286,6 +306,49 @@ struct IntersectFaceEdgeVisitor {
         float first = 0.0f;
         float second = 0.0f;
         if (edge_triangle_pierce(y0, y1, x0, x1, x2, first, second)) {
+            // Match only a surface cloth edge (rod prefix excluded), with
+            // real object ownership; competing FE, EE and VV records retain
+            // their normal counts regardless of this pair.
+            if (allow_soft_static_fe != 0u && edge_index >= rod_count &&
+                fprop.collider && fanchor.object_index != NO_OBJECT_INDEX &&
+                eanchor.object_index != NO_OBJECT_INDEX &&
+                fanchor.object_index != eanchor.object_index) {
+                const VertexProp ea1 = vertex_prop[e[1]];
+                const VertexProp fa1 = vertex_prop[f[1]];
+                const VertexProp fa2 = vertex_prop[f[2]];
+                const bool hard_first = is_permitted_hard_endpoint(eanchor) && is_ordinary_free_cloth_endpoint(ea1);
+                const bool hard_second = is_permitted_hard_endpoint(ea1) && is_ordinary_free_cloth_endpoint(eanchor);
+                if (ea1.object_index == eanchor.object_index && (hard_first || hard_second) &&
+                    is_soft_follow_static_corner(fanchor, fanchor.object_index) &&
+                    is_soft_follow_static_corner(fa1, fanchor.object_index) &&
+                    is_soft_follow_static_corner(fa2, fanchor.object_index)) {
+                    const Vec3f o0 = accepted_vert[f[0]];
+                    const Vec3f o1 = accepted_vert[f[1]];
+                    const Vec3f o2 = accepted_vert[f[2]];
+                    const Vec3f p_free = accepted_vert[hard_first ? e[1] : e[0]];
+                    const Vec3f old_normal = (o1-o0).cross(o2-o0);
+                    const Vec3f new_normal = (x1-x0).cross(x2-x0);
+                    const float old_side = (p_free-o0).dot(old_normal);
+                    const float new_side = hard_first ? second : first;
+                    const float tip_side = hard_first ? first : second;
+                    const float normal_agreement = old_normal.dot(new_normal);
+                    // Exact sign continuity relative to consistently oriented
+                    // faces. Zero and invalid/overflowed signs keep the
+                    // ordinary record. The float bound is representability,
+                    // not a penetration distance or angular tolerance.
+                    const float fmax = 3.402823466e38f;
+                    if (normal_agreement > 0.0f && normal_agreement <= fmax &&
+                        old_side >= -fmax && old_side <= fmax &&
+                        new_side >= -fmax && new_side <= fmax &&
+                        tip_side >= -fmax && tip_side <= fmax &&
+                        ((old_side > 0.0f && new_side > 0.0f && tip_side < 0.0f) ||
+                         (old_side < 0.0f && new_side < 0.0f && tip_side > 0.0f))) {
+                        // Counter slot zero is reserved for real failures.
+                        compute::atomic_add(counter + 1u, 1u);
+                        return false;
+                    }
+                }
+            }
             Vec3f fv[3] = {x0, x1, x2};
             Vec3f ev[2] = {y0, y1};
             intersection_record_claim(records, counter, capacity,
@@ -503,8 +566,9 @@ struct IntersectCollisionMeshVisitor {
 
 [[seam::entry(element)]]
 [[seam::device_fn]] inline void intersect_scan_face_edge(
-    const Vec3f *vert,
+    const Vec3f *vert, const Vec3f *accepted_vert,
     const Vec3u *face, unsigned face_count,
+    unsigned allow_soft_static_fe, unsigned rod_count,
     const Vec2u *edge,
     const VertexProp *vertex_prop,
     const unsigned *start_link_index,
@@ -524,6 +588,7 @@ struct IntersectCollisionMeshVisitor {
     }
     IntersectFaceEdgeVisitor op;
     op.vert = vert;
+    op.accepted_vert = accepted_vert;
     op.face = face;
     op.edge = edge;
     op.vertex_prop = vertex_prop;
@@ -537,6 +602,8 @@ struct IntersectCollisionMeshVisitor {
     op.capacity = capacity;
     op.edge_index = element;
     op.face_count = face_count;
+    op.allow_soft_static_fe = allow_soft_static_fe;
+    op.rod_count = rod_count;
     op.diag = diag;
     if (aabb_query(node, node_count, aabb, root, op, box, diag) > 0u) {
         flag[element] = 1u;

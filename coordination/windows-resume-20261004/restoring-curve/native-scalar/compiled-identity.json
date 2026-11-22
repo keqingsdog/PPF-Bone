@@ -4,7 +4,7 @@
   "channel_mask": 15,
   "ordered_entry_count": 397,
   "layout_sha256": "72ec8aaedb0e9107f94399d4b0f974dddd861c2211281e84d1377688877c874e",
-  "kernel_table_sha256": "730eae6cd6ee5df1469bdeb48e1e7b8583ee0c912507804c8fb19539ca8b5af4",
+  "kernel_table_sha256": "00af0a7398d436de6d33639f7363e08aace25364bfa3df76a072421ee7799fcb",
   "source_stamp": "591fe28860d09be2c7a7c81c495618a577ce624b7b149eca0455b5cc53a6fea7",
   "serialization": "UTF8 frozen LAYOUT_SPEC newline then whitespace-normalized actual kernelgen Rust arg struct/assert source; ordered table stem newline whitespace-normalized Rust table source, newline joined, includes all legacy entries; comments omitted"
 }

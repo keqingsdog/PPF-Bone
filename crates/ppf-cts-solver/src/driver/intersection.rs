@@ -240,6 +240,8 @@ pub struct Report {
     /// aborted on intersections wants the true count, and a report that stops
     /// counting where it stops storing understates the problem.
     pub found: u32,
+    /// Additional raw FE overlaps classified as scoped continuation.
+    pub scoped_soft_static_fe: u32,
     /// Whether NO edge intersects anything, folded on the device over the flag
     /// `check_intersection` accumulates across its three edge walks.
     ///
@@ -283,6 +285,7 @@ impl Report {
 pub struct Scene {
     /// The committed pose, `3 * vertices` position components.
     pub vert: Handle,
+    pub accepted_vert: Handle,
     pub face: Handle,
     pub edge: Handle,
     pub face_prop: Handle,
@@ -298,6 +301,8 @@ pub struct Scene {
     /// thread-count guard says nothing about it, and Metal returns 0.0 for an
     /// out-of-bounds read and faults on nothing.
     pub faces: usize,
+    pub allow_soft_static_fe: bool,
+    pub rod_count: u32,
     pub edges: usize,
     pub surface_vertices: usize,
 }
@@ -419,7 +424,7 @@ impl ScanState {
             AllocLabel("intersection.records"),
         )?;
         self.counter
-            .size(device, 1, AllocLabel("intersection.counter"))?;
+            .size(device, 2, AllocLabel("intersection.counter"))?;
         // THE FOLD SCRATCH, sized for the longer of the two arrays. A fold over
         // N elements needs one slot per block at every level, and the geometric
         // series over a width of `DOF_FOLD_WIDTH` is under N/(width-1) slots,
@@ -436,7 +441,7 @@ impl ScanState {
         let vert_words = self.vert_flag.len();
         clear(device, self.edge_flag.handle(), edge_words)?;
         clear(device, self.vert_flag.handle(), vert_words)?;
-        clear(device, self.counter.handle(), 1)?;
+        clear(device, self.counter.handle(), 2)?;
         Ok(())
     }
 
@@ -463,8 +468,11 @@ impl ScanState {
         let count = scene.edges as u32;
         let args = IntersectScanFaceEdgeArgs {
             vert: scene.vert,
+            accepted_vert: scene.accepted_vert,
             face: scene.face,
             face_count: scene.faces as u32,
+            allow_soft_static_fe: u32::from(scene.allow_soft_static_fe),
+            rod_count: scene.rod_count,
             edge: scene.edge,
             vertex_prop: scene.vert_prop,
             start_link_index: scene.start_link.index,
@@ -734,6 +742,7 @@ impl ScanState {
     pub fn finish<D: Device>(&mut self, device: &mut D) -> FatalResult<Report> {
         self.counter.download(device)?;
         let found = self.counter.host()[0];
+        let scoped_soft_static_fe = self.counter.host()[1];
         let stored = (found as usize).min(max_records());
         let mut records = Vec::with_capacity(stored);
         if stored > 0 {
@@ -755,6 +764,7 @@ impl ScanState {
         Ok(Report {
             records,
             found,
+            scoped_soft_static_fe,
             edge_clear,
             vert_clear,
             #[cfg(test)]
@@ -972,6 +982,7 @@ mod tests {
             }
             Scene {
                 vert: self.vert.handle(),
+                accepted_vert: self.vert.handle(),
                 face: self.face.handle(),
                 edge: self.edge.handle(),
                 face_prop: self.face_prop.handle(),
@@ -985,6 +996,8 @@ mod tests {
                     present: self.link_present,
                 },
                 faces: self.faces,
+                allow_soft_static_fe: false,
+                rod_count: 0,
                 edges: self.edges,
                 surface_vertices: self.surface_vertices,
             }
@@ -1935,6 +1948,124 @@ mod tests {
             "the stored records stop at the buffer's capacity"
         );
     }
+    #[test]
+    fn narrow_soft_follow_face_edge_reporting_keeps_competing_crossings() {
+        let vertex = [
+            point(-1.0, -1.0, 0.0), point(1.0, -1.0, 0.0), point(0.0, 1.0, 0.0),
+            point(-0.1, 0.0, -0.5), point(-0.1, 0.0, 0.5),
+            point(0.1, 0.0, -0.5), point(0.1, 0.0, 0.5)
+        ];
+        let face = [[0u32,1,2]];
+        for (transition, rod_count, hard_tip, soft_face, crossing_free, expected) in [
+            (false, 0, true, true, false, 2),
+            (true, 0, true, true, false, 1),
+            (true, 0, true, true, true, 2),
+            (true, 1, true, true, false, 2),
+            (true, 0, false, true, false, 2),
+            (true, 0, true, false, false, 2),
+        ] {
+            for edge in [[[3u32,4],[5,6]], [[4u32,3],[5,6]]] {
+                let mut fx=Fixture::new();
+                let mut prop = [free_vertex(0); 7];
+                for (i,v) in prop.iter_mut().enumerate() {
+                    v.object_index = if i<3 { 1 } else { 2 };
+                    v.collider = i<3;
+                    v.pull_index = if i<3 && (soft_face || i!=2) { (i+1) as u32 } else { 0 };
+                    v.fix_index = if i==3 && hard_tip { 1 } else { 0 };
+                    v.pin_allow_intersection = i==3;
+                }
+                let mut fp = free_face(0);
+                fp.collider=true;
+                fx.stage_scene(&vertex,&face,&edge,&[fp],&[free_edge(0);2],&prop,
+                               &[EdgeParam::default()],&[VertexParam::default()]);
+                let mut scene=fx.scene();
+                scene.allow_soft_static_fe=transition;
+                scene.rod_count=rod_count;
+                let mut accepted=vertex;
+                // Both endpoints started on the same side. Only the hard
+                // endpoint crossed in the positive case; in the negative
+                // case the current crossing instead came from the free end.
+                accepted[3][2] = if crossing_free { -0.5 } else { 0.5 };
+                accepted[4][2] = if crossing_free { -0.5 } else { 0.5 };
+                let mut previous=Buffer::none();
+                scene.accepted_vert=stage(&mut fx.device,&mut previous,&flat_points(&accepted));
+                let mut tree=fx.tree(&face_boxes_of(&vertex,&face));
+                let query=fx.query(&edge_boxes_of(&vertex,&edge));
+                fx.begin();
+                unsafe { fx.scan.scan_face_edge(&mut fx.device,&scene,&mut tree,query) }.unwrap();
+                let report=fx.finish();
+                assert_eq!(report.found,expected);
+                if expected==1 { assert_eq!(report.records[0].elem1,1); }
+                assert_eq!(report.scoped_soft_static_fe, u32::from(expected==1));
+            }
+        }
+    }
+
+    #[test]
+    fn reverse_pin_face_edge_filters_only_the_proven_record() {
+        use crate::data::{Vec2u, Vec3u};
+        use super::super::reverse_pin_contacts::filter_trial;
+        use super::super::test_scene::{fix_pin, pull_pin, TestScene};
+
+        let face = [[0, 1, 2]];
+        let edge = [[3, 4], [5, 6]];
+        let native = TestScene::new(7)
+            .with_faces(&[Vec3u::new(0, 1, 2)])
+            .with_edges(&[Vec2u::new(3, 4), Vec2u::new(5, 6)]);
+        let new = [
+            point(-1.0, 0.0, 0.0), point(1.0, 0.0, 0.0), point(0.0, 2.0, 0.0),
+            point(0.0, 0.5, -1.0), point(0.0, 0.5, 1.0),
+            point(0.1, 0.5, -1.0), point(0.1, 0.5, 1.0),
+        ];
+        let mut old = new;
+        old[3][1] = -0.5;
+        old[4][1] = -0.5;
+        let mut props = [free_vertex(0); 7];
+        for (index, prop) in props[..2].iter_mut().enumerate() {
+            prop.fix_index = index as u32 + 1;
+            prop.pin_allow_intersection = true;
+        }
+        for (index, prop) in props[3..5].iter_mut().enumerate() {
+            prop.object_index = 1;
+            prop.collider = true;
+            prop.pull_index = index as u32 + 1;
+        }
+        props[5].object_index = 2;
+        props[6].object_index = 2;
+        let mut fixed = [fix_pin(0), fix_pin(1)];
+        fixed[0].allow_intersection = true;
+        let pull = [pull_pin(3), pull_pin(4)];
+        for active_permission in [true, false] {
+            fixed[1].allow_intersection = active_permission;
+            let mut fx = Fixture::new();
+            fx.stage_scene(
+                &new, &face, &edge, &[free_face(0)], &[free_edge(0); 2], &props,
+                &[EdgeParam::default()], &[VertexParam::default()],
+            );
+            let scene = fx.scene();
+            let mut tree = fx.tree(&face_boxes_of(&new, &face));
+            let query = fx.query(&edge_boxes_of(&new, &edge));
+            fx.begin();
+            unsafe { fx.scan.scan_face_edge(&mut fx.device, &scene, &mut tree, query) }.unwrap();
+            let mut report = fx.finish();
+            assert_eq!(report.found, 2);
+            let mut fix = Buffer::none();
+            stage(&mut fx.device, &mut fix, &fixed);
+            let mut accepted = ReadbackBuffer::none();
+            accepted.size(&mut fx.device, old.len() * 3, AllocLabel("reverse_pin.test")).unwrap();
+            accepted.seed(&mut fx.device, &flat_points(&old)).unwrap();
+            let eligible = unsafe {
+                filter_trial(
+                    &mut fx.device, &native.data, &mut accepted, &flat_points(&new),
+                    &props, &fix, &pull, &[], &mut report,
+                )
+            }.unwrap();
+            assert_eq!(eligible.len(), usize::from(active_permission));
+            assert_eq!(report.found, 2 - u32::from(active_permission));
+            assert!(report.records.iter().any(|record| record.elem1 == 1));
+        }
+    }
+
     #[test]
     fn collision_filter_controls_the_final_face_edge_scan() {
         for (a, b, admitted) in [

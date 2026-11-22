@@ -1442,6 +1442,7 @@ const HANDLE_FIELDS: &[(&str, &str)] = &[
     // and are device allocations from the day they are written, because the
     // reference reads exactly those three back and nothing else.
     ("contact/intersect_geometry", "IntersectScanFaceEdgeArgs.vert"),
+    ("contact/intersect_geometry", "IntersectScanFaceEdgeArgs.accepted_vert"),
     ("contact/intersect_geometry", "IntersectScanFaceEdgeArgs.face"),
     ("contact/intersect_geometry", "IntersectScanFaceEdgeArgs.edge"),
     ("contact/intersect_geometry", "IntersectScanFaceEdgeArgs.vertex_prop"),

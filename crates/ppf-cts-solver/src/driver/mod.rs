@@ -328,6 +328,8 @@ pub mod log;
 pub mod ccd;
 pub mod dyncsr;
 pub mod intersection;
+mod reverse_pin_contacts;
+mod reverse_pin_fe;
 pub mod lbvh;
 pub mod pair_cache;
 pub mod operator;
@@ -997,7 +999,7 @@ pub unsafe extern "C" fn initialize(data: *const DataSet, param: *const ParamSet
             (curr, curr_host, "current"),
         ] {
             let scan = with_device(|device| {
-                live.check_intersection(device, &*data, mesh_refs, pose, pose_host, allocated.prop_vertex.host(), windows)
+                live.check_intersection(device, &*data, mesh_refs, pose, pose, pose_host, allocated.prop_vertex.host(), windows, false)
             });
             let report = match scan {
                 Ok(report) => report,

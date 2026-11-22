@@ -80,5 +80,8 @@ pub(super) fn import<D:Device>(device:&mut D,state:&mut SolverState,s:&Snapshot,
         }
         state.joints.soft.update_prescribed_vertices(device,&state.rigid,&after)?;
     }
+    if let Some(contact) = &mut state.contact {
+        contact.reverse_pin_face_edges.clear();
+    }
     Ok(())
 }
