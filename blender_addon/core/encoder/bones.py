@@ -181,29 +181,53 @@ def _known_scale_validation_handlers(scene):
 
 
 def _provably_fixed_fk_scale(arm, names, paths):
-    """First pass: plain FK with bounded transform curves on an unparented rig.
+    """Prove bounded FK and its object-parent chain have fixed uniform scale.
 
     Unknown actions, inheritance, controllers or curve interpolation retain
     evaluation. This is not a general dependency graph proof.
     """
     from ...models.bone_bindings import _rest_frame_for_drift
 
-    if arm.parent is not None or arm.constraints or any(
+    if arm.constraints or any(
             pose.constraints for pose in arm.pose.bones):
         return False  # Sibling/descendant IK can affect relevant bones.
-    ad = arm.animation_data
-    if ad is None or ad.drivers or ad.nla_tracks or ad.use_tweak_mode:
-        return False
-    if (ad.action_blend_type != 'REPLACE' or ad.action_influence != 1.
-            or ad.action_extrapolation != 'HOLD'):
-        return False
-    action = ad.action
-    if action is None or (getattr(action, 'is_action_layered', False)
-                          and getattr(ad, 'action_slot', None) is None):
-        return False
-    layers = getattr(action, 'layers', ())
-    if len(layers) > 1 or any(len(layer.strips) != 1 for layer in layers):
-        return False
+    def action_valid(owner, scale_paths, movement_paths):
+        ad = owner.animation_data
+        if ad is None:
+            return True
+        if (ad.drivers or ad.nla_tracks or ad.use_tweak_mode
+                or ad.action_blend_type != 'REPLACE' or ad.action_influence != 1.
+                or ad.action_extrapolation != 'HOLD' or ad.action is None):
+            return False
+        action = ad.action
+        if (getattr(action, 'is_action_layered', False)
+                and getattr(ad, 'action_slot', None) is None):
+            return False
+        layers = getattr(action, 'layers', ())
+        if len(layers) > 1 or any(len(layer.strips) != 1 for layer in layers):
+            return False
+        for curve in _action_curves(action, getattr(ad, 'action_slot', None)):
+            if curve.mute:
+                continue
+            if curve.data_path in scale_paths:
+                if (not 0 <= curve.array_index < 3
+                        or not _is_constant_positive_scale_curve(curve)
+                        or abs(curve.keyframe_points[0].co.y
+                               - owner.path_resolve(curve.data_path)[curve.array_index]) > 1.e-7):
+                    return False
+                continue
+            if (curve.data_path not in movement_paths or not 0 <= curve.array_index < 3
+                    or curve.extrapolation != 'CONSTANT' or curve.modifiers
+                    or curve.sampled_points or not curve.keyframe_points):
+                return False
+            for key in curve.keyframe_points:
+                if (key.interpolation not in {'BEZIER', 'LINEAR', 'CONSTANT'}
+                        or not all(math.isfinite(float(v)) and abs(v) <= 1.e3
+                                   for v in (key.co.y, key.handle_left.y, key.handle_right.y))
+                        or not all(math.isfinite(float(v)) for v in
+                                   (key.co.x, key.handle_left.x, key.handle_right.x))):
+                    return False
+        return True
 
     def constant_basis(owner):
         return (all(math.isfinite(float(value)) and abs(float(value)) <= 1.e3
@@ -218,6 +242,57 @@ def _provably_fixed_fk_scale(arm, names, paths):
                           *arm.delta_rotation_quaternion))
             or any(value != 1. for value in arm.delta_scale)):
         return False
+    # Prove every object link is a positive similarity. A fixed uniform
+    # inverse and fixed uniform scale stay uniform under animated rotations.
+    from ...models.bone_bindings import similarity_frame_scale
+    object_scale = 1.0
+    accumulated_error = 0.0
+    depth = 0
+    current = arm
+    while current.parent is not None:
+        depth += 1
+        if depth > 12 or current.parent_type != 'OBJECT':
+            return False
+        matrix = current.matrix_parent_inverse
+        if (any(not math.isfinite(float(v)) or abs(float(v)) > 1.e3
+                for v in matrix.translation)
+                or any(abs(matrix[3][j] - (1. if j == 3 else 0.)) > 1.e-7
+                       for j in range(4))):
+            return False
+        basis = matrix.to_3x3()
+        if basis.determinant() <= 0.:
+            return False
+        columns = [basis.col[i] for i in range(3)]
+        scale_sq = sum(column.dot(column) for column in columns) / 3.
+        if not math.isfinite(scale_sq) or scale_sq <= 0.:
+            return False
+        gram_error = max(abs(columns[i].dot(columns[j]) / scale_sq
+                             - (1. if i == j else 0.))
+                         for i in range(3) for j in range(3))
+        accumulated_error += gram_error
+        if accumulated_error > 5.e-7:
+            return False
+        try:
+            _, inverse_scale = similarity_frame_scale(matrix, current.name)
+        except (ValueError, RuntimeError):
+            return False
+        parent = current.parent
+        if parent.constraints or not constant_basis(parent):
+            return False
+        if (any(value != 1. for value in parent.delta_scale)
+                or not all(math.isfinite(float(value)) and abs(value) <= 1.e3
+                           for value in (*parent.delta_location, *parent.delta_rotation_euler,
+                                         *parent.delta_rotation_quaternion))):
+            return False
+        movement_paths = {'location'}
+        if parent.rotation_mode not in {'QUATERNION', 'AXIS_ANGLE'}:
+            movement_paths.update(('rotation_euler', 'delta_rotation_euler'))
+        if not action_valid(parent, {'scale', 'delta_scale'}, movement_paths):
+            return False
+        object_scale *= inverse_scale * parent.scale[0]
+        if not 0.25 <= object_scale <= 4.:
+            return False
+        current = parent
     movement = {'location'}
     if arm.rotation_mode not in {'QUATERNION', 'AXIS_ANGLE'}:
         movement.add('rotation_euler')
@@ -232,37 +307,15 @@ def _provably_fixed_fk_scale(arm, names, paths):
             return False
         # Uniform factors can be composed without shear; bound the aggregate
         # to avoid overflow/near-singularity along an otherwise simple chain.
-        effective = arm.scale[0] * pose.scale[0] * math.prod(
+        effective = object_scale * arm.scale[0] * pose.scale[0] * math.prod(
             parent.scale[0] for parent in pose.parent_recursive)
         if not 0.25 <= effective <= 4.:
             return False
         if pose.rotation_mode not in {'QUATERNION', 'AXIS_ANGLE'}:
             movement.add(pose.path_from_id('rotation_euler'))
         movement.add(pose.path_from_id('location'))
-    for curve in _action_curves(action, getattr(ad, 'action_slot', None)):
-        if curve.mute:
-            continue
-        if curve.data_path in paths:
-            # The explicit validator already checked constancy. Verify the
-            # keyed axes match the effective channels observed at entry.
-            if (not 0 <= curve.array_index < 3
-                    or not _is_constant_positive_scale_curve(curve)
-                    or abs(curve.keyframe_points[0].co.y
-                           - arm.path_resolve(curve.data_path)[curve.array_index]) > 1.e-7):
-                return False
-            continue
-        if (curve.data_path not in movement or not 0 <= curve.array_index < 3
-                or curve.extrapolation != 'CONSTANT' or curve.modifiers
-                or curve.sampled_points or not curve.keyframe_points):
-            return False
-        for key in curve.keyframe_points:
-            if (key.interpolation not in {'BEZIER', 'LINEAR', 'CONSTANT'}
-                    or not all(math.isfinite(float(v)) and abs(v) <= 1.e3
-                               for v in (key.co.y, key.handle_left.y, key.handle_right.y))
-                    or not all(math.isfinite(float(v)) for v in
-                               (key.co.x, key.handle_left.x, key.handle_right.x))):
-                return False
-    return True
+    return action_valid(arm, paths, movement)
+
 
 
 def _pose_scale_sources(context, *, explicit_only=False):
@@ -286,6 +339,7 @@ def _pose_scale_sources(context, *, explicit_only=False):
         if not names:
             continue
         ad = arm.animation_data
+        arm_ad = ad
         paths = {arm.pose.bones[name].path_from_id('scale') for name in names} | {'scale', 'delta_scale'}
         if ad is not None:
             if _has_unsupported_scale_animation(ad, paths):
@@ -303,7 +357,7 @@ def _pose_scale_sources(context, *, explicit_only=False):
             ancestor = ancestor.parent
         if explicit_only:
             continue
-        if ad is not None and arm.parent is None:
+        if arm_ad is not None or arm.parent is not None:
             if fast is None:
                 fast = _known_scale_validation_handlers(context.scene)
             if fast and _provably_fixed_fk_scale(arm, names, paths):
