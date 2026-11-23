@@ -1673,10 +1673,9 @@ class SOLVER_OT_ResumeFrom(AsyncOperator):
 
 
 class SOLVER_OT_UpdateParams(AsyncOperator):
-    """Update the parameters of the solver."""
-
     bl_idname = "solver.update_params"
     bl_label = "Update Params on Remote"
+    bl_description = "Update the parameters of the scene already transferred to the solver."
 
     _mode = None
     timeout: float = 120.0
@@ -1780,14 +1779,15 @@ class SOLVER_OT_UpdateParams(AsyncOperator):
             raise StageAbort(str(exc)) from exc
         if target_frame is None:
             raise StageAbort(
-                "CHECKPOINT_PARAMETERS_IMMUTABLE: no horizon extension; "
-                "use Resume without Update Params, or Transfer/Run a fresh generation"
+                iface_("CHECKPOINT_PARAMETERS_IMMUTABLE: no horizon extension; "
+                       "use Resume without Update Params, or Transfer/Run a fresh generation")
             )
         self._require_current_inputs(context)
         self._mode = "local-finished"
-        self.report({"INFO"},
-                    f"Resume target {target_frame + 1} samples validated locally; "
-                    "click Resume. Remote sealed parameters remain unchanged.")
+        self.report({"INFO"}, iface_(
+            "Resume target {frames} samples validated locally; click Resume. "
+            "Remote sealed parameters remain unchanged."
+        ).format(frames=target_frame + 1))
 
     def _stage_bone_motion(self, context):
         from ..core import encode_progress
@@ -1849,7 +1849,7 @@ class SOLVER_OT_UpdateParams(AsyncOperator):
                 and param_hash
                 and param_hash == remote.server_param_hash):
             self._mode = "local-finished"
-            self.report({"INFO"}, "参数未更改，保留当前解算结果。")
+            self.report({"INFO"}, iface_("Parameters are unchanged. The current simulation result is kept."))
             return
         try:
             com.build_pipeline(

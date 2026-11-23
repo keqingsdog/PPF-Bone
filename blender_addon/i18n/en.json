@@ -1,4 +1,8 @@
 {
+  "Update the parameters of the scene already transferred to the solver.": "Update the parameters of the scene already transferred to the solver.",
+  "CHECKPOINT_PARAMETERS_IMMUTABLE: no horizon extension; use Resume without Update Params, or Transfer/Run a fresh generation": "CHECKPOINT_PARAMETERS_IMMUTABLE: no horizon extension; use Resume without Update Params, or Transfer/Run a fresh generation",
+  "Resume target {frames} samples validated locally; click Resume. Remote sealed parameters remain unchanged.": "Resume target {frames} samples validated locally; click Resume. Remote sealed parameters remain unchanged.",
+  "Parameters are unchanged. The current simulation result is kept.": "Parameters are unchanged. The current simulation result is kept.",
   "Reset": "Reset",
   "Reset PCG Tolerance": "Reset PCG Tolerance",
   "Restore the PCG tolerance to 0.001.": "Restore the PCG tolerance to 0.001.",

@@ -405,8 +405,6 @@ def _draw_edit_display(layout,context):
     controls=layout.column(align=True);controls.enabled=settings.enabled and settings.proxy_enabled
     row=controls.row(align=True);row.prop(settings,'faces',text='表面');row.prop(settings,'edges',text='线框')
     controls.prop(settings,'opacity',text='透明度')
-    controls.prop(settings,'refresh_fps',text='共享刷新 FPS')
-    controls.label(text='多场景取最高值')
     row=controls.row(align=True);row.prop(settings,'in_front',text='透视');row.prop(settings,'selected_only',text='仅选中')
 
 

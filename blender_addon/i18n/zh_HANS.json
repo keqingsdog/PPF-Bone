@@ -1,4 +1,8 @@
 {
+  "Update the parameters of the scene already transferred to the solver.": "更新已传输到求解器的场景参数。",
+  "CHECKPOINT_PARAMETERS_IMMUTABLE: no horizon extension; use Resume without Update Params, or Transfer/Run a fresh generation": "CHECKPOINT_PARAMETERS_IMMUTABLE：本次未延长模拟范围。请直接续算，或重新传输并开始新的模拟。",
+  "Resume target {frames} samples validated locally; click Resume. Remote sealed parameters remain unchanged.": "续算至目标帧 {frames} 所需的数据已在本地通过验证。请点击「续算」。远程封存参数保持原样。",
+  "Parameters are unchanged. The current simulation result is kept.": "参数未更改，保留当前解算结果。",
   "Reset": "重置",
   "Reset PCG Tolerance": "重置 PCG 容差",
   "Restore the PCG tolerance to 0.001.": "将 PCG 容差恢复为 0.001。",
@@ -1925,7 +1929,7 @@
   "Unknown physical body: {name}": "未知的物理体：{name}",
   "Unrecoverable CUDA runtime or driver error": "不可恢复的 CUDA 运行时或驱动程序错误",
   "Unsupported: {field}: {detail}": "不支持：{field}：{detail}",
-  "Update Params on Remote": "在远程更新参数",
+  "Update Params on Remote": "更新远程参数",
   "Update Stat": "更新统计",
   "Update preserves edited proxy geometry and transform": "更新保留已编辑的代理网格和变换",
   "Update server status.": "更新服务器状态。",

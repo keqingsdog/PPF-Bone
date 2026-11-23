@@ -1,4 +1,8 @@
 {
+  "Update the parameters of the scene already transferred to the solver.": "솔버로 이미 전송된 씬의 매개변수를 업데이트합니다.",
+  "CHECKPOINT_PARAMETERS_IMMUTABLE: no horizon extension; use Resume without Update Params, or Transfer/Run a fresh generation": "CHECKPOINT_PARAMETERS_IMMUTABLE: 시뮬레이션 범위가 연장되지 않았습니다. 그대로 재개하거나 다시 전송하여 새로 실행하세요.",
+  "Resume target {frames} samples validated locally; click Resume. Remote sealed parameters remain unchanged.": "재개 대상 {frames} 프레임까지의 데이터를 로컬에서 검증했습니다. '재개'를 클릭하세요. 원격에서 확정된 매개변수는 유지됩니다.",
+  "Parameters are unchanged. The current simulation result is kept.": "매개변수가 변경되지 않았습니다. 현재 시뮬레이션 결과를 유지합니다.",
   "Reset": "초기화",
   "Reset PCG Tolerance": "PCG 허용 오차 초기화",
   "Restore the PCG tolerance to 0.001.": "PCG 허용 오차를 0.001로 복원합니다.",
