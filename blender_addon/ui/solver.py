@@ -60,7 +60,7 @@ from ..models.groups import (
 from .geometry_cleanup_ops import popup_transfer_error
 from .dynamics.bone_capture import (
     SOLVER_OT_CaptureBoneMotion, SOLVER_OT_AbortBoneCapture, is_active as bone_capture_active,
-    has_bones,
+    draw_preview_controls, has_bones, standalone_progress,
 )
 from .dynamics.bake_ops import bake_progress_snapshot, bake_scene_locked, is_bake_running
 from .dynamics.pin_capture_ops import (
@@ -767,7 +767,7 @@ class SOLVER_PT_SolverPanel(Panel):
 
         if com.info.status == RemoteStatus.WAITING_FOR_DATA and has_dynamic and SOLVER_OT_Transfer.poll(context):
             row = box.row()
-            row.label(text="Click \"Transfer\" to upload data", icon="INFO")
+            row.label(text=iface_("Click \"Transfer\" to upload data"), icon="INFO")
 
         # Warn when local animation is the only blocker for Run
         if SOLVER_OT_ClearAnimation.poll(context):
@@ -806,6 +806,12 @@ class SOLVER_PT_SolverPanel(Panel):
             SOLVER_OT_RecaptureAllDeformations.bl_idname, icon="FILE_REFRESH"
         )
         box.operator(SOLVER_OT_ClearAllDeformations.bl_idname, icon="TRASH")
+        if has_bones(context):
+            bone_note = box.column(align=True)
+            bone_note.label(text="Bone preview is not cached.", icon="INFO")
+            bone_note.label(text=iface_("Transfer samples bones again."))
+        if standalone_progress(context) is not None:
+            draw_preview_controls(box, context)
         _draw_bulk_capture_modes(box, context)
 
         # Export the simulated mesh sequence to a USD / Alembic cache: a
@@ -1183,6 +1189,7 @@ class SOLVER_OT_Run(AsyncOperator):
 
     bl_idname = "solver.run"
     bl_label = "Run"
+    bl_description = "Start a new simulation from the scene transferred to the solver."
 
     timeout: float = 86400.0  # 24 hours for long simulations
     auto_redraw: bool = True
@@ -1343,6 +1350,7 @@ class SOLVER_OT_Resume(AsyncOperator):
 
     bl_idname = "solver.resume"
     bl_label = "Resume"
+    bl_description = "Continue the simulation from a saved state on the solver."
 
     timeout: float = 86400.0  # 24 hours for long simulations
     auto_redraw: bool = True
@@ -1485,6 +1493,7 @@ class SOLVER_OT_ResumeFrom(AsyncOperator):
 
     bl_idname = "solver.resume_from"
     bl_label = "Resume"
+    bl_description = "Choose a saved frame to resume or extend the simulation. Earlier frames are kept; later frames are recomputed."
     twist_upgrade: BoolProperty(name="连续累计扭转", default=False, options={'HIDDEN', 'SKIP_SAVE'})
 
     timeout: float = 120.0
@@ -1664,10 +1673,9 @@ class SOLVER_OT_ResumeFrom(AsyncOperator):
 
 
 class SOLVER_OT_UpdateParams(AsyncOperator):
-    """Update the parameters of the solver."""
-
     bl_idname = "solver.update_params"
     bl_label = "Update Params on Remote"
+    bl_description = "Update the parameters of the scene already transferred to the solver."
 
     _mode = None
     timeout: float = 120.0
@@ -1771,14 +1779,15 @@ class SOLVER_OT_UpdateParams(AsyncOperator):
             raise StageAbort(str(exc)) from exc
         if target_frame is None:
             raise StageAbort(
-                "CHECKPOINT_PARAMETERS_IMMUTABLE: no horizon extension; "
-                "use Resume without Update Params, or Transfer/Run a fresh generation"
+                iface_("CHECKPOINT_PARAMETERS_IMMUTABLE: no horizon extension; "
+                       "use Resume without Update Params, or Transfer/Run a fresh generation")
             )
         self._require_current_inputs(context)
         self._mode = "local-finished"
-        self.report({"INFO"},
-                    f"Resume target {target_frame + 1} samples validated locally; "
-                    "click Resume. Remote sealed parameters remain unchanged.")
+        self.report({"INFO"}, iface_(
+            "Resume target {frames} samples validated locally; click Resume. "
+            "Remote sealed parameters remain unchanged."
+        ).format(frames=target_frame + 1))
 
     def _stage_bone_motion(self, context):
         from ..core import encode_progress
@@ -1840,7 +1849,7 @@ class SOLVER_OT_UpdateParams(AsyncOperator):
                 and param_hash
                 and param_hash == remote.server_param_hash):
             self._mode = "local-finished"
-            self.report({"INFO"}, "参数未更改，保留当前解算结果。")
+            self.report({"INFO"}, iface_("Parameters are unchanged. The current simulation result is kept."))
             return
         try:
             com.build_pipeline(
@@ -2065,10 +2074,7 @@ def _recapture_pin_queue_identity(scene, specs):
 
 
 class SOLVER_OT_RecaptureAllDeformations(Operator):
-    """Re-capture deformation for every deforming STATIC collider and every
-    animated pin with one action, so you don't have to capture each one by hand
-    before Transfer. When batching is enabled, one timeline pass samples both
-    Static and Pin. Shows the actual capture mode, progress and an Abort button."""
+    """Re-capture Static and Pin inputs. For bones alone, run Bone Preview. With meshes, enable frame batching and Include Bone Preview to sample bones too. Transfer still evaluates bone animation live."""
 
     bl_idname = "solver.recapture_all_deformations"
     bl_label = "Re-capture All Deformations"
@@ -2092,9 +2098,13 @@ class SOLVER_OT_RecaptureAllDeformations(Operator):
         return bool(
             scene_has_capturable_static(context)
             or collect_capturable_pins(context, cheap=True)
+            or SOLVER_OT_CaptureBoneMotion.poll(context)
         )
 
     def execute(self, context):
+        # RNA normally enforces poll; keep the same guard for direct callers.
+        if is_bake_running() or is_capture_running() or is_pin_capture_running() or bone_capture_active():
+            return {"CANCELLED"}
         self._capture_cancelled = False
         self._capture_sampling_targets = None
         self._capture_ranges = None
@@ -2104,17 +2114,6 @@ class SOLVER_OT_RecaptureAllDeformations(Operator):
         )
         self._capture_frame_batch_active = False
         self._joint_capture = None
-        if self._capture_frame_batch_requested:
-            if not bpy.data.filepath:
-                self.report({"ERROR"}, iface_("Save the project before using mixed capture"))
-                return {"CANCELLED"}
-            try:
-                from ..core.capture_provenance import _assert_group_idle
-                from ..core.pc2 import get_pc2_dir
-                _assert_group_idle(get_pc2_dir())
-            except (OSError, RuntimeError, ValueError) as exc:
-                self.report({"ERROR"}, str(exc))
-                return {"CANCELLED"}
         from .dynamics.static_deform_ops import collect_capturable_static_objects
         from .dynamics.pin_capture_ops import collect_capturable_pins, validate_pin_capture_specs
 
@@ -2133,6 +2132,27 @@ class SOLVER_OT_RecaptureAllDeformations(Operator):
         except RuntimeError as exc:
             self.report({"WARNING"}, str(exc))
             return {"CANCELLED"}
+        if not static_objs and not pin_specs:
+            # Bone Preview owns its own modal timer and never publishes a
+            # deformation input cache. Do not require a saved blend for it.
+            if SOLVER_OT_CaptureBoneMotion.poll(context):
+                result = bpy.ops.solver.capture_bone_motion("EXEC_DEFAULT")
+                # The child owns the modal handler; this wrapper has no
+                # timer or modal state of its own in the bone-only route.
+                return {"FINISHED"} if "RUNNING_MODAL" in result else result
+            self.report({"WARNING"}, iface_("No deformations to capture"))
+            return {"CANCELLED"}
+        if self._capture_frame_batch_requested:
+            if not bpy.data.filepath:
+                self.report({"ERROR"}, iface_("Save the project before using mixed capture"))
+                return {"CANCELLED"}
+            try:
+                from ..core.capture_provenance import _assert_group_idle
+                from ..core.pc2 import get_pc2_dir
+                _assert_group_idle(get_pc2_dir())
+            except (OSError, RuntimeError, ValueError) as exc:
+                self.report({"ERROR"}, str(exc))
+                return {"CANCELLED"}
         try:
             self._queued_pin_identity = _recapture_pin_queue_identity(context.scene, pin_specs)
         except (ReferenceError, RuntimeError, ValueError, IndexError) as exc:
@@ -2156,10 +2176,6 @@ class SOLVER_OT_RecaptureAllDeformations(Operator):
             self._queue.append((self._PHASE_STATIC, static_objs))
         if pin_specs:
             self._queue.append((self._PHASE_PIN, pin_specs))
-        if not self._queue:
-            self._capture_sampling_targets = None
-            self.report({"WARNING"}, iface_("No deformations to capture"))
-            return {"CANCELLED"}
         self._phase = None
         self._summary = {"objs": 0, "pins": 0}
         self._bulk_display = {"scene": _bulk_capture_scene_key(context), "phases": {}}
@@ -2492,10 +2508,7 @@ class SOLVER_OT_RecaptureAllDeformations(Operator):
 
 
 class SOLVER_OT_ClearAllDeformations(Operator):
-    """Clear this Scene's owned STATIC and Pin deformation input caches.
-
-    Shared or unproven caches are retained. Authored geometry and keyframes
-    remain intact; Re-capture All Deformations can rebuild the inputs."""
+    """Clear owned Static and Pin input caches only. Shared or unproven caches, authored geometry and keyframes are kept. Bone Preview has no cache to clear; solver playback is not cleared here."""
 
     bl_idname = "solver.clear_all_deformations"
     bl_label = "Clear All Deformations"
@@ -2521,7 +2534,7 @@ class SOLVER_OT_ClearAllDeformations(Operator):
     def poll(cls, context):
         # Disabled while a capture/bake is in flight, and (the "nothing to
         # clear" case) when no cache exists across the active groups.
-        if is_bake_running() or is_capture_running() or is_pin_capture_running():
+        if is_bake_running() or is_capture_running() or is_pin_capture_running() or bone_capture_active():
             return False
         # The static predicate checks ownership only for existing PC2 files
         # or in-memory arrays. Clear revalidates the caches when it runs.
@@ -2533,6 +2546,9 @@ class SOLVER_OT_ClearAllDeformations(Operator):
         )
 
     def execute(self, context):
+        # A capture can start while the interactive confirmation is open.
+        if not self.poll(context):
+            return {"CANCELLED"}
         origin = getattr(self, "_clear_confirmation_origin", None)
         if origin is not None and origin != (context.scene.as_pointer(), bpy.data.filepath):
             self.report({"WARNING"}, iface_("Scene or project changed; confirm clearing again"))
@@ -2695,6 +2711,7 @@ class SOLVER_OT_FetchData(AsyncOperator):
 
     bl_idname = "solver.fetch_remote_data"
     bl_label = "Fetch All Animation"
+    bl_description = "Download all available simulation frames from the solver for local playback or baking."
 
     timeout: float = 600.0
     auto_redraw: bool = True
@@ -2784,6 +2801,7 @@ class SOLVER_OT_DeleteRemoteData(AsyncOperator):
 
     bl_idname = "solver.delete_remote_data"
     bl_label = "Delete Remote Data"
+    bl_description = "Delete the connected solver’s data for this project, including uploaded inputs, simulation results, and saved states."
 
     timeout: float = 60.0
     auto_redraw: bool = True

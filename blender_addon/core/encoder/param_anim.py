@@ -116,7 +116,7 @@ def _sample_curve_or_static(fcurve, frame, static):
     return float(fcurve.evaluate(frame))
 
 
-def _contact_resolution(group, state, which):
+def _contact_resolution(group, state, which, *, projected_proxy=None):
     """`(property, scale)` for a group's contact gap or offset, or `(None, 0)`.
 
     Mirrors the branch `_encode_group_params` takes for the static value, so an
@@ -129,7 +129,7 @@ def _contact_resolution(group, state, which):
         return None, 0.0
     if group.use_group_bounding_box_diagonal:
         from .mesh import compute_group_bounding_box_diagonal
-        diagonal = compute_group_bounding_box_diagonal(group) * state.world_scaling
+        diagonal = compute_group_bounding_box_diagonal(group, projected_proxy=projected_proxy) * state.world_scaling
         return f"contact_{which}_rat", diagonal
     return f"contact_{which}", float(state.world_scaling)
 
@@ -252,6 +252,8 @@ def encode_param_anim(
     frames = [start_frame + i for i in range(max(1, int(frame_count)))]
     per_group = {}
     witness = {}
+    from .proxy_start import projection_lookup
+    projected_proxy = projection_lookup(scene)
     for group in groups:
         slot = _slot_of(scene, group)
         if slot is None:
@@ -260,7 +262,7 @@ def encode_param_anim(
         series = {}
         for key, spec in ANIMATABLE_MATERIAL_KEYS.items():
             if "resolve" in spec:
-                prop, scale = _contact_resolution(group, state, spec["resolve"])
+                prop, scale = _contact_resolution(group, state, spec["resolve"], projected_proxy=projected_proxy)
             else:
                 prop, scale = spec["prop"].get(obj_type), None
             if prop is None:

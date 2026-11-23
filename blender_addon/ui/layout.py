@@ -9,7 +9,6 @@ from .. import i18n
 from ..core.utils import get_category_name
 
 ADDON_KEY = __package__.rsplit('.', 1)[0]
-MIN_COLUMN_WIDTH = 680.0
 
 
 def preferences(context):
@@ -41,7 +40,7 @@ class PPF_LayoutPreferences(bpy.types.AddonPreferences):
 
     layout_mode: EnumProperty(name='界面布局', items=(
         ('CLASSIC', '经典', '保留原有纵向面板'),
-        ('TWO_COLUMN', '双栏', '宽侧栏并排显示模块；窄侧栏自动单列')),
+        ('TWO_COLUMN', '双栏', '始终并排显示两栏，不受侧栏宽度限制')),
         default='CLASSIC', update=_redraw)
     show_connection: BoolProperty(name='连接', default=True)
     show_solver: BoolProperty(name='求解', default=True)
@@ -64,12 +63,6 @@ class PPF_LayoutPreferences(bpy.types.AddonPreferences):
 def classic_visible(context):
     prefs = preferences(context)
     return prefs is None or prefs.layout_mode == 'CLASSIC'
-
-
-def logical_width(context):
-    region = context.region
-    scale = max(float(context.preferences.system.ui_scale), .1)
-    return float(region.width) / scale if region is not None else 0.0
 
 
 # Native inline panels assume a full-width panel root. Workbench drawers use
@@ -173,13 +166,8 @@ def draw_content(layout, context):
     if prefs is None:
         layout.label(text='请先启用插件以保存界面偏好', icon='INFO')
         return
-    wide = logical_width(context) >= MIN_COLUMN_WIDTH
-    if wide:
-        split = layout.split(factor=0.5)
-        columns = (split.column(), split.column())
-    else:
-        layout.label(text='拉宽侧栏可并排显示；当前为单列', icon='INFO')
-        columns = (layout.column(),) * 2
+    split = layout.split(factor=0.5)
+    columns = (split.column(), split.column())
     for side, key, panel_type, parent in _modules():
         if not content_available(panel_type, context):
             continue

@@ -338,11 +338,14 @@ class PPF_OT_BoneProxyScale(bpy.types.Operator):
     def execute(self,context):
         from ..core.bone_geometry_edit import acquire
         self._lease=None
+        self._mutated=False
         try:
             snapshots=[(p,[tuple(v.co) for v in p.data.vertices]) for p in targets(context)]
             self._snapshots=snapshots
             self._lease=acquire(context,[proxy for proxy,_coords in snapshots],kind='SCALE')
-            apply_geometry(snapshots,self.factors,self.orientation)
+            if tuple(self.factors)!=(1.,1.,1.):
+                self._mutated=True
+                apply_geometry(snapshots,self.factors,self.orientation)
             self._finish(commit=True)
         except (ValueError,RuntimeError) as exc:
             if self._lease is not None:self.cancel(context)
@@ -355,11 +358,10 @@ class PPF_OT_BoneProxyScale(bpy.types.Operator):
         global _scaler
         if not context.region_data:return self.execute(context)
         self._lease=None
+        self._mutated=False
         try:self._snapshots=[(p,[tuple(v.co) for v in p.data.vertices]) for p in targets(context)]
         except (ValueError,RuntimeError) as exc:self.report({'ERROR'},iface_(str(exc)));return {'CANCELLED'}
-        import numpy as np
-        self._preview_arrays=[np.asarray(coords,dtype=np.float64) for _proxy,coords in self._snapshots]
-        if any(not np.isfinite(coords).all() for coords in self._preview_arrays):
+        if any(not math.isfinite(v) for _,coords in self._snapshots for co in coords for v in co):
             self.report({'ERROR'},iface_('代理坐标超出有限范围'));return {'CANCELLED'}
         from bpy_extras.view3d_utils import location_3d_to_region_2d
         # Use the same placement that draws the proxy. Hidden proxy object
@@ -382,33 +384,71 @@ class PPF_OT_BoneProxyScale(bpy.types.Operator):
         self._distance=(Vector((event.mouse_x,event.mouse_y))-self._origin-self._center).length or 1.
         self._factor=1.;self.factors=(1.,1.,1.);self._axes={0,1,2};self._axis_key=None;self.orientation='LOCAL';self._matrices=[p.matrix_world.to_3x3().copy() for p,_ in self._snapshots];self._numeric='';self._area=context.area;self._cancelled=False
         from ..core.bone_geometry_edit import acquire
+        from ..core import bone_scale_preview
+        from .bone_proxy import selected_bones
+        arm, bones = selected_bones(context,scope=editor_scope(context))
+        shapes = {bone.ppf_bone_physics.proxy.as_pointer():bone.ppf_bone_physics.shape
+                  for bone in bones if bone.ppf_bone_physics.proxy is not None}
+        proxies = [proxy for proxy,_coords in self._snapshots]
+        self._owner=(context.scene,context.view_layer,context.window,arm)
+        self._view_key=bone_overlay._viewport_key(context)
+        self._matrix_preview=None
+        self._last_preview=None
+        if bone_scale_preview.preview_basis(proxies,[shapes.get(p.as_pointer()) for p in proxies]):
+            try:
+                self._matrix_preview=tuple(
+                    (p.as_pointer(),
+                     tuple(max((abs(co[axis]) for co in coords),default=0.) for axis in range(3)),
+                     bone_scale_preview.basis_pair(self._matrices[index]))
+                    for index,(p,coords) in enumerate(self._snapshots))
+            except ValueError:
+                pass  # Keep stock validation for uncertain/bad basis.
+        if self._matrix_preview is None:
+            import numpy as np
+            self._preview_arrays=[np.asarray(coords,dtype=np.float64) for _proxy,coords in self._snapshots]
         try:
-            self._lease=acquire(context,[proxy for proxy,_coords in self._snapshots],kind='SCALE')
+            self._lease=acquire(context,proxies,kind='SCALE')
             context.window_manager.modal_handler_add(self)
         except (ValueError,RuntimeError) as exc:
             if self._lease is not None:self.cancel(context)
             self.report({'ERROR'},iface_(str(exc)));return {'CANCELLED'}
         _scaler=self;return {'RUNNING_MODAL'}
-    def _finish(self,commit=False):
+    def _finish(self,commit=False,*,handoff_keys=None):
         global _scaler
         from ..core.bone_geometry_edit import finish
+        from ..core.bone_scale_preview import clear, commit_handoff
         token=getattr(self,'_lease',None)
         # Keep the token and snapshots live if committing fails. The caller can
         # restore author geometry, then release without retiring the old build.
-        if token is not None:finish(token,commit=commit)
+        if token is not None:
+            changed=finish(token,commit=commit)
+            if commit and changed and handoff_keys is not None:
+                for view, keys in handoff_keys.items():
+                    commit_handoff(token,view,keys)
+            clear(token)
         self._lease=None
         if _scaler is self:_scaler=None
         self._cancelled=True
         try:
             if getattr(self,'_area',None):
                 self._area.header_text_set(None)
+                self._area.tag_redraw()
                 _restore_editor_header(self._area, force=True)
         except (ReferenceError,RuntimeError):pass
     def cancel(self,context):
-        try:restore_geometry(self._snapshots)
+        from ..core.bone_geometry_edit import owns
+        try:
+            # No preview writes for the matrix route. Also do not touch an
+            # invalidated datablock after Load/Undo/Redo retired the lease.
+            if getattr(self,'_mutated',False) and owns(getattr(self,'_lease',None)):
+                restore_geometry(self._snapshots)
         finally:self._finish(commit=False)
     def modal(self,context,event):
         if self._cancelled:return {'CANCELLED'}
+        from ..core.bone_geometry_edit import owns
+        if (not owns(self._lease) or context.mode!='POSE'
+                or (context.scene,context.view_layer,context.window,context.object)!=self._owner):
+            self.cancel(context);return {'CANCELLED'}
         if not in_editor_window(self,context,event):return {'PASS_THROUGH'}
         if event.type in {'MIDDLEMOUSE','WHEELUPMOUSE','WHEELDOWNMOUSE','TRACKPADPAN','TRACKPADZOOM'} or event.type.startswith('NDOF_'):
             return {'PASS_THROUGH'}
@@ -416,8 +456,17 @@ class PPF_OT_BoneProxyScale(bpy.types.Operator):
             self.cancel(context);return {'CANCELLED'}
         if event.type in {'LEFTMOUSE','RET','NUMPAD_ENTER'} and event.value=='PRESS':
             try:
-                apply_geometry(self._snapshots,self.factors,self.orientation,self._matrices)
-                self._finish(commit=True)
+                handoff_keys=None
+                if tuple(self.factors)!=(1.,1.,1.):
+                    if self._matrix_preview is not None:
+                        from ..ui.bone_overlay import scale_handoff_views
+                        handoff_keys=scale_handoff_views(self._view_key[3])
+                    self._mutated=True
+                    apply_geometry(self._snapshots,self.factors,self.orientation,self._matrices)
+                elif self._mutated:
+                    restore_geometry(self._snapshots)
+                    self._mutated=False
+                self._finish(commit=True,handoff_keys=handoff_keys)
             except (ValueError,RuntimeError) as exc:
                 self.cancel(context);self.report({'ERROR'},iface_(str(exc)));return {'CANCELLED'}
             except BaseException:
@@ -444,8 +493,19 @@ class PPF_OT_BoneProxyScale(bpy.types.Operator):
             return {'RUNNING_MODAL'}
         try:
             factor=float(self._numeric) if self._numeric else self._factor
-            self.factors=scale_factors(tuple(factor if i in self._axes else 1. for i in range(3)))
-            apply_geometry(self._snapshots,self.factors,self.orientation,self._matrices,preview=True,view_layer=context.view_layer,preview_arrays=self._preview_arrays)
+            factors=scale_factors(tuple(factor if i in self._axes else 1. for i in range(3)))
+            preview_key=(factors,self.orientation)
+            if preview_key != self._last_preview:
+                if self._matrix_preview is not None:
+                    from ..core.bone_scale_preview import publish
+                    publish(self._lease,self._view_key,self._matrix_preview,factors,self.orientation=='WORLD')
+                    self._area.tag_redraw()
+                else:
+                    self._mutated=True
+                    apply_geometry(self._snapshots,factors,self.orientation,self._matrices,preview=True,
+                                   view_layer=context.view_layer,preview_arrays=self._preview_arrays)
+                self.factors=factors
+                self._last_preview=preview_key
         except ValueError as exc:
             if self.orientation=='WORLD' and '矩阵' in str(exc):
                 self.cancel(context);self.report({'ERROR'},iface_(str(exc)));return {'CANCELLED'}

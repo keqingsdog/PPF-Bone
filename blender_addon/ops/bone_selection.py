@@ -1,6 +1,7 @@
 """User-invoked selection of physical bones and collision memberships."""
 import bpy
 from ..core.compat import set_pose_bone_selected
+from ..i18n import iface, register_class
 from ..i18n.props import BoolVectorProperty
 from ..models.bone_bindings import active_armature
 
@@ -15,7 +16,7 @@ def _selectable(bone):
 def _select(context, operator, slots=None):
     arm = active_armature(context)
     if arm is None or context.mode not in {'OBJECT', 'POSE'}:
-        operator.report({'WARNING'}, '请在物体或姿态模式选择骨架')
+        operator.report({'WARNING'}, iface('请在物体或姿态模式选择骨架'))
         return {'CANCELLED'}
     matches = []
     for pb in arm.pose.bones:
@@ -27,7 +28,7 @@ def _select(context, operator, slots=None):
             continue
         matches.append(pb.name)
     if not matches:
-        operator.report({'WARNING'}, '没有匹配的可选物理骨骼')
+        operator.report({'WARNING'}, iface('没有匹配的可选物理骨骼'))
         return {'CANCELLED'}
     if context.mode == 'OBJECT':
         try:
@@ -41,13 +42,14 @@ def _select(context, operator, slots=None):
         if _selectable(pb.bone):
             set_pose_bone_selected(pb, pb.name in names)
     arm.data.bones.active = arm.data.bones.get(matches[0])
-    operator.report({'INFO'}, f'已选择 {len(matches)} 根物理骨骼')
+    operator.report({'INFO'}, iface('已选择 {count} 根物理骨骼').format(count=len(matches)))
     return {'FINISHED'}
 
 
 class PPF_OT_SelectPhysicsBones(bpy.types.Operator):
     bl_idname = 'ppf.select_physics_bones'
     bl_label = '选择物理骨骼'
+    bl_description = '选择在当前骨架中参与物理模拟的可选骨骼'
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
@@ -57,6 +59,7 @@ class PPF_OT_SelectPhysicsBones(bpy.types.Operator):
 class PPF_OT_SelectCollisionGroupBones(bpy.types.Operator):
     bl_idname = 'ppf.select_collision_group_bones'
     bl_label = '选择碰撞组骨骼'
+    bl_description = '选择属于指定碰撞组的可选物理骨骼'
     bl_options = {'REGISTER', 'UNDO'}
 
     groups: BoolVectorProperty(name='碰撞组', size=16, default=(True,) + (False,) * 15)
@@ -79,7 +82,7 @@ classes = (PPF_OT_SelectPhysicsBones, PPF_OT_SelectCollisionGroupBones)
 
 def register():
     for cls in classes:
-        bpy.utils.register_class(cls)
+        register_class(cls)
 
 
 def unregister():

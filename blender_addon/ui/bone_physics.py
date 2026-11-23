@@ -405,8 +405,6 @@ def _draw_edit_display(layout,context):
     controls=layout.column(align=True);controls.enabled=settings.enabled and settings.proxy_enabled
     row=controls.row(align=True);row.prop(settings,'faces',text='表面');row.prop(settings,'edges',text='线框')
     controls.prop(settings,'opacity',text='透明度')
-    controls.prop(settings,'refresh_fps',text='共享刷新 FPS')
-    controls.label(text='多场景取最高值')
     row=controls.row(align=True);row.prop(settings,'in_front',text='透视');row.prop(settings,'selected_only',text='仅选中')
 
 
@@ -414,6 +412,7 @@ def _draw_generation(layout,context,settings):
     """Read-only UI: effective defaults come from the mesh producer's resolver."""
     from ..models.proxy_generation import effective_proxy_quality,PROXY_QUALITY_ITEMS
     from ..ops.bone_proxy_editor import editor_scope
+    from ..ops.bone_weight_fit import draw_inline_fit
     layout.prop(settings,'shape',text='形状')
     if settings.shape=='CUSTOM':layout.prop(settings,'custom_object',text='源网格')
     else:
@@ -423,6 +422,7 @@ def _draw_generation(layout,context,settings):
         layout.label(text=iface('实际面数：{quality}').format(quality=iface(labels.get(quality,quality))),translate=False)
         if settings.shape in {'CAPSULE','SPHERE'}:layout.prop(settings,'radius',text='半径')
         if settings.shape!='SPHERE':layout.prop(settings,'length_ratio',text='骨长比例')
+        draw_inline_fit(layout, context)
         if settings.shape=='BOX':
             row=layout.row(align=True);row.prop(settings,'box_width',text='宽');row.prop(settings,'box_depth',text='深')
     op=layout.operator('ppf.bone_proxy_generate',text='按当前参数更新范围',icon='FILE_REFRESH')
@@ -652,9 +652,8 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
         authoring.enabled = context.mode in {'POSE', 'OBJECT'} and bool(selected)
         authoring.operator_context = 'INVOKE_DEFAULT'
         row = authoring.row(align=True)
-        row.operator('ppf.import_mmd_physics', text='导入代理').import_mode = 'NATIVE'
-        row.operator('ppf.import_mmd_physics', text='导入代理 + Joint').import_mode = 'MMD'
-        authoring.operator('ppf.fit_bone_proxies_to_weights', text='按蒙皮权重拟合代理', icon='MOD_ARMATURE')
+        row.operator('ppf.import_mmd_physics', text='MMD 导入代理').import_mode = 'NATIVE'
+        row.operator('ppf.import_mmd_physics', text='MMD 导入代理 + 关节').import_mode = 'MMD'
         if not editor_active(context):
             op=editor.operator('ppf.bone_editor_action',text='添加 / 更新代理' if count else '添加 / 更新整个骨架',icon='FILE_REFRESH')
             op.action='UPDATE';op.scope=scope if count else 'ALL'

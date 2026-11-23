@@ -6,7 +6,7 @@ from ..models.restoring_curves import COMMON_ANGULAR_FREQUENCY_HZ, COMMON_DAMPIN
 
 COMMON_FREQUENCY_HZ = 10.0
 # Uncalibrated defaults for newly created ordinary Native proxy joints only.
-NEW_NATIVE_ANGULAR_HZ = {'twist_x': 4.0, 'swing_y': 3.0, 'swing_z': 3.0}
+NEW_NATIVE_ANGULAR_HZ = {'twist_x': 3.5, 'swing_y': 2.7, 'swing_z': 2.7}
 
 
 def _commit(state, mode, document):

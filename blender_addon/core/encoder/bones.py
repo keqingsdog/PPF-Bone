@@ -456,7 +456,7 @@ def prepare_transport_bones(context, state, fps, start_frame, *, cone_restoring_
     )
     from .automatic_parent_anchors import prepare_parent_track
     from ...models.restoring_curves import mmd_automatic_angular_channels
-    source = collect_bindings(context)
+    source = collect_bindings(context, project_author_pose=True)
     from ..cross_links import encode as encode_cross_links, collision_pairs
     cross_links = encode_cross_links(context, source['bindings'])
     cross_collision_pairs = collision_pairs(context, source['bindings'])

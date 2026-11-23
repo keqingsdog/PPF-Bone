@@ -8,6 +8,7 @@ import math
 import json
 from contextlib import contextmanager
 from copy import deepcopy
+from functools import lru_cache
 
 import bpy
 from bpy.app.handlers import persistent
@@ -111,8 +112,20 @@ def time_driven_bones(arm):
                     'delta_rotation_euler', 'delta_rotation_quaternion',
                     'delta_scale'} for path in paths):
         return {bone.name for bone in arm.data.bones}
-    prefixes = {bone.name: arm.pose.bones[bone.name].path_from_id() + '.' for bone in arm.data.bones}
-    direct = {name for name, prefix in prefixes.items() if any(path.startswith(prefix) for path in paths)}
+    # Prefixes end in a literal separator. Checking each path once preserves
+    # Blender's escaped bone-name paths without comparing every bone to every curve.
+    direct = set()
+    if paths:
+        by_prefix = {arm.pose.bones[bone.name].path_from_id() + '.': bone.name
+                     for bone in arm.data.bones}
+        for path in paths:
+            if not path.startswith('pose.bones['):
+                continue
+            for i, char in enumerate(path):
+                if char == '.':
+                    name = by_prefix.get(path[:i + 1])
+                    if name is not None:
+                        direct.add(name)
     names = set(direct)
     for bone in arm.data.bones:
         if any(parent.name in direct for parent in bone.parent_recursive):
@@ -151,12 +164,22 @@ def _authored_signature_changed(scene, arm, old, current):
                 and observed[:4] == (scene.session_uid, arm.session_uid, scene.frame_current, scene.frame_subframe)
                 and observed[4] != current[0])
 
-def _rows(scene, *, validate=True, skip_animated=False):
+def _rows(scene, *, validate=True, skip_animated=False, preview_inventory=False):
     from ..models.bone_bindings import validate_proxy_owner, armature_data_owner_counts
     data_owners = armature_data_owner_counts() if validate else None
-    from ..ops.bone_proxy import owned_bone_material
-    from ..models.groups import iterate_active_object_groups
+    from ..ops.bone_proxy import owned_bone_material, _owned_bone_material
+    from ..models.groups import iterate_active_object_groups, iterate_object_groups
+    from collections import Counter, defaultdict
     uuid_counts = {}
+    if validate and preview_inventory:
+        groups = {}
+        for group in iterate_object_groups(scene):
+            groups.setdefault(group.uuid, group)
+        scene_users = Counter(obj.as_pointer() for sc in bpy.data.scenes for obj in sc.objects)
+        arms_by_uuid = defaultdict(list)
+        for obj in bpy.data.objects:
+            if obj.type == 'ARMATURE':
+                arms_by_uuid[obj.ppf_armature_uuid].append(obj)
     if validate:
         for group in iterate_active_object_groups(scene):
             uuid_counts[group.uuid] = uuid_counts.get(group.uuid, 0) + 1
@@ -164,6 +187,9 @@ def _rows(scene, *, validate=True, skip_animated=False):
         if arm.type != 'ARMATURE' or arm.mode == 'EDIT':
             continue
         driven = time_driven_bones(arm) if skip_animated else ()
+        if validate and preview_inventory:
+            proxy_refs = Counter(proxy.as_pointer() for bone in arm.data.bones
+                                 if (proxy := bone.ppf_bone_physics.proxy) is not None)
         for bone in arm.data.bones:
             settings = bone.ppf_bone_physics
             proxy = settings.proxy
@@ -187,12 +213,18 @@ def _rows(scene, *, validate=True, skip_animated=False):
                                 'preview_color': tuple(settings.preview_color)}}
             if not settings.enabled or proxy is None or proxy.mode == 'EDIT':
                 continue
-            if scene.objects.get(proxy.name) != proxy or len(proxy.users_scene) != 1:
+            if (scene.objects.get(proxy.name) != proxy or
+                    (scene_users[proxy.as_pointer()] if validate and preview_inventory else len(proxy.users_scene)) != 1):
                 continue
             try:
                 if validate:
-                    validate_proxy_owner(arm, bone, data_owner_counts=data_owners)
-                    group = owned_bone_material(scene, arm, bone)
+                    if preview_inventory:
+                        group = _owned_bone_material(scene, arm, bone, groups=groups,
+                                                     data_owner_counts=data_owners, scene_user_counts=scene_users,
+                                                     proxy_counts=proxy_refs, arms_by_uuid=arms_by_uuid)
+                    else:
+                        validate_proxy_owner(arm, bone, data_owner_counts=data_owners)
+                        group = owned_bone_material(scene, arm, bone)
                     if group is None or uuid_counts.get(group.uuid) != 1:
                         continue
                 pose = arm.pose.bones.get(bone.name)
@@ -224,7 +256,7 @@ def _transform_active(scene):
     return False
 
 
-def _save_author_record(settings, proxy, bone_world, proxy_world, rest, bone_name=None):
+def _save_author_record(settings, proxy, bone_world, proxy_world, rest, bone_name=None, *, offset=None):
     """Store only primitive author data; Blender Undo restores it with the proxy."""
     def rows(matrix):
         return [float(v) for row in matrix for v in row]
@@ -233,7 +265,7 @@ def _save_author_record(settings, proxy, bone_world, proxy_world, rest, bone_nam
         'version': 1, 'armature_uuid': proxy.get('ppf_armature_uuid', ''),
         'bone_uuid': settings.bone_uuid, 'body_uuid': settings.body_uuid,
         'bone_world': rows(bone_world), 'proxy_world': rows(proxy_world),
-        'offset': rows(bone_world.inverted() @ proxy_world),
+        'offset': rows(bone_world.inverted() @ proxy_world if offset is None else offset),
         'arm_world': rows(rest[0]), 'rest_head': list(rest[1]), 'rest_tail': list(rest[2]),
     }, separators=(',', ':'))
     if proxy.get(_AUTHOR_RECORD) != value:
@@ -241,13 +273,21 @@ def _save_author_record(settings, proxy, bone_world, proxy_world, rest, bone_nam
 
 
 def _load_author_record(settings, proxy):
+    try:
+        return _decode_author_record(proxy.get(_AUTHOR_RECORD, ''), proxy.get('ppf_armature_uuid'),
+                                     settings.bone_uuid, settings.body_uuid)
+    except (AttributeError, KeyError, TypeError, ValueError, RuntimeError):
+        return None
+
+
+def _decode_author_record(raw, armature_uuid, bone_uuid, body_uuid):
     from mathutils import Matrix, Vector
     try:
-        record = json.loads(proxy.get(_AUTHOR_RECORD, ''))
-        if (record.get('version') != 1 or not settings.bone_uuid or not settings.body_uuid
-                or record.get('armature_uuid') != proxy.get('ppf_armature_uuid')
-                or record.get('bone_uuid') != settings.bone_uuid
-                or record.get('body_uuid') != settings.body_uuid):
+        record = json.loads(raw)
+        if (record.get('version') != 1 or not bone_uuid or not body_uuid
+                or record.get('armature_uuid') != armature_uuid
+                or record.get('bone_uuid') != bone_uuid
+                or record.get('body_uuid') != body_uuid):
             return None
         def matrix(name):
             values = record[name]
@@ -264,6 +304,24 @@ def _load_author_record(settings, proxy):
         return (bone, proxy_matrix, offset), (arm, head, tail)
     except (AttributeError, KeyError, TypeError, ValueError, RuntimeError):
         return None
+
+
+@lru_cache(maxsize=256)
+def _cached_display_offset(raw, armature_uuid, bone_uuid, body_uuid):
+    """Return immutable decoded content only; never retain Blender IDs or pose."""
+    record = _decode_author_record(raw, armature_uuid, bone_uuid, body_uuid)
+    return tuple(tuple(row) for row in record[0][2]) if record is not None else None
+
+
+def display_author_offset(settings, proxy, raw):
+    armature_uuid = proxy.get('ppf_armature_uuid')
+    if isinstance(raw, str) and len(raw) <= 8192 and isinstance(armature_uuid, str):
+        from mathutils import Matrix
+        offset = _cached_display_offset(raw, armature_uuid, settings.bone_uuid, settings.body_uuid)
+        return Matrix(offset) if offset is not None else None
+    # Non-string/corrupt/oversized author records follow the same evaluator.
+    record = _decode_author_record(raw, armature_uuid, settings.bone_uuid, settings.body_uuid)
+    return record[0][2] if record is not None else None
 
 
 def read_author_offset(scene, arm, bone, *, owner_snapshot=None):
@@ -587,7 +645,7 @@ def _preview_pose(context):
     scene = context.scene
     pose_arms = {obj.as_pointer() for obj in scene.objects
                  if obj.type == 'ARMATURE' and obj.mode == 'POSE'}
-    rows = list(_rows(scene))  # Ownership is resolved afresh on every tick.
+    rows = list(_rows(scene, preview_inventory=True))  # One shared, fresh proof per tick.
     valid = {key for key, *_rest in rows}
     for key in list(_pose_preview):
         if key[0] == scene.as_pointer() and key not in valid:
@@ -686,6 +744,7 @@ def _sync_steps(context, *, transfer=False):
             _pose_preview.pop(key, None)
     plans = []
     frozen_offsets = {}
+    exact_offsets = {}
     for key, settings, proxy, bone_world, proxy_world, rest in rows:
         previous = _seen.get(key)
         if previous is None:
@@ -746,17 +805,22 @@ def _sync_steps(context, *, transfer=False):
             bake = length_bake if bake is None else bake @ length_bake
         if not _finite_invertible(target):
             return 0
+        if bake is None and length_bake is None:
+            if key in frozen_offsets:
+                exact_offsets[key] = frozen_offsets[key]
+            elif not moved and previous is not None:
+                exact_offsets[key] = previous[2]
         if moved or not _close(target, proxy_world) or bake is not None:
             plans.append((key, proxy, bone_world, proxy_world, target, bake))
     if not plans:
         for key, _settings, _proxy, bone_world, proxy_world, rest in rows:
-            offset = frozen_offsets.get(key, bone_world.inverted() @ proxy_world)
+            offset = exact_offsets.get(key, bone_world.inverted() @ proxy_world)
             _seen[key] = (bone_world.copy(), proxy_world.copy(), offset)
             _rest_seen[key] = rest
             _record_row_signature(scene, key, _proxy)
             _pose_preview.pop(key, None)
             if key not in _unproven:
-                _save_author_record(_settings, _proxy, bone_world, proxy_world, rest, key[2])
+                _save_author_record(_settings, _proxy, bone_world, proxy_world, rest, key[2], offset=offset)
         return 0
     communicator.assert_bone_body_switch_idle()
     staged = []
@@ -801,13 +865,13 @@ def _sync_steps(context, *, transfer=False):
         actual = proxy.matrix_world.copy()
         # Once any scale is baked, the new unit-scale mesh owns that scale.
         # Persist the committed raw offset, never a transient preview matrix.
-        offset = bone_world.inverted() @ actual
+        offset = exact_offsets.get(key, bone_world.inverted() @ actual)
         _seen[key] = (bone_world.copy(), actual, offset)
         _rest_seen[key] = rest
         _record_row_signature(scene, key, proxy)
         _pose_preview.pop(key, None)
         if key not in _unproven:
-            _save_author_record(_settings, proxy, bone_world, actual, rest, key[2])
+            _save_author_record(_settings, proxy, bone_world, actual, rest, key[2], offset=offset)
     return len(plans)
 
 

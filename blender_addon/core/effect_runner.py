@@ -1568,6 +1568,10 @@ class EffectRunner:
                         return
                 with self._collision_lock:
                     drifted = self._body_retransfer or self._collision_retransfer
+                if drifted and ol:
+                    # Automatic preview cannot consume the retired scene. Leave
+                    # the retransfer latch intact; explicit Fetch still reports.
+                    return
                 if drifted:
                     # A PROVED current-author edit. Refuse synchronously, BEFORE any
                     # frame worker is queued: the later auto-query that used to raise
@@ -2497,7 +2501,14 @@ class EffectRunner:
                 command = request.get("request") if request else None
                 # Show project status on a cold connection. Actions that use
                 # the result still rebuild and validate the local expectation.
-                inspect_only = command not in _SCENE_QUERY_COMMANDS and self._cold_expectation_pending()
+                with self._collision_lock:
+                    drifted = self._body_retransfer or self._collision_retransfer
+                # A background heartbeat reports server state, not permission to
+                # consume its frames. Explicit queries and commands still validate;
+                # automatic preview independently refuses the retired authorship.
+                background_drift = not request and status_query_id is None and drifted
+                inspect_only = background_drift or (
+                    command not in _SCENE_QUERY_COMMANDS and self._cold_expectation_pending())
                 if not inspect_only and not self._collision_validate(response, ticket, query_id=status_query_id):
                     self._cancel_status_query(status_query_id)
                     return

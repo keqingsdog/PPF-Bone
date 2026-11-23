@@ -433,7 +433,7 @@ def _encode_intersection_allowance(group, spec, object_uuids):
     }
 
 
-def group_contact_lengths(group, scale: float = 1.0) -> tuple[float, float]:
+def group_contact_lengths(group, scale: float = 1.0, *, projected_proxy=None) -> tuple[float, float]:
     """``(contact gap, contact offset)`` of ``group``, times ``scale``.
 
     The one resolver for these two lengths: the encoder asks with the world
@@ -451,7 +451,7 @@ def group_contact_lengths(group, scale: float = 1.0) -> tuple[float, float]:
 
         return group.contact_gap * scale, sand_seeded_radius(group) * scale
     if group.use_group_bounding_box_diagonal:
-        bbox_diagonal = compute_group_bounding_box_diagonal(group) * scale
+        bbox_diagonal = compute_group_bounding_box_diagonal(group, projected_proxy=projected_proxy) * scale
         return (bbox_diagonal * group.contact_gap_rat,
                 bbox_diagonal * group.contact_offset_rat)
     return group.contact_gap * scale, group.contact_offset * scale
@@ -460,6 +460,8 @@ def group_contact_lengths(group, scale: float = 1.0) -> tuple[float, float]:
 def _encode_group_params(context, groups, state, fps, start_frame):
     """Encode per-group material parameters."""
     from ..uuid_registry import resolve_assigned
+    from .proxy_start import projection_lookup
+    projected_proxy = projection_lookup(context.scene)
     group_params = []
     for group in groups:
         for assigned in group.assigned_objects:
@@ -723,7 +725,7 @@ def _encode_group_params(context, groups, state, fps, start_frame):
         # World-space lengths, scaled like the geometry: the solver shrinks
         # the mesh by world_scaling on ingest (and collider thickness with it).
         contact_gap_value, contact_offset_value = group_contact_lengths(
-            group, state.world_scaling,
+            group, state.world_scaling, projected_proxy=projected_proxy,
         )
 
         # A tracked captured deformation streams the rest shape every frame and

@@ -5,7 +5,7 @@ import struct
 import uuid
 from contextlib import contextmanager
 import bpy
-from bpy.props import FloatProperty, StringProperty, EnumProperty
+from ..i18n.props import FloatProperty, StringProperty, EnumProperty
 from mathutils import Matrix, Vector
 from . import bone_proxy
 from ..models.bone_bindings import bone_world_matrix
@@ -463,6 +463,7 @@ def _selection_identity(context, arm, rows):
 class PPF_OT_ImportMMDPhysics(bpy.types.Operator):
     bl_idname = 'ppf.import_mmd_physics'
     bl_label = '导入选中骨骼的 MMD 物理'
+    bl_description = 'In Blender, enable MMD Tools and import a model with its original rigid bodies. Build PPF proxies for selected bones; + Joint also imports MMD joint constraints. If MMD physics is built, clean it in MMD Tools first.'
     bl_options = {'REGISTER', 'UNDO'}
 
     import_mode: EnumProperty(items=[('NATIVE', '原生', ''), ('MMD', 'MMD Joint', '')], default='NATIVE', options={'SKIP_SAVE'})

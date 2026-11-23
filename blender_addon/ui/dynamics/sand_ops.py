@@ -350,6 +350,7 @@ class OBJECT_OT_ConvertToParticleMesh(Operator):
             icon="INFO",
         )
         layout.prop(self, "rng")
+        layout.label(text="Apply object scale before converting for best results.", icon="INFO")
         warn = layout.column()
         warn.alert = True
         warn.label(text="Destructive: original faces are discarded", icon="ERROR")

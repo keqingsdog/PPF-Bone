@@ -10,10 +10,10 @@ PPF-Bone 是由 keqingsdog 维护的独立骨骼物理分支与发行版。它�
 
 ### 安装和使用
 
-**当前下载：** Blender 插件 **1.0.66**；Windows x64 求解器 **2026.11.22**。插件和求解器分别发版。
+**当前下载：** Blender 插件 **1.0.67**；Windows x64 求解器 **2026.11.22**。插件和求解器分别发版。
 
 1. 下载并解压 [Windows x64 求解器 ZIP（CPU / CUDA）](https://github.com/keqingsdog/PPF-Bone/releases/download/solver-2026.11.22/PPF-Bone-Solver-Windows-x64-CPU-CUDA-20261122.zip)，其中包含便携 Python。
-2. 下载 [Blender 插件 1.0.66 ZIP](https://github.com/keqingsdog/PPF-Bone/releases/download/v1.0.66/PPF-Bone-Blender-1.0.66.zip)。在 Blender 中使用“从磁盘安装”，然后在插件设置中将求解器路径指向上一步解压后的文件夹。
+2. 下载 [Blender 插件 1.0.67 ZIP](https://github.com/keqingsdog/PPF-Bone/releases/download/v1.0.67/PPF-Bone-Blender-1.0.67.zip)。在 Blender 中使用“从磁盘安装”，然后在插件设置中将求解器路径指向上一步解压后的文件夹。
 3. 配置骨骼代理和连接，传输场景并运行模拟，再获取结果和烘焙动画。
 
 本分支发布的预编译求解器仅支持 Windows x64，目前没有 Linux 或 macOS 的预编译求解器。
@@ -26,10 +26,10 @@ In Blender, create rigid or soft proxies for individual bones, connect bone chai
 
 ### Installation and use
 
-**Current downloads:** Blender add-on **1.0.66**; Windows x64 solver **2026.11.22**. The add-on and solver have separate releases.
+**Current downloads:** Blender add-on **1.0.67**; Windows x64 solver **2026.11.22**. The add-on and solver have separate releases.
 
 1. Download and extract the [Windows x64 solver ZIP (CPU / CUDA)](https://github.com/keqingsdog/PPF-Bone/releases/download/solver-2026.11.22/PPF-Bone-Solver-Windows-x64-CPU-CUDA-20261122.zip), which includes portable Python.
-2. Download the [Blender add-on 1.0.66 ZIP](https://github.com/keqingsdog/PPF-Bone/releases/download/v1.0.66/PPF-Bone-Blender-1.0.66.zip). In Blender, choose Install from Disk, then point the solver path in the add-on settings to the folder extracted in step 1.
+2. Download the [Blender add-on 1.0.67 ZIP](https://github.com/keqingsdog/PPF-Bone/releases/download/v1.0.67/PPF-Bone-Blender-1.0.67.zip). In Blender, choose Install from Disk, then point the solver path in the add-on settings to the folder extracted in step 1.
 3. Configure bone proxies and connections, transfer the scene and run the simulation, then fetch the results and bake animation.
 
 Prebuilt solver releases from this fork support Windows x64 only. No prebuilt Linux or macOS solver is provided by this fork.
