@@ -1,4 +1,8 @@
 {
+  "Reset": "リセット",
+  "Reset PCG Tolerance": "PCG 許容誤差をリセット",
+  "Restore the PCG tolerance to 0.001.": "PCG 許容誤差を 0.001 に戻します。",
+  "Recommended PCG tolerance: 0.01 or less.": "推奨 PCG 許容誤差は 0.01 以下です。",
   "Capture Bone Motion (Preview)": "ボーンの動きをキャプチャ（プレビュー）",
   "Abort Bone Capture": "ボーンプレビューを中止",
   "Include Bone Preview": "ボーンのプレビューを含める",
@@ -2948,5 +2952,18 @@
   "无可续算状态：启用完成时保存状态后重新运行": "",
   "Animation data fetch failed.": "",
   "Migration failed: {error}; copied data retained at {path}": "",
-  "FP32": ""
+  "FP32": "",
+  "Start a new simulation from the scene transferred to the solver.": "",
+  "Continue the simulation from a saved state on the solver.": "",
+  "Choose a saved frame to resume or extend the simulation. Earlier frames are kept; later frames are recomputed.": "",
+  "Download all available simulation frames from the solver for local playback or baking.": "",
+  "Delete the connected solver’s data for this project, including uploaded inputs, simulation results, and saved states.": "",
+  "In Blender, enable MMD Tools and import a model with its original rigid bodies. Build PPF proxies for selected bones; + Joint also imports MMD joint constraints. If MMD physics is built, clean it in MMD Tools first.": "",
+  "MMD 导入代理": "",
+  "MMD 导入代理 + 关节": "",
+  "Precision Fit": "",
+  "Try to follow concave details where the source supports it. If a valid proxy cannot be built, use the convex fit and report the fallback.": "",
+  "Precision Fit fell back to convex fitting for {bones}; the selected skin or triangle budget did not meet the precision checks.": "",
+  "Precision Fit could not repair {bone} at its current contact offset while preserving the contour and coverage; no proxies were changed.": "",
+  "Precision Fit repaired local face clearance for {bones} without changing contact offset.": ""
 }

@@ -767,7 +767,7 @@ class SOLVER_PT_SolverPanel(Panel):
 
         if com.info.status == RemoteStatus.WAITING_FOR_DATA and has_dynamic and SOLVER_OT_Transfer.poll(context):
             row = box.row()
-            row.label(text="Click \"Transfer\" to upload data", icon="INFO")
+            row.label(text=iface_("Click \"Transfer\" to upload data"), icon="INFO")
 
         # Warn when local animation is the only blocker for Run
         if SOLVER_OT_ClearAnimation.poll(context):
@@ -809,7 +809,7 @@ class SOLVER_PT_SolverPanel(Panel):
         if has_bones(context):
             bone_note = box.column(align=True)
             bone_note.label(text="Bone preview is not cached.", icon="INFO")
-            bone_note.label(text="Transfer samples bones again.")
+            bone_note.label(text=iface_("Transfer samples bones again."))
         if standalone_progress(context) is not None:
             draw_preview_controls(box, context)
         _draw_bulk_capture_modes(box, context)
@@ -1189,6 +1189,7 @@ class SOLVER_OT_Run(AsyncOperator):
 
     bl_idname = "solver.run"
     bl_label = "Run"
+    bl_description = "Start a new simulation from the scene transferred to the solver."
 
     timeout: float = 86400.0  # 24 hours for long simulations
     auto_redraw: bool = True
@@ -1349,6 +1350,7 @@ class SOLVER_OT_Resume(AsyncOperator):
 
     bl_idname = "solver.resume"
     bl_label = "Resume"
+    bl_description = "Continue the simulation from a saved state on the solver."
 
     timeout: float = 86400.0  # 24 hours for long simulations
     auto_redraw: bool = True
@@ -1491,6 +1493,7 @@ class SOLVER_OT_ResumeFrom(AsyncOperator):
 
     bl_idname = "solver.resume_from"
     bl_label = "Resume"
+    bl_description = "Choose a saved frame to resume or extend the simulation. Earlier frames are kept; later frames are recomputed."
     twist_upgrade: BoolProperty(name="连续累计扭转", default=False, options={'HIDDEN', 'SKIP_SAVE'})
 
     timeout: float = 120.0
@@ -2708,6 +2711,7 @@ class SOLVER_OT_FetchData(AsyncOperator):
 
     bl_idname = "solver.fetch_remote_data"
     bl_label = "Fetch All Animation"
+    bl_description = "Download all available simulation frames from the solver for local playback or baking."
 
     timeout: float = 600.0
     auto_redraw: bool = True
@@ -2797,6 +2801,7 @@ class SOLVER_OT_DeleteRemoteData(AsyncOperator):
 
     bl_idname = "solver.delete_remote_data"
     bl_label = "Delete Remote Data"
+    bl_description = "Delete the connected solver’s data for this project, including uploaded inputs, simulation results, and saved states."
 
     timeout: float = 60.0
     auto_redraw: bool = True

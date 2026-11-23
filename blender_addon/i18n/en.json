@@ -1,4 +1,8 @@
 {
+  "Reset": "Reset",
+  "Reset PCG Tolerance": "Reset PCG Tolerance",
+  "Restore the PCG tolerance to 0.001.": "Restore the PCG tolerance to 0.001.",
+  "Recommended PCG tolerance: 0.01 or less.": "Recommended PCG tolerance: 0.01 or less.",
   "Capture Bone Motion (Preview)": "Capture Bone Motion (Preview)",
   "Abort Bone Capture": "Abort Bone Capture",
   "Include Bone Preview": "Include Bone Preview",
@@ -2835,7 +2839,7 @@
   "代理编辑模式": "代理编辑模式",
   "选物理骨骼": "选物理骨骼",
   "按碰撞组选骨": "按碰撞组选骨",
-  "按蒙皮权重拟合代理": "按蒙皮权重拟合代理",
+  "按蒙皮权重拟合代理": "Fit Proxies to Skin Weights",
   "T 循环形状 · 自定义源齐全时加入": "T 循环形状 · 自定义源齐全时加入",
   "按参数重建形状": "按参数重建形状",
   "已保存的硬关节不再支持；请显式选择柔性关节": "已保存的硬关节不再支持；请显式选择柔性关节",
@@ -2946,5 +2950,18 @@
   "无可续算状态：启用完成时保存状态后重新运行": "无可续算状态：启用完成时保存状态后重新运行",
   "Animation data fetch failed.": "Animation data fetch failed.",
   "Migration failed: {error}; copied data retained at {path}": "Migration failed: {error}; copied data retained at {path}",
-  "FP32": "FP32"
+  "FP32": "FP32",
+  "Start a new simulation from the scene transferred to the solver.": "Start a new simulation from the scene transferred to the solver.",
+  "Continue the simulation from a saved state on the solver.": "Continue the simulation from a saved state on the solver.",
+  "Choose a saved frame to resume or extend the simulation. Earlier frames are kept; later frames are recomputed.": "Choose a saved frame to resume or extend the simulation. Earlier frames are kept; later frames are recomputed.",
+  "Download all available simulation frames from the solver for local playback or baking.": "Download all available simulation frames from the solver for local playback or baking.",
+  "Delete the connected solver’s data for this project, including uploaded inputs, simulation results, and saved states.": "Delete the connected solver’s data for this project, including uploaded inputs, simulation results, and saved states.",
+  "In Blender, enable MMD Tools and import a model with its original rigid bodies. Build PPF proxies for selected bones; + Joint also imports MMD joint constraints. If MMD physics is built, clean it in MMD Tools first.": "In Blender, enable MMD Tools and import a model with its original rigid bodies. Build PPF proxies for selected bones; + Joint also imports MMD joint constraints. If MMD physics is built, clean it in MMD Tools first.",
+  "MMD 导入代理": "MMD Import Proxies",
+  "MMD 导入代理 + 关节": "MMD Import Proxies + Joints",
+  "Precision Fit": "Precision Fit",
+  "Try to follow concave details where the source supports it. If a valid proxy cannot be built, use the convex fit and report the fallback.": "Try to follow concave details where the source supports it. If a valid proxy cannot be built, use the convex fit and report the fallback.",
+  "Precision Fit fell back to convex fitting for {bones}; the selected skin or triangle budget did not meet the precision checks.": "Precision Fit fell back to convex fitting for {bones}; the selected skin or triangle budget did not meet the precision checks.",
+  "Precision Fit could not repair {bone} at its current contact offset while preserving the contour and coverage; no proxies were changed.": "Precision Fit could not repair {bone} at its current contact offset while preserving the contour and coverage; no proxies were changed.",
+  "Precision Fit repaired local face clearance for {bones} without changing contact offset.": "Precision Fit repaired local face clearance for {bones} without changing contact offset."
 }

@@ -365,6 +365,13 @@ def _model_matrix(context, proxy, depsgraph):
 
 
 
+def _scene_user_counts():
+    # Exactly the inverse of Object.users_scene. No retained RNA, and no
+    # sharing the inventory across viewport evaluation barriers.
+    from collections import Counter
+    return Counter(obj.as_pointer() for scene in bpy.data.scenes for obj in scene.objects)
+
+
 def _cross_link_segments(context, depsgraph=None, plan=None, *, binding_rows=None):
     """Copy schematic anchors into world coordinates in the stable producer.
 
@@ -377,6 +384,7 @@ def _cross_link_segments(context, depsgraph=None, plan=None, *, binding_rows=Non
     from ..models.bone_bindings import armature_data_owner_counts
     data_owners = armature_data_owner_counts()
     groups = {g.uuid: g for g in iterate_object_groups(context.scene)}
+    scene_users = _scene_user_counts()
     visible = {}
     for proxy, model, selected, owner in (bindings(context) if binding_rows is None else binding_rows):
         group = groups.get(owner.group_uuid)
@@ -385,7 +393,7 @@ def _cross_link_segments(context, depsgraph=None, plan=None, *, binding_rows=Non
                 or len(group.assigned_objects) != 1
                 or group.assigned_objects[0].uuid != owner.body_uuid
                 or not group.assigned_objects[0].included
-                or len(proxy.users_scene) != 1):
+                or scene_users[proxy.as_pointer()] != 1):
             continue
         key = (proxy.get('ppf_armature_uuid'), owner.bone_uuid)
         visible[key] = bool(selected)
@@ -395,7 +403,7 @@ def _cross_link_segments(context, depsgraph=None, plan=None, *, binding_rows=Non
     result = []
     for arm in arms:
         if (arm_counts[arm.ppf_armature_uuid] != 1 or arm.library or arm.data.library
-                or data_owners[arm.data.as_pointer()] != 1 or len(arm.users_scene) != 1):
+                or data_owners[arm.data.as_pointer()] != 1 or scene_users[arm.as_pointer()] != 1):
             continue
         bones = {}
         duplicates = set()
@@ -495,10 +503,11 @@ def _pose_display_matrices(context, depsgraph, *, allow_cache=True, targets=None
     index = rigid_pose._cache.get(key) if key else None
     bindings = (index or {}).get('receipt', {}).get('bindings', ()) if allow_cache else ()
     cached = {(r['armature_uuid'], r['bone_uuid'], r['body_uuid']) for r in bindings}
+    scene_users = _scene_user_counts()
     for arm in context.scene.objects:
         if arm.type != 'ARMATURE' or arm.mode == 'EDIT':
             continue
-        if arm.library or arm.data.library or len(arm.users_scene) > 1 or data_owners[arm.data.as_pointer()] > 1:
+        if arm.library or arm.data.library or scene_users[arm.as_pointer()] > 1 or data_owners[arm.data.as_pointer()] > 1:
             continue
         proxy_counts = Counter(b.ppf_bone_physics.proxy.as_pointer() for b in arm.data.bones if b.ppf_bone_physics.proxy)
         driven = follow.time_driven_bones(arm)
@@ -520,7 +529,7 @@ def _pose_display_matrices(context, depsgraph, *, allow_cache=True, targets=None
                 targets.add(proxy.as_pointer())
             try:
                 owner = proxy_parent_armature(proxy)
-                valid = (context.scene.objects.get(proxy.name) == proxy and len(proxy.users_scene) <= 1
+                valid = (context.scene.objects.get(proxy.name) == proxy and scene_users[proxy.as_pointer()] <= 1
                          and proxy_counts[proxy.as_pointer()] == 1 and proxy.get('ppf_bone_proxy_owned')
                          and proxy.get('ppf_bone_uuid') == settings.bone_uuid
                          and proxy.get('ppf_armature_uuid') == arm.ppf_armature_uuid
@@ -528,10 +537,11 @@ def _pose_display_matrices(context, depsgraph, *, allow_cache=True, targets=None
                          and (owner == arm or (owner is None and arm_counts[arm.ppf_armature_uuid] == 1)))
                 if not valid:
                     continue
-                record = follow._load_author_record(settings, proxy)
+                raw_record = proxy.get(follow._AUTHOR_RECORD)
+                offset = follow.display_author_offset(settings, proxy, raw_record)
                 row_key = (context.scene.as_pointer(), arm.as_pointer(), bone.name, proxy.as_pointer())
-                if record is not None:
-                    offset, authority = record[0][2], 'durable'
+                if offset is not None:
+                    authority = 'durable'
                 elif row_key in follow._seen and row_key not in follow._unproven:
                     offset, authority = follow._seen[row_key][2], 'baseline'
                 else:
@@ -549,7 +559,7 @@ def _pose_display_matrices(context, depsgraph, *, allow_cache=True, targets=None
             if follow._finite_invertible(matrix):
                 result[proxy.as_pointer()] = _matrix_token(matrix)
                 if plan is not None:
-                    plan.append((arm.name, arm.session_uid, bone.name, proxy.name, proxy.session_uid, proxy.as_pointer(), settings.bone_uuid, settings.body_uuid, _matrix_token(offset), authority, proxy.get(follow._AUTHOR_RECORD)))
+                    plan.append((arm.name, arm.session_uid, bone.name, proxy.name, proxy.session_uid, proxy.as_pointer(), settings.bone_uuid, settings.body_uuid, _matrix_token(offset), authority, raw_record))
     return result
 
 @persistent
@@ -999,6 +1009,9 @@ def _refresh_snapshots(generation):
                 key, snapshot = result
                 staged[key] = snapshot
     if generation == _generation and _identity_ready():
+        from ..core.bone_scale_preview import forget_view
+        for key in _snapshots.keys() - staged.keys():
+            forget_view(key)
         _snapshots = staged
         for key in tuple(_geometry_snapshots):
             if key not in staged:
@@ -1007,6 +1020,7 @@ def _refresh_snapshots(generation):
         for key in tuple(_gpu_views):
             if key not in staged:
                 _gpu_views.pop(key, None)
+                forget_view(key)
         for key in tuple(_dynamic_reuse):
             if key not in staged:
                 _dynamic_reuse.pop(key, None)
@@ -1154,6 +1168,27 @@ def _dynamic_display_row(packet, viewport, geometry_key):
     return row
 
 
+def scale_handoff_keys(key):
+    """Only serials already eligible for draw or retained in the GPU queue."""
+    view = _gpu_views.get(key, {})
+    snapshots = (_snapshots.get(key), view.get('display'), view.get('latest'), view.get('inflight'))
+    return {item[5] for snapshot in snapshots if snapshot is not None for item in snapshot[1]}
+
+
+def scale_handoff_views(scene_id):
+    views = set(_gpu_views) | set(_snapshots)
+    return {key: scale_handoff_keys(key) for key in views if key[3] == scene_id}
+
+
+def _scale_draw_model(model, geometry_key, active, handoff):
+    identity = geometry_key[0]
+    if active is not None and identity in active:
+        model = model @ active[identity]
+    if handoff is not None and geometry_key in handoff:
+        model = model @ handoff[geometry_key]
+    return model
+
+
 def draw():
     # Completed primitive snapshots only; no retired Mesh/Object/owner reads.
     if _rebuilding or _producer_running or not _registered or not _identity_ready():
@@ -1239,8 +1274,11 @@ def draw():
         gpu.state.blend_set('ALPHA')
         gpu.state.depth_test_set('NONE' if in_front else 'LESS_EQUAL')
         gpu.state.depth_mask_set(False)
-        from ..core.bone_scale_preview import matrices as scale_preview_matrices
-        scale_preview = scale_preview_matrices(key)
+        from ..core import bone_scale_preview
+        scale_preview = bone_scale_preview.matrices(key)
+        handoff = bone_scale_preview.handoff_matrices(key)
+        if handoff:
+            bone_scale_preview.limit_handoff(key, scale_handoff_keys(key))
         for item in sorted(items, key=lambda item: item[4]):
             _positions, _edges, _triangles, color, selected, geometry_key, matrix = item
             identity = geometry_key[0]
@@ -1252,18 +1290,22 @@ def draw():
             if epoch is not None and identity in _frame_known_targets.get(scene_key, ()):
                 if not current or identity not in publication[3]:
                     continue
-                cached = _geometry_snapshots.get(key, {}).get(identity)
-                if cached is None or cached[2] != geometry_key[1]:
-                    continue
-                token = cached[0]
-                if (token[6] != _mesh_revisions.get(token[3], 0)
-                        or token[7] != _object_revisions.get(identity, 0)):
-                    continue
+                # A confirmed resize deliberately bridges this exact old
+                # geometry key while the current pose publication remains valid.
+                # Without a bridge an unconfirmed/outdated key is never drawn.
+                if handoff is None or geometry_key not in handoff:
+                    cached = _geometry_snapshots.get(key, {}).get(identity)
+                    if cached is None or cached[2] != geometry_key[1]:
+                        continue
+                    token = cached[0]
+                    if (token[6] != _mesh_revisions.get(token[3], 0)
+                            or token[7] != _object_revisions.get(identity, 0)):
+                        continue
                 matrix = publication[3][identity]
             with gpu.matrix.push_pop():
                 model = Matrix(tuple(matrix[i:i+4] for i in range(0, 16, 4)))
-                if scale_preview is not None and identity in scale_preview:
-                    model = model @ scale_preview[identity]
+                if scale_preview or handoff:
+                    model = _scale_draw_model(model, geometry_key, scale_preview, handoff)
                 gpu.matrix.multiply_matrix(model)
                 face_batch, edge_batch, source_edges = dynamic_batches or view['batches'][geometry_key]
                 shader.bind()
@@ -1314,6 +1356,8 @@ def _invalidate_snapshots(*, geometry=True):
     _generation += 1
     _snapshots = {}
     if geometry:
+        from ..core.bone_scale_preview import clear_handoffs
+        clear_handoffs()  # The corresponding GPU geometry keys are being retired.
         _geometry_snapshots.clear()
         _known_proxy_meshes.clear()
         _gpu_views.clear()

@@ -8,6 +8,7 @@ import math
 import json
 from contextlib import contextmanager
 from copy import deepcopy
+from functools import lru_cache
 
 import bpy
 from bpy.app.handlers import persistent
@@ -272,13 +273,21 @@ def _save_author_record(settings, proxy, bone_world, proxy_world, rest, bone_nam
 
 
 def _load_author_record(settings, proxy):
+    try:
+        return _decode_author_record(proxy.get(_AUTHOR_RECORD, ''), proxy.get('ppf_armature_uuid'),
+                                     settings.bone_uuid, settings.body_uuid)
+    except (AttributeError, KeyError, TypeError, ValueError, RuntimeError):
+        return None
+
+
+def _decode_author_record(raw, armature_uuid, bone_uuid, body_uuid):
     from mathutils import Matrix, Vector
     try:
-        record = json.loads(proxy.get(_AUTHOR_RECORD, ''))
-        if (record.get('version') != 1 or not settings.bone_uuid or not settings.body_uuid
-                or record.get('armature_uuid') != proxy.get('ppf_armature_uuid')
-                or record.get('bone_uuid') != settings.bone_uuid
-                or record.get('body_uuid') != settings.body_uuid):
+        record = json.loads(raw)
+        if (record.get('version') != 1 or not bone_uuid or not body_uuid
+                or record.get('armature_uuid') != armature_uuid
+                or record.get('bone_uuid') != bone_uuid
+                or record.get('body_uuid') != body_uuid):
             return None
         def matrix(name):
             values = record[name]
@@ -295,6 +304,24 @@ def _load_author_record(settings, proxy):
         return (bone, proxy_matrix, offset), (arm, head, tail)
     except (AttributeError, KeyError, TypeError, ValueError, RuntimeError):
         return None
+
+
+@lru_cache(maxsize=256)
+def _cached_display_offset(raw, armature_uuid, bone_uuid, body_uuid):
+    """Return immutable decoded content only; never retain Blender IDs or pose."""
+    record = _decode_author_record(raw, armature_uuid, bone_uuid, body_uuid)
+    return tuple(tuple(row) for row in record[0][2]) if record is not None else None
+
+
+def display_author_offset(settings, proxy, raw):
+    armature_uuid = proxy.get('ppf_armature_uuid')
+    if isinstance(raw, str) and len(raw) <= 8192 and isinstance(armature_uuid, str):
+        from mathutils import Matrix
+        offset = _cached_display_offset(raw, armature_uuid, settings.bone_uuid, settings.body_uuid)
+        return Matrix(offset) if offset is not None else None
+    # Non-string/corrupt/oversized author records follow the same evaluator.
+    record = _decode_author_record(raw, armature_uuid, settings.bone_uuid, settings.body_uuid)
+    return record[0][2] if record is not None else None
 
 
 def read_author_offset(scene, arm, bone, *, owner_snapshot=None):

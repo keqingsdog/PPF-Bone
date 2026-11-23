@@ -110,12 +110,29 @@ class PPF_OT_TogglePCGToleranceLock(Operator):
     def draw(self, _context):
         self.layout.label(text=iface_("A looser tolerance can speed up the simulation."), icon="INFO")
         self.layout.label(text=iface_("Joint, soft-body and contact animation may change."))
+        self.layout.label(text=iface_("Recommended PCG tolerance: 0.01 or less."))
 
     def execute(self, context):
         if (context.scene is None or
                 getattr(self, "_confirmation_scene_uid", None) != context.scene.session_uid):
             return {"CANCELLED"}
         _pcg_tolerance_unlocked.add(context.scene.session_uid)
+        return {"FINISHED"}
+
+
+class PPF_OT_ResetPCGTolerance(Operator):
+    bl_idname = "ppf.reset_pcg_tolerance"
+    bl_label = "Reset PCG Tolerance"
+    bl_description = "Restore the PCG tolerance to 0.001."
+    bl_options = {"UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return has_addon_data(context.scene)
+
+    def execute(self, context):
+        params = get_addon_data(context.scene).state
+        params.property_unset("cg_tol")
         return {"FINISHED"}
 
 
@@ -131,6 +148,9 @@ def _draw_pcg_tolerance(layout, context, params):
         text=iface_("Lock" if unlocked else "Unlock"),
         icon="UNLOCKED" if unlocked else "LOCKED",
     )
+    row.operator("ppf.reset_pcg_tolerance", text=iface_("Reset"), icon="LOOP_BACK")
+    if unlocked:
+        layout.label(text=iface_("Recommended PCG tolerance: 0.01 or less."), icon="INFO")
 
 
 def _profile_path_exists(path: str) -> bool:
@@ -2689,6 +2709,7 @@ class VISUALIZATION_PT_Visualization(Panel):
 
 classes = (
     PPF_OT_TogglePCGToleranceLock,
+    PPF_OT_ResetPCGTolerance,
     MAIN_PT_SceneConfiguration,
     DYNAMICS_PT_Groups,
     SNAPMERGE_PT_SnapAndMerge,

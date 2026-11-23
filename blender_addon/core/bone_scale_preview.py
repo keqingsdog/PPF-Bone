@@ -5,6 +5,7 @@ from mathutils import Matrix, Vector
 
 # Only the modal operation owning the lease can write this transient packet.
 _packet = None
+_handoffs = {}  # View -> stale immutable GPU geometry key -> display matrix.
 _MAX_FLOAT32 = 3.3e38
 
 
@@ -67,8 +68,50 @@ def matrices(view):
     return packet[2] if packet is not None and packet[1]==view[3] else None
 
 
+def commit_handoff(token, view, drawable_keys):
+    active = _packet
+    if active is None or active[0] is not token or active[1] != view[3]:
+        return
+    previous = _handoffs.get(view, {})
+    staged = {}
+    for key in drawable_keys:
+        older = previous.get(key)
+        change = active[2].get(key[0])
+        if change is not None:
+            staged[key] = change if older is None else change @ older
+        elif older is not None:
+            staged[key] = older
+    if staged:
+        _handoffs[view] = staged
+    else:
+        _handoffs.pop(view, None)
+
+
+def handoff_matrices(view):
+    return _handoffs.get(view)
+
+
+def limit_handoff(view, drawable_keys):
+    pending = _handoffs.get(view)
+    if pending is not None:
+        for key in pending.keys() - drawable_keys:
+            del pending[key]
+        if not pending:
+            _handoffs.pop(view, None)
+
+
+def forget_view(view):
+    _handoffs.pop(view, None)
+
+
+def clear_handoffs():
+    _handoffs.clear()
+
+
 def clear(token=None):
     global _packet
+    if token is None:
+        clear_handoffs()
     if token is None or (_packet is not None and _packet[0] is token):
         scene_id = _packet[1] if _packet is not None else None
         _packet=None

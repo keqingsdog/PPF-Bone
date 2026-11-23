@@ -413,15 +413,18 @@ class PPF_OT_BoneProxyScale(bpy.types.Operator):
             if self._lease is not None:self.cancel(context)
             self.report({'ERROR'},iface_(str(exc)));return {'CANCELLED'}
         _scaler=self;return {'RUNNING_MODAL'}
-    def _finish(self,commit=False):
+    def _finish(self,commit=False,*,handoff_keys=None):
         global _scaler
         from ..core.bone_geometry_edit import finish
-        from ..core.bone_scale_preview import clear
+        from ..core.bone_scale_preview import clear, commit_handoff
         token=getattr(self,'_lease',None)
         # Keep the token and snapshots live if committing fails. The caller can
         # restore author geometry, then release without retiring the old build.
         if token is not None:
-            finish(token,commit=commit)
+            changed=finish(token,commit=commit)
+            if commit and changed and handoff_keys is not None:
+                for view, keys in handoff_keys.items():
+                    commit_handoff(token,view,keys)
             clear(token)
         self._lease=None
         if _scaler is self:_scaler=None
@@ -453,13 +456,17 @@ class PPF_OT_BoneProxyScale(bpy.types.Operator):
             self.cancel(context);return {'CANCELLED'}
         if event.type in {'LEFTMOUSE','RET','NUMPAD_ENTER'} and event.value=='PRESS':
             try:
+                handoff_keys=None
                 if tuple(self.factors)!=(1.,1.,1.):
+                    if self._matrix_preview is not None:
+                        from ..ui.bone_overlay import scale_handoff_views
+                        handoff_keys=scale_handoff_views(self._view_key[3])
                     self._mutated=True
                     apply_geometry(self._snapshots,self.factors,self.orientation,self._matrices)
                 elif self._mutated:
                     restore_geometry(self._snapshots)
                     self._mutated=False
-                self._finish(commit=True)
+                self._finish(commit=True,handoff_keys=handoff_keys)
             except (ValueError,RuntimeError) as exc:
                 self.cancel(context);self.report({'ERROR'},iface_(str(exc)));return {'CANCELLED'}
             except BaseException:
