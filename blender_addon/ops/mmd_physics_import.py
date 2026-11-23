@@ -5,7 +5,7 @@ import struct
 import uuid
 from contextlib import contextmanager
 import bpy
-from bpy.props import FloatProperty, StringProperty, EnumProperty
+from ..i18n.props import FloatProperty, StringProperty, EnumProperty
 from mathutils import Matrix, Vector
 from . import bone_proxy
 from ..models.bone_bindings import bone_world_matrix

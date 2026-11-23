@@ -265,8 +265,8 @@ def get_pc2_dir():
     When the .blend is saved, files are stored under a per-blend subfolder so
     multiple .blend files sharing the same directory don't collide:
         <blend_dir>/data/<blend_basename_noext>/<name>.pc2
-    Before first save, a flat temp dir is used; migrate_pc2_on_save moves
-    those files into the per-blend layout on save_post.
+    Before first save, a flat temp dir is used. The save_pre hook copies
+    owned mesh caches before Blender serializes their references.
     """
     blend_path = bpy.data.filepath if bpy else ""
     if blend_path:
@@ -2101,17 +2101,19 @@ def prepare_mesh_cache_save(filepath, *_args):
     """Copy cache files and install their references before .blend serialization."""
     global _mesh_cache_save
     previous = bpy.data.filepath
-    if not previous or not filepath or os.path.normcase(previous) == os.path.normcase(filepath):
+    if not filepath or os.path.normcase(previous) == os.path.normcase(filepath):
         return
     from .pc2_migration import copy_files_noreplace
     from .single_bake_restore import KEY as single_bake_key
     from .full_bake_restore import KEY as full_bake_key
 
+    first_save = not previous
     previous_dir = os.path.dirname(previous)
     next_dir = os.path.dirname(filepath)
     target = os.path.join(next_dir, "data", os.path.splitext(os.path.basename(filepath))[0])
     same_directory = os.path.normcase(previous_dir) == os.path.normcase(next_dir)
-    source_data = os.path.normcase(os.path.realpath(os.path.join(previous_dir, "data")))
+    source_data = os.path.normcase(os.path.realpath(os.path.join(
+        tempfile.gettempdir() if first_save else previous_dir, "data")))
     recovery_objects = {
         row["obj"].as_pointer()
         for scene in bpy.data.scenes
@@ -2129,9 +2131,17 @@ def prepare_mesh_cache_save(filepath, *_args):
             continue
         original = mod.filepath
         source = os.path.abspath(bpy.path.abspath(original))
-        owned_name = os.path.basename(get_pc2_path(object_pc2_key_readonly(obj)))
-        if source.lower().endswith(".pc2") and os.path.basename(source) == owned_name:
-            under_data = os.path.normcase(os.path.realpath(source)).startswith(source_data + os.sep)
+        key = object_pc2_key_readonly(obj)
+        owned_name = os.path.basename(get_pc2_path(key))
+        if (not first_save or key) and os.path.basename(source) == owned_name:
+            resolved_source = os.path.normcase(os.path.realpath(source))
+            # Before the first save all writer-owned mesh PC2 files are flat;
+            # do not claim another project's or a lookalike relative cache.
+            under_data = (
+                os.path.isabs(original) and not original.startswith("//")
+                and os.path.dirname(resolved_source) == source_data
+                if first_save else resolved_source.startswith(source_data + os.sep)
+            )
             if under_data and os.path.isfile(source) and obj.as_pointer() not in recovery_objects:
                 destination = os.path.join(target, owned_name)
                 if os.path.normcase(source) != os.path.normcase(destination):
@@ -2141,7 +2151,7 @@ def prepare_mesh_cache_save(filepath, *_args):
                 continue
         # A recovery record or an external reference still belongs to its owner.
         # Write a stable path when changing directories, even with remapping off.
-        if not same_directory and original.startswith("//"):
+        if not first_save and not same_directory and original.startswith("//"):
             paths.append((mod, original, source, source))
 
     if not paths:
@@ -2184,14 +2194,12 @@ def rollback_mesh_cache_save(*_args):
 
 @bpy.app.handlers.persistent
 def migrate_pc2_on_save(*_args):
-    """Move PC2 files from temp dir to 'data/' next to .blend after first save.
+    """Finish the mesh save transaction and migrate other cache classes.
 
-    Called from a ``bpy.app.handlers.save_post`` handler.
+    Mesh modifiers must never be retargeted or their sources moved here: the
+    .blend has already been written, even if its pre-save copy was refused.
     """
-    import shutil
     from .statistics_cache import migrate_statistics_on_save
-
-    from .uuid_registry import get_object_uuid
 
     blend_path = bpy.data.filepath
     global _mesh_cache_save
@@ -2223,23 +2231,6 @@ def migrate_pc2_on_save(*_args):
     _capture_project_dir = target_dir
     from .curve_output import migrate_outputs_after_save
     migrate_outputs_after_save()
-    tmp_dir = os.path.realpath(os.path.join(tempfile.gettempdir(), "data"))
-    for obj in bpy.data.objects:
-        if obj.type == "MESH":
-            mod = obj.modifiers.get(MODIFIER_NAME)
-            if mod is None:
-                continue
-            abs_path = os.path.realpath(bpy.path.abspath(mod.filepath))
-            if not abs_path.startswith(tmp_dir + os.sep) and abs_path != tmp_dir:
-                continue
-            if not os.path.exists(abs_path):
-                continue
-            os.makedirs(target_dir, exist_ok=True)
-            filename = os.path.basename(abs_path)
-            new_path = os.path.join(target_dir, filename)
-            shutil.move(abs_path, new_path)
-            mod.filepath = bpy.path.relpath(new_path)
-
 
 
 # ---------------------------------------------------------------------------

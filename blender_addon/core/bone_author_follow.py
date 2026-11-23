@@ -224,7 +224,7 @@ def _transform_active(scene):
     return False
 
 
-def _save_author_record(settings, proxy, bone_world, proxy_world, rest, bone_name=None):
+def _save_author_record(settings, proxy, bone_world, proxy_world, rest, bone_name=None, *, offset=None):
     """Store only primitive author data; Blender Undo restores it with the proxy."""
     def rows(matrix):
         return [float(v) for row in matrix for v in row]
@@ -233,7 +233,7 @@ def _save_author_record(settings, proxy, bone_world, proxy_world, rest, bone_nam
         'version': 1, 'armature_uuid': proxy.get('ppf_armature_uuid', ''),
         'bone_uuid': settings.bone_uuid, 'body_uuid': settings.body_uuid,
         'bone_world': rows(bone_world), 'proxy_world': rows(proxy_world),
-        'offset': rows(bone_world.inverted() @ proxy_world),
+        'offset': rows(bone_world.inverted() @ proxy_world if offset is None else offset),
         'arm_world': rows(rest[0]), 'rest_head': list(rest[1]), 'rest_tail': list(rest[2]),
     }, separators=(',', ':'))
     if proxy.get(_AUTHOR_RECORD) != value:
@@ -686,6 +686,7 @@ def _sync_steps(context, *, transfer=False):
             _pose_preview.pop(key, None)
     plans = []
     frozen_offsets = {}
+    exact_offsets = {}
     for key, settings, proxy, bone_world, proxy_world, rest in rows:
         previous = _seen.get(key)
         if previous is None:
@@ -746,17 +747,22 @@ def _sync_steps(context, *, transfer=False):
             bake = length_bake if bake is None else bake @ length_bake
         if not _finite_invertible(target):
             return 0
+        if bake is None and length_bake is None:
+            if key in frozen_offsets:
+                exact_offsets[key] = frozen_offsets[key]
+            elif not moved and previous is not None:
+                exact_offsets[key] = previous[2]
         if moved or not _close(target, proxy_world) or bake is not None:
             plans.append((key, proxy, bone_world, proxy_world, target, bake))
     if not plans:
         for key, _settings, _proxy, bone_world, proxy_world, rest in rows:
-            offset = frozen_offsets.get(key, bone_world.inverted() @ proxy_world)
+            offset = exact_offsets.get(key, bone_world.inverted() @ proxy_world)
             _seen[key] = (bone_world.copy(), proxy_world.copy(), offset)
             _rest_seen[key] = rest
             _record_row_signature(scene, key, _proxy)
             _pose_preview.pop(key, None)
             if key not in _unproven:
-                _save_author_record(_settings, _proxy, bone_world, proxy_world, rest, key[2])
+                _save_author_record(_settings, _proxy, bone_world, proxy_world, rest, key[2], offset=offset)
         return 0
     communicator.assert_bone_body_switch_idle()
     staged = []
@@ -801,13 +807,13 @@ def _sync_steps(context, *, transfer=False):
         actual = proxy.matrix_world.copy()
         # Once any scale is baked, the new unit-scale mesh owns that scale.
         # Persist the committed raw offset, never a transient preview matrix.
-        offset = bone_world.inverted() @ actual
+        offset = exact_offsets.get(key, bone_world.inverted() @ actual)
         _seen[key] = (bone_world.copy(), actual, offset)
         _rest_seen[key] = rest
         _record_row_signature(scene, key, proxy)
         _pose_preview.pop(key, None)
         if key not in _unproven:
-            _save_author_record(_settings, proxy, bone_world, actual, rest, key[2])
+            _save_author_record(_settings, proxy, bone_world, actual, rest, key[2], offset=offset)
     return len(plans)
 
 

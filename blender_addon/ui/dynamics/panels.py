@@ -28,6 +28,7 @@ from .utils import get_assigned_by_selection_uuid
 from ...models.material_locks import is_locked, lock_name
 from ...models.material_maps import pin_tracks_rest_shape, wants_anisotropic_bending
 from ...core.capabilities import sand_creation_ui
+from ...i18n import iface as _sand_iface
 
 
 def _draw_sand_creation(box, context, capabilities=None, conflict_check=None):
@@ -48,7 +49,7 @@ def _draw_sand_creation(box, context, capabilities=None, conflict_check=None):
         for name, radius in conflict[:3]:
             conv_box.label(text=f"{name}：{radius:g} m")
         if len(conflict) > 3:
-            conv_box.label(text=f"另有 {len(conflict) - 3} 个物体")
+            conv_box.label(text=_sand_iface("另有 {count} 个物体").format(count=len(conflict) - 3), translate=False)
         conv_box.label(text="请统一半径后重新生成沙粒", icon="INFO")
     col = conv_box.column()
     col.enabled = supported and convertible

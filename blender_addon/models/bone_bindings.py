@@ -934,7 +934,7 @@ def hard_settings(settings):
     return None
 
 
-def collect_bindings(context):
+def collect_bindings(context, *, project_author_pose=False):
     """JSON-safe authoring contract for the original transfer/build encoder.
 
     Matrices/positions use Blender Z-up scene units. The encoder owns the single
@@ -982,6 +982,10 @@ def collect_bindings(context):
         seen_armatures.add(arm.ppf_armature_uuid)
         out["armatures"].append({"armature_uuid": arm.ppf_armature_uuid, "object_name": arm.name, "matrix_world_blender": _matrix_rows(arm.matrix_world)})
         stored_pmx_pairs = parent_joint_pairs(arm)
+        if project_author_pose:
+            from ..core.bone_author_follow import time_driven_bones
+            from ..core.encoder.proxy_start import projected
+            driven = time_driven_bones(arm)
         for bone in sorted(enabled, key=lambda b: b.name):
             s = bone.ppf_bone_physics; proxy = s.proxy
             if not proxy or proxy.type != "MESH" or context.scene.objects.get(proxy.name) != proxy:
@@ -1023,7 +1027,8 @@ def collect_bindings(context):
             if has_joint_parent and s.joint_mode == 'BALL_FIXED' and parent and parent.ppf_bone_physics.physical_model == 'SOFT':
                 raise _error('{name}: 硬球关节不支持软体父级', name=bone.name)
             bone_world, author_scale = bone_world_frame_scale(arm, bone)
-            proxy_world = rigid_matrix(proxy.matrix_world.copy(), proxy.name)
+            proxy_start = projected(arm, bone, proxy, driven) if project_author_pose else None
+            proxy_world = rigid_matrix(proxy_start if proxy_start is not None else proxy.matrix_world.copy(), proxy.name)
             axis = Matrix.Rotation(math.pi/2, 4, 'Z') @ Euler(tuple(s.joint_axis_euler)).to_matrix().to_4x4()
             physics = {"density_kg_per_m3": float(s.density if s.is_property_set("density") else (group.solid_density if expected_type == "SOLID" else group.pdrd_density)), "anchor_stiffness_N_per_m": float(s.anchor_stiffness), "collide_connected": bool(s.collide_connected), "angular_control_v1": _angular_control(s), "angular_soft_limits_v1": {"coordinate_model": MODEL, **{a: {"enabled": bool(s.soft_limits_enabled[i]), "lower_rad": float(s.soft_lower[i]), "upper_rad": float(s.soft_upper[i]), "stiffness_Nm_per_rad": float(s.soft_stiffness[i])} for i, a in enumerate(AXES)}}}
             if s.soft_limit_mode=='CONE':

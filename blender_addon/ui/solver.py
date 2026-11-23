@@ -60,7 +60,7 @@ from ..models.groups import (
 from .geometry_cleanup_ops import popup_transfer_error
 from .dynamics.bone_capture import (
     SOLVER_OT_CaptureBoneMotion, SOLVER_OT_AbortBoneCapture, is_active as bone_capture_active,
-    has_bones,
+    draw_preview_controls, has_bones, standalone_progress,
 )
 from .dynamics.bake_ops import bake_progress_snapshot, bake_scene_locked, is_bake_running
 from .dynamics.pin_capture_ops import (
@@ -806,6 +806,12 @@ class SOLVER_PT_SolverPanel(Panel):
             SOLVER_OT_RecaptureAllDeformations.bl_idname, icon="FILE_REFRESH"
         )
         box.operator(SOLVER_OT_ClearAllDeformations.bl_idname, icon="TRASH")
+        if has_bones(context):
+            bone_note = box.column(align=True)
+            bone_note.label(text="Bone preview is not cached.", icon="INFO")
+            bone_note.label(text="Transfer samples bones again.")
+        if standalone_progress(context) is not None:
+            draw_preview_controls(box, context)
         _draw_bulk_capture_modes(box, context)
 
         # Export the simulated mesh sequence to a USD / Alembic cache: a
@@ -2065,10 +2071,7 @@ def _recapture_pin_queue_identity(scene, specs):
 
 
 class SOLVER_OT_RecaptureAllDeformations(Operator):
-    """Re-capture deformation for every deforming STATIC collider and every
-    animated pin with one action, so you don't have to capture each one by hand
-    before Transfer. When batching is enabled, one timeline pass samples both
-    Static and Pin. Shows the actual capture mode, progress and an Abort button."""
+    """Re-capture Static and Pin inputs. For bones alone, run Bone Preview. With meshes, enable frame batching and Include Bone Preview to sample bones too. Transfer still evaluates bone animation live."""
 
     bl_idname = "solver.recapture_all_deformations"
     bl_label = "Re-capture All Deformations"
@@ -2092,9 +2095,13 @@ class SOLVER_OT_RecaptureAllDeformations(Operator):
         return bool(
             scene_has_capturable_static(context)
             or collect_capturable_pins(context, cheap=True)
+            or SOLVER_OT_CaptureBoneMotion.poll(context)
         )
 
     def execute(self, context):
+        # RNA normally enforces poll; keep the same guard for direct callers.
+        if is_bake_running() or is_capture_running() or is_pin_capture_running() or bone_capture_active():
+            return {"CANCELLED"}
         self._capture_cancelled = False
         self._capture_sampling_targets = None
         self._capture_ranges = None
@@ -2104,17 +2111,6 @@ class SOLVER_OT_RecaptureAllDeformations(Operator):
         )
         self._capture_frame_batch_active = False
         self._joint_capture = None
-        if self._capture_frame_batch_requested:
-            if not bpy.data.filepath:
-                self.report({"ERROR"}, iface_("Save the project before using mixed capture"))
-                return {"CANCELLED"}
-            try:
-                from ..core.capture_provenance import _assert_group_idle
-                from ..core.pc2 import get_pc2_dir
-                _assert_group_idle(get_pc2_dir())
-            except (OSError, RuntimeError, ValueError) as exc:
-                self.report({"ERROR"}, str(exc))
-                return {"CANCELLED"}
         from .dynamics.static_deform_ops import collect_capturable_static_objects
         from .dynamics.pin_capture_ops import collect_capturable_pins, validate_pin_capture_specs
 
@@ -2133,6 +2129,27 @@ class SOLVER_OT_RecaptureAllDeformations(Operator):
         except RuntimeError as exc:
             self.report({"WARNING"}, str(exc))
             return {"CANCELLED"}
+        if not static_objs and not pin_specs:
+            # Bone Preview owns its own modal timer and never publishes a
+            # deformation input cache. Do not require a saved blend for it.
+            if SOLVER_OT_CaptureBoneMotion.poll(context):
+                result = bpy.ops.solver.capture_bone_motion("EXEC_DEFAULT")
+                # The child owns the modal handler; this wrapper has no
+                # timer or modal state of its own in the bone-only route.
+                return {"FINISHED"} if "RUNNING_MODAL" in result else result
+            self.report({"WARNING"}, iface_("No deformations to capture"))
+            return {"CANCELLED"}
+        if self._capture_frame_batch_requested:
+            if not bpy.data.filepath:
+                self.report({"ERROR"}, iface_("Save the project before using mixed capture"))
+                return {"CANCELLED"}
+            try:
+                from ..core.capture_provenance import _assert_group_idle
+                from ..core.pc2 import get_pc2_dir
+                _assert_group_idle(get_pc2_dir())
+            except (OSError, RuntimeError, ValueError) as exc:
+                self.report({"ERROR"}, str(exc))
+                return {"CANCELLED"}
         try:
             self._queued_pin_identity = _recapture_pin_queue_identity(context.scene, pin_specs)
         except (ReferenceError, RuntimeError, ValueError, IndexError) as exc:
@@ -2156,10 +2173,6 @@ class SOLVER_OT_RecaptureAllDeformations(Operator):
             self._queue.append((self._PHASE_STATIC, static_objs))
         if pin_specs:
             self._queue.append((self._PHASE_PIN, pin_specs))
-        if not self._queue:
-            self._capture_sampling_targets = None
-            self.report({"WARNING"}, iface_("No deformations to capture"))
-            return {"CANCELLED"}
         self._phase = None
         self._summary = {"objs": 0, "pins": 0}
         self._bulk_display = {"scene": _bulk_capture_scene_key(context), "phases": {}}
@@ -2492,10 +2505,7 @@ class SOLVER_OT_RecaptureAllDeformations(Operator):
 
 
 class SOLVER_OT_ClearAllDeformations(Operator):
-    """Clear this Scene's owned STATIC and Pin deformation input caches.
-
-    Shared or unproven caches are retained. Authored geometry and keyframes
-    remain intact; Re-capture All Deformations can rebuild the inputs."""
+    """Clear owned Static and Pin input caches only. Shared or unproven caches, authored geometry and keyframes are kept. Bone Preview has no cache to clear; solver playback is not cleared here."""
 
     bl_idname = "solver.clear_all_deformations"
     bl_label = "Clear All Deformations"
@@ -2521,7 +2531,7 @@ class SOLVER_OT_ClearAllDeformations(Operator):
     def poll(cls, context):
         # Disabled while a capture/bake is in flight, and (the "nothing to
         # clear" case) when no cache exists across the active groups.
-        if is_bake_running() or is_capture_running() or is_pin_capture_running():
+        if is_bake_running() or is_capture_running() or is_pin_capture_running() or bone_capture_active():
             return False
         # The static predicate checks ownership only for existing PC2 files
         # or in-memory arrays. Clear revalidates the caches when it runs.
@@ -2533,6 +2543,9 @@ class SOLVER_OT_ClearAllDeformations(Operator):
         )
 
     def execute(self, context):
+        # A capture can start while the interactive confirmation is open.
+        if not self.poll(context):
+            return {"CANCELLED"}
         origin = getattr(self, "_clear_confirmation_origin", None)
         if origin is not None and origin != (context.scene.as_pointer(), bpy.data.filepath):
             self.report({"WARNING"}, iface_("Scene or project changed; confirm clearing again"))

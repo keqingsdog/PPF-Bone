@@ -110,7 +110,8 @@ def _update_display(self, context):
 
 
 class PPF_PG_BoneDisplay(bpy.types.PropertyGroup):
-    show_joint_axes: BoolProperty(name='显示关节轴向', default=True)
+    show_joint_axes: BoolProperty(name='显示关节轴向', default=True,
+        description='原生默认：关节 +X / +Y / +Z 对应子骨骼局部 +Y / −X / +Z。手调轴向优先；MMD 使用源 Joint 轴向。')
     enabled: BoolProperty(name='GPU 总闸', default=False, update=_update_display)
     proxy_enabled: BoolProperty(name='显示代理', default=True, update=_update_display)
     faces: BoolProperty(name='透明表面', default=True, update=_update_display)

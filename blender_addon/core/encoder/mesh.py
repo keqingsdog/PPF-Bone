@@ -238,7 +238,7 @@ def compute_mesh_hash(context):
     return hash_data
 
 
-def compute_group_bounding_box_diagonal(group):
+def compute_group_bounding_box_diagonal(group, *, projected_proxy=None):
     """Compute the maximal diagonal length of the bounding box that encapsulates all objects in a group."""
     min_coord = None
     max_coord = None
@@ -253,7 +253,8 @@ def compute_group_bounding_box_diagonal(group):
         if not obj or obj.type not in ("MESH", "CURVE"):
             continue
 
-        world_mat = obj.matrix_world
+        placement = projected_proxy(obj) if projected_proxy is not None else None
+        world_mat = obj.matrix_world if placement is None else placement
 
         if obj.type == "CURVE":
             # Use Blender's bound_box which works for all object types
@@ -921,6 +922,8 @@ def _encode_obj_inner(context, scene, state, data):
 
     # Track canonical meshes for deduplication: hash -> first object name
     canonical_meshes = {}
+    from .proxy_start import projection_lookup
+    projected_proxy = projection_lookup(scene)
 
     for group in iter_export_groups(scene):
         objects_info = []
@@ -930,7 +933,12 @@ def _encode_obj_inner(context, scene, state, data):
             from ..uuid_registry import resolve_assigned
             obj = resolve_assigned(assigned)
             assert obj is not None, f"Object {assigned.name} not found."
-            mat = world_matrix(obj)
+            proxy_start = projected_proxy(obj)
+            if proxy_start is None:
+                mat = world_matrix(obj)
+            else:
+                from ..transform import zup_to_yup
+                mat = zup_to_yup() @ proxy_start
 
             # For CURVE objects in ROD groups, sample in local space.
             # The "transform" field (full world_matrix) is sent separately
