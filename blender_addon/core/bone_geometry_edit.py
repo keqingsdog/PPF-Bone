@@ -155,8 +155,14 @@ def finish(token, commit=False):
     return changed
 
 
+def owns(token):
+    return _lease is not None and _lease['token'] is token
+
+
 def release_all():
     global _lease
+    from .bone_scale_preview import clear
+    clear()
     if _lease is not None:_restore_presentations(_lease)
     _lease = None
 

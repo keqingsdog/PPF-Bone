@@ -111,8 +111,20 @@ def time_driven_bones(arm):
                     'delta_rotation_euler', 'delta_rotation_quaternion',
                     'delta_scale'} for path in paths):
         return {bone.name for bone in arm.data.bones}
-    prefixes = {bone.name: arm.pose.bones[bone.name].path_from_id() + '.' for bone in arm.data.bones}
-    direct = {name for name, prefix in prefixes.items() if any(path.startswith(prefix) for path in paths)}
+    # Prefixes end in a literal separator. Checking each path once preserves
+    # Blender's escaped bone-name paths without comparing every bone to every curve.
+    direct = set()
+    if paths:
+        by_prefix = {arm.pose.bones[bone.name].path_from_id() + '.': bone.name
+                     for bone in arm.data.bones}
+        for path in paths:
+            if not path.startswith('pose.bones['):
+                continue
+            for i, char in enumerate(path):
+                if char == '.':
+                    name = by_prefix.get(path[:i + 1])
+                    if name is not None:
+                        direct.add(name)
     names = set(direct)
     for bone in arm.data.bones:
         if any(parent.name in direct for parent in bone.parent_recursive):
@@ -151,12 +163,22 @@ def _authored_signature_changed(scene, arm, old, current):
                 and observed[:4] == (scene.session_uid, arm.session_uid, scene.frame_current, scene.frame_subframe)
                 and observed[4] != current[0])
 
-def _rows(scene, *, validate=True, skip_animated=False):
+def _rows(scene, *, validate=True, skip_animated=False, preview_inventory=False):
     from ..models.bone_bindings import validate_proxy_owner, armature_data_owner_counts
     data_owners = armature_data_owner_counts() if validate else None
-    from ..ops.bone_proxy import owned_bone_material
-    from ..models.groups import iterate_active_object_groups
+    from ..ops.bone_proxy import owned_bone_material, _owned_bone_material
+    from ..models.groups import iterate_active_object_groups, iterate_object_groups
+    from collections import Counter, defaultdict
     uuid_counts = {}
+    if validate and preview_inventory:
+        groups = {}
+        for group in iterate_object_groups(scene):
+            groups.setdefault(group.uuid, group)
+        scene_users = Counter(obj.as_pointer() for sc in bpy.data.scenes for obj in sc.objects)
+        arms_by_uuid = defaultdict(list)
+        for obj in bpy.data.objects:
+            if obj.type == 'ARMATURE':
+                arms_by_uuid[obj.ppf_armature_uuid].append(obj)
     if validate:
         for group in iterate_active_object_groups(scene):
             uuid_counts[group.uuid] = uuid_counts.get(group.uuid, 0) + 1
@@ -164,6 +186,9 @@ def _rows(scene, *, validate=True, skip_animated=False):
         if arm.type != 'ARMATURE' or arm.mode == 'EDIT':
             continue
         driven = time_driven_bones(arm) if skip_animated else ()
+        if validate and preview_inventory:
+            proxy_refs = Counter(proxy.as_pointer() for bone in arm.data.bones
+                                 if (proxy := bone.ppf_bone_physics.proxy) is not None)
         for bone in arm.data.bones:
             settings = bone.ppf_bone_physics
             proxy = settings.proxy
@@ -187,12 +212,18 @@ def _rows(scene, *, validate=True, skip_animated=False):
                                 'preview_color': tuple(settings.preview_color)}}
             if not settings.enabled or proxy is None or proxy.mode == 'EDIT':
                 continue
-            if scene.objects.get(proxy.name) != proxy or len(proxy.users_scene) != 1:
+            if (scene.objects.get(proxy.name) != proxy or
+                    (scene_users[proxy.as_pointer()] if validate and preview_inventory else len(proxy.users_scene)) != 1):
                 continue
             try:
                 if validate:
-                    validate_proxy_owner(arm, bone, data_owner_counts=data_owners)
-                    group = owned_bone_material(scene, arm, bone)
+                    if preview_inventory:
+                        group = _owned_bone_material(scene, arm, bone, groups=groups,
+                                                     data_owner_counts=data_owners, scene_user_counts=scene_users,
+                                                     proxy_counts=proxy_refs, arms_by_uuid=arms_by_uuid)
+                    else:
+                        validate_proxy_owner(arm, bone, data_owner_counts=data_owners)
+                        group = owned_bone_material(scene, arm, bone)
                     if group is None or uuid_counts.get(group.uuid) != 1:
                         continue
                 pose = arm.pose.bones.get(bone.name)
@@ -587,7 +618,7 @@ def _preview_pose(context):
     scene = context.scene
     pose_arms = {obj.as_pointer() for obj in scene.objects
                  if obj.type == 'ARMATURE' and obj.mode == 'POSE'}
-    rows = list(_rows(scene))  # Ownership is resolved afresh on every tick.
+    rows = list(_rows(scene, preview_inventory=True))  # One shared, fresh proof per tick.
     valid = {key for key, *_rest in rows}
     for key in list(_pose_preview):
         if key[0] == scene.as_pointer() and key not in valid:

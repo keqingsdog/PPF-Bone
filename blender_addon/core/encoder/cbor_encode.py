@@ -24,6 +24,41 @@ import numpy as np
 SCHEMA_VERSION = 2
 
 
+def _write_xyz_float_rows(encoder, value):
+    """Write large capture xyz rows without Python-per-coordinate objects."""
+    if (type(value) not in (np.ndarray, np.memmap) or value.ndim != 3
+            or value.shape[-1] != 3 or value.dtype.kind != "f"
+            or value.dtype.itemsize not in (4, 8) or not value.shape[1]
+            or not hasattr(encoder, "write")):
+        return False
+    # This path is only used for the default noncanonical wire format.
+    # Keep float encoder compatibility explicit, including the sign of zero.
+    from ..module import get_cbor2
+    if get_cbor2().dumps([0., -0., 1., -1.]) != bytes.fromhex(
+            "84fb0000000000000000fb8000000000000000fb3ff0000000000000fbbff0000000000000"):
+        return False
+    encoder.encode_length(4, len(value))
+    for frame in value:
+        if not np.isfinite(frame).all():
+            # cbor2 uses special encodings for infinities and NaN.
+            encoder.encode(frame)
+            continue
+        encoder.encode_length(4, len(frame))
+        wire_dtype = np.dtype([
+            ("array", "u1"), ("float1", "u1"), ("x", ">f8"),
+            ("float2", "u1"), ("y", ">f8"),
+            ("float3", "u1"), ("z", ">f8"),
+        ])
+        for i in range(0, len(frame), 65536):
+            block = frame[i:i + 65536]
+            rec = np.empty(len(block), dtype=wire_dtype)
+            rec["array"] = 0x83
+            rec["float1"] = rec["float2"] = rec["float3"] = 0xfb
+            rec["x"], rec["y"], rec["z"] = block.T
+            encoder.write(rec.tobytes())
+    return True
+
+
 def _numpy_default(encoder, value):
     """cbor2 fallback for non-natively-encodable types.
 
@@ -42,6 +77,8 @@ def _numpy_default(encoder, value):
         # Each row goes through this same encoder; small leaves retain tolist's
         # exact dtype/scalar behavior. No samples, dimensions or proofs change.
         if value.ndim > 0 and value.nbytes > 1024 * 1024:
+            if _write_xyz_float_rows(encoder, value):
+                return
             encoder.encode_length(4, len(value))
             for row in value:
                 encoder.encode(row)

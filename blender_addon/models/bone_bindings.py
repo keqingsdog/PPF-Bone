@@ -665,7 +665,7 @@ _bone_frame_cache = ContextVar('ppf_bone_frame_cache', default=None)
 @contextmanager
 def bone_frame_cache():
     """Cache only while the caller guarantees an unchanged evaluation frame."""
-    token = _bone_frame_cache.set({'rest': {}, 'frame': {}})
+    token = _bone_frame_cache.set({'rest': {}, 'frame': {}, 'armature': {}})
     try:
         yield
     finally:
@@ -774,7 +774,12 @@ def bone_world_frame_scale(armature, bone):
     if cache is not None and key in cache['frame']:
         frame, scale = cache['frame'][key]
         return frame.copy(), scale
-    world, object_scale = similarity_frame_scale(armature.matrix_world, armature.name)
+    if cache is not None and key[0] in cache['armature']:
+        world, object_scale = cache['armature'][key[0]]
+    else:
+        world, object_scale = similarity_frame_scale(armature.matrix_world, armature.name)
+        if cache is not None:
+            cache['armature'][key[0]] = world, object_scale
     pose = armature.pose.bones[bone.name].matrix
     rest = bone.matrix_local
     same_rest_orientation = all(abs(pose[i][j] - rest[i][j]) <= 1.e-7

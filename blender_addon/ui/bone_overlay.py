@@ -29,6 +29,8 @@ _gpu_views = {}  # Viewport -> GPU resources; never RNA. Created only inside dra
 _dynamic_plans = {}  # viewport -> primitive object identity/topology plans
 _dynamic_packets = {}  # viewport -> immutable current-frame vertex/matrix data
 _dynamic_serial = 0
+_dynamic_graph_serial = 0
+_dynamic_reuse = {}  # viewport -> one immutable evaluated packet and its provenance
 _native_consumed = {}  # scene -> generation/epoch/frame/completion serial
 _fast_views = {}  # viewport -> generation for plans covering all visible entries
 _native_overlay_signature = ()
@@ -143,8 +145,25 @@ def bindings(context):
     if not _identity_ready():
         return
     from collections import Counter
-    from ..core.bone_proxy_visibility import overlay_visible
-    collection_visibility = {}
+    from ..core.bone_proxy_visibility import MANAGED
+    visible_managed_ids = None
+    def visible(proxy):
+        nonlocal visible_managed_ids
+        if not proxy.get(MANAGED):
+            return proxy.visible_get(view_layer=context.view_layer, viewport=context.space_data)
+        if proxy.hide_viewport:
+            return False
+        if visible_managed_ids is None:
+            visible_managed_ids = set()
+            stack = [context.view_layer.layer_collection]
+            while stack:
+                node = stack.pop()
+                collection = node.collection
+                if node.exclude or node.hide_viewport or collection.hide_viewport:
+                    continue
+                visible_managed_ids.update(obj.as_pointer() for obj in collection.objects if obj.get(MANAGED))
+                stack.extend(node.children)
+        return proxy.as_pointer() in visible_managed_ids
     body_counts = Counter(obj.get('_solver_uuid') for obj in context.scene.objects if obj.get('_solver_uuid'))
     proxy_counts = Counter(
         bone.ppf_bone_physics.proxy.as_pointer()
@@ -172,7 +191,7 @@ def bindings(context):
                             or display.get('body_uuid') != proxy.get('_solver_uuid')
                             or display.get('bone_uuid') != proxy.get('ppf_bone_uuid')
                             or body_counts[display['body_uuid']] != 1
-                            or not overlay_visible(context, proxy, collection_visibility=collection_visibility)):
+                            or not visible(proxy)):
                         continue
                     selected = bool(edit.select or edit.select_head or edit.select_tail)
                     yield proxy, display['physical_model'], selected, SimpleNamespace(**display)
@@ -186,7 +205,7 @@ def bindings(context):
                     or (proxy.mode=='EDIT' and proxy.get('ppf_bone_proxy_visibility_editing'))
                     or proxy.name not in context.scene.objects
                     or proxy.name not in context.view_layer.objects
-                    or not overlay_visible(context, proxy, collection_visibility=collection_visibility)
+                    or not visible(proxy)
                     or not proxy.get('ppf_bone_proxy_owned')
                     or not s.body_uuid or not s.bone_uuid or not arm.ppf_armature_uuid
                     or body_counts[s.body_uuid] != 1
@@ -346,7 +365,7 @@ def _model_matrix(context, proxy, depsgraph):
 
 
 
-def _cross_link_segments(context, depsgraph=None, plan=None):
+def _cross_link_segments(context, depsgraph=None, plan=None, *, binding_rows=None):
     """Copy schematic anchors into world coordinates in the stable producer.
 
     Only endpoints with the same valid visible proxy ownership as the overlay
@@ -359,7 +378,7 @@ def _cross_link_segments(context, depsgraph=None, plan=None):
     data_owners = armature_data_owner_counts()
     groups = {g.uuid: g for g in iterate_object_groups(context.scene)}
     visible = {}
-    for proxy, model, selected, owner in bindings(context):
+    for proxy, model, selected, owner in (bindings(context) if binding_rows is None else binding_rows):
         group = groups.get(owner.group_uuid)
         if (group is None or not group.active
                 or group.object_type != ('SOLID' if model == 'SOFT' else 'PDRD')
@@ -551,11 +570,26 @@ def _dynamic_frame(scene, depsgraph, epoch, viewport=None):
         _dynamic_frame_view(scene, depsgraph, epoch, view_key)
 
 
-def _dynamic_frame_view(scene, depsgraph, epoch, viewport):
+def _dynamic_frame_view(scene, depsgraph, epoch, viewport, *, reuse=False):
     global _dynamic_serial
     plan = _dynamic_plans.get(viewport)
     if not plan or plan[0] != _generation:
         return
+    scene_key = scene.as_pointer()
+    frame = float(scene.frame_current_final)
+    source = (_generation, scene_key, depsgraph.as_pointer(), depsgraph.view_layer.as_pointer(),
+              frame, _dynamic_graph_serial, plan)
+    previous = _dynamic_reuse.get(viewport)
+    if (reuse and previous is not None and previous[0] == source
+            and _depsgraph_changed in bpy.app.handlers.depsgraph_update_post
+            and epoch == _frame_epochs.get(scene_key)):
+        # A no-op evaluation can advance the overlay's publication epoch.
+        # Republish only after the producer's evaluation barrier, and only
+        # if no depsgraph update (including unrelated driver inputs) occurred.
+        rows, serial = previous[1:]
+        _dynamic_packets[viewport] = (_generation, epoch, frame, rows, serial)
+        return
+    _dynamic_reuse.pop(viewport, None)
     rows = {}
     for name, uid, identity, mesh_uid, vertex_count, mesh_ptr, mesh_revision in plan[1]:
         obj = scene.objects.get(name)
@@ -579,9 +613,11 @@ def _dynamic_frame_view(scene, depsgraph, epoch, viewport):
             rows[identity] = (positions, matrix, mesh_ptr, mesh_revision)
         finally:
             evaluated.to_mesh_clear()
-    if epoch == _frame_epochs.get(scene.as_pointer()):
+    if epoch == _frame_epochs.get(scene_key):
         _dynamic_serial += 1
-        _dynamic_packets[viewport] = (_generation, epoch, float(scene.frame_current_final), rows, _dynamic_serial)
+        _dynamic_packets[viewport] = (_generation, epoch, frame, rows, _dynamic_serial)
+        if len(rows) == len(plan[1]) and source[5] == _dynamic_graph_serial:
+            _dynamic_reuse[viewport] = (source, rows, _dynamic_serial)
 
 
 def _native_frame_publication(scene, packet):
@@ -848,9 +884,12 @@ def _capture_view_impl(context, generation):
     entries = []
     dynamic_plan = []
     fast_unsupported = False
-    if settings.enabled and settings.proxy_enabled and (settings.faces or settings.edges):
+    proxy_enabled = settings.enabled and settings.proxy_enabled and (settings.faces or settings.edges)
+    links_enabled = settings.enabled and settings.cross_links
+    binding_rows = tuple(bindings(context)) if proxy_enabled or links_enabled else ()
+    if proxy_enabled:
         from ..models.bone_bindings import effective_preview_color
-        for proxy, model, selected, owner in bindings(context):
+        for proxy, model, selected, owner in binding_rows:
             if generation != _generation or not _identity_ready():
                 return None
             # The shared source-pivot API stays synchronous in this stable
@@ -899,21 +938,23 @@ def _capture_view_impl(context, generation):
     if settings.enabled and settings.proxy_enabled and (settings.faces or settings.edges):
         _geometry_snapshots[key] = staged_geometry
     link_plan = []
-    segments = _cross_link_segments(context, plan=link_plan) if settings.enabled and settings.cross_links else ()
+    segments = _cross_link_segments(context, plan=link_plan, binding_rows=binding_rows) if links_enabled else ()
     scene_key = context.scene.as_pointer()
     new_dynamic_plan = (_generation, tuple(dynamic_plan))
     plan_changed = _dynamic_plans.get(key) != new_dynamic_plan
     _dynamic_plans[key] = new_dynamic_plan
     if not dynamic_plan:
         _dynamic_packets.pop(key, None)
+        _dynamic_reuse.pop(key, None)
     # The first producer runs after an evaluation barrier, including when no
     # frame-change callback has fired since opening a saved scene.
     epoch = _frame_epochs.setdefault(scene_key, 0)
     if dynamic_plan:
         try:
-            _dynamic_frame(context.scene, depsgraph, epoch, key)
+            _dynamic_frame_view(context.scene, depsgraph, epoch, key, reuse=True)
         except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError) as exc:
             _dynamic_packets.pop(key, None)
+            _dynamic_reuse.pop(key, None)
             print('PPF dynamic overlay frame unavailable:', exc)
     _frame_link_plans.setdefault(scene_key, {})[key] = tuple(link_plan)
     covered = pose_targets | {row[2] for row in dynamic_plan}
@@ -966,6 +1007,9 @@ def _refresh_snapshots(generation):
         for key in tuple(_gpu_views):
             if key not in staged:
                 _gpu_views.pop(key, None)
+        for key in tuple(_dynamic_reuse):
+            if key not in staged:
+                _dynamic_reuse.pop(key, None)
         _known_proxy_meshes.clear()
         _known_proxy_meshes.update(
             cached[0][3] for viewport in _geometry_snapshots.values() for cached in viewport.values()
@@ -1195,6 +1239,8 @@ def draw():
         gpu.state.blend_set('ALPHA')
         gpu.state.depth_test_set('NONE' if in_front else 'LESS_EQUAL')
         gpu.state.depth_mask_set(False)
+        from ..core.bone_scale_preview import matrices as scale_preview_matrices
+        scale_preview = scale_preview_matrices(key)
         for item in sorted(items, key=lambda item: item[4]):
             _positions, _edges, _triangles, color, selected, geometry_key, matrix = item
             identity = geometry_key[0]
@@ -1215,7 +1261,10 @@ def draw():
                     continue
                 matrix = publication[3][identity]
             with gpu.matrix.push_pop():
-                gpu.matrix.multiply_matrix(Matrix(tuple(matrix[i:i+4] for i in range(0, 16, 4))))
+                model = Matrix(tuple(matrix[i:i+4] for i in range(0, 16, 4)))
+                if scale_preview is not None and identity in scale_preview:
+                    model = model @ scale_preview[identity]
+                gpu.matrix.multiply_matrix(model)
                 face_batch, edge_batch, source_edges = dynamic_batches or view['batches'][geometry_key]
                 shader.bind()
                 if faces and face_batch is not None:
@@ -1252,6 +1301,7 @@ def draw():
 def _invalidate_snapshots(*, geometry=True):
     _dynamic_plans.clear()
     _dynamic_packets.clear()
+    _dynamic_reuse.clear()
     _fast_views.clear()
     _pose_offset_diagnostics.clear()
     _frame_epochs.clear()
@@ -1297,7 +1347,10 @@ def _subscribe_layer_window():
 @persistent
 def _depsgraph_changed(_scene, depsgraph):
     """Primitive dirtiness only; mesh reads remain in the stable producer."""
-    global _snapshot_dirty
+    global _snapshot_dirty, _dynamic_graph_serial
+    # Invalidation is deliberately broader than the overlay's own object
+    # dirtiness: dependencies may be arbitrary external driver inputs.
+    _dynamic_graph_serial += 1
     if not _identity_ready():
         _geometry_snapshots.clear()
         _known_proxy_meshes.clear()
