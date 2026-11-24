@@ -4,8 +4,11 @@ PC2 stays unchanged. A payload-bound JSON proof and a persistent Scene binding
 identify the captured facts. A pending marker rejects interrupted paired commits;
 ordinary failures restore disk backups, not in-memory copies of large old files.
 """
+from contextlib import contextmanager
+from contextvars import ContextVar
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -21,6 +24,56 @@ BINDINGS = 'ppf_capture_proof_bindings_v1'
 PROOF_SUFFIX = '.capture.json'
 PENDING_SUFFIX = '.capture.pending'
 GROUP_PENDING_NAME = '.ppf-capture-group.pending'
+
+
+_transfer_observations = ContextVar('ppf_transfer_capture_files', default=None)
+
+
+def _file_identity(st):
+    return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns
+
+
+@contextmanager
+def observe_transfer_capture_files(observations):
+    """Only record reads performed synchronously by this Transfer tick."""
+    token = _transfer_observations.set(observations)
+    try:
+        yield
+    finally:
+        _transfer_observations.reset(token)
+
+
+def _record_verified_file(observations, path, path_initial, descriptor_initial, handle):
+    descriptor_final = _file_identity(os.fstat(handle.fileno()))
+    path_final = _file_identity(os.stat(path))
+    # Windows CPython can report birth time for stat(path).st_ctime_ns
+    # but change time for fstat(fd).st_ctime_ns. Use the full tuple only
+    # within each API, and cross-check the shared identity fields.
+    if (path_initial != path_final or descriptor_initial != descriptor_final
+            or path_final[:4] != descriptor_final[:4]
+            or observations.setdefault(path, (path_final, descriptor_final)) != (path_final, descriptor_final)):
+        raise _capture_file_changed(path)
+
+
+def _capture_file_changed(path):
+    from ..i18n import pgettext_iface as iface_
+    return ValueError(iface_("Capture file changed during Transfer: '{file}'. Start Transfer again.").format(
+        file=os.path.basename(path),
+    ))
+
+
+def require_transfer_capture_files_current(observations):
+    """Metadata comparison only; no payload read and no persistent descriptor."""
+    for path, (path_identity, _) in observations.items():
+        try:
+            if _file_identity(os.stat(path)) != path_identity:
+                raise ValueError('recorded file identity changed')
+            if not path.endswith(PROOF_SUFFIX):
+                _assert_group_idle(os.path.dirname(path))
+                if os.path.lexists(path + PENDING_SUFFIX):
+                    raise ValueError('capture commit is incomplete or uncertain')
+        except (OSError, ValueError) as exc:
+            raise _capture_file_changed(path) from exc
 
 
 def _assert_group_idle(parent):
@@ -174,17 +227,8 @@ def commit_capture(path, frames, proof=None, *, publish=None, rollback=None):
     return record
 
 
-def read_bound_proof(path, frames=None):
-    """Read/verify only this actual input pair; never manufacture missing proof."""
-    path = os.fspath(path)
-    _assert_group_idle(os.path.dirname(path))
-    if os.path.exists(path + PENDING_SUFFIX):
-        raise ValueError('capture commit is incomplete or uncertain')
-    try:
-        with open(path + PROOF_SUFFIX, encoding='utf8') as handle:
-            proof = json.load(handle)
-    except FileNotFoundError as exc:
-        raise ValueError('legacy or missing capture provenance; origin and vertex membership are unproven') from exc
+def _read_capture_proof_bytes(data):
+    proof = json.loads(data)
     if not isinstance(proof, dict) or proof.get('schema') != SCHEMA or proof.get('status') != 'complete':
         raise ValueError('capture provenance is unproven or unsupported')
     if proof.get('proof_sha256') != _proof_digest(proof):
@@ -194,35 +238,97 @@ def read_bound_proof(path, frames=None):
         raise ValueError('capture provenance has an invalid shape')
     if any(type(proof.get(k)) is not int for k in ('frame_start', 'frame_end')) or proof['frame_end'] - proof['frame_start'] + 1 != shape[0]:
         raise ValueError('capture provenance has an invalid frame range')
-    digest = hashlib.sha256()
-    expected = shape[0] * shape[1] * 12
+    return proof
+
+
+def _check_capture_payload(path, proof, destination=None, *, decode=False, observed=None):
+    """Verify the same bytes copied to staging, in bounded blocks."""
+    from contextlib import nullcontext
+    digest = hashlib.sha256() if proof is not None else None
     with open(path, 'rb') as handle:
+        if observed is not None:
+            path_initial = _file_identity(os.stat(path))
+            descriptor_initial = _file_identity(os.fstat(handle.fileno()))
         header = handle.read(32)
         if len(header) != 32:
             raise ValueError('capture PC2 header is incomplete')
         magic, version, vertices, start, sampling, count = struct.unpack('<12siiffi', header)
-        if (magic, version, vertices, start, sampling, count) != (b'POINTCACHE2\0', 1, shape[1], 0.0, 1.0, shape[0]):
+        if (magic != b'POINTCACHE2\0' or version != 1 or vertices < 1 or count < 1
+                or not math.isfinite(start) or not math.isfinite(sampling) or sampling <= 0):
+            raise ValueError('capture PC2 header is invalid')
+        if proof is not None and (vertices, start, sampling, count) != (proof['shape'][1], 0.0, 1.0, proof['shape'][0]):
             raise ValueError('capture PC2 header does not match its proof')
-        size = 0
-        while True:
-            chunk = handle.read(1024 * 1024)
-            if not chunk:
-                break
-            size += len(chunk); digest.update(chunk)
-        if size != expected or digest.hexdigest() != proof.get('payload_sha256'):
-            raise ValueError('capture PC2 payload does not match its proof')
-    if frames is not None and (list(frames.shape) != shape or not np.isfinite(frames).all() or _payload_digest(frames) != proof['payload_sha256']):
+        expected = count * vertices * 12
+        if os.fstat(handle.fileno()).st_size != 32 + expected:
+            raise ValueError('capture PC2 has the wrong payload length')
+        # A cold Scene decode consumes the exact chunks that feed the proof
+        # digest. Publish no array until the complete stream is verified.
+        if decode and (proof is None or destination is not None):
+            raise ValueError('capture decode requires a proof and no copy destination')
+        raw = bytearray(expected) if decode else None
+        with (open(destination, 'wb') if destination is not None else nullcontext()) as output:
+            if output is not None:
+                output.write(header)
+            left = expected
+            while left:
+                chunk = handle.read(min(left, 1024 * 1024))
+                if not chunk:
+                    raise ValueError('capture PC2 ended during validation')
+                if digest is not None:
+                    digest.update(chunk)
+                if output is not None:
+                    output.write(chunk)
+                if raw is not None:
+                    raw[expected-left:expected-left+len(chunk)] = chunk
+                left -= len(chunk)
+            if handle.read(1):
+                raise ValueError('capture PC2 changed during validation')
+        if observed is not None:
+            _record_verified_file(observed, path, path_initial, descriptor_initial, handle)
+    if digest is not None and digest.hexdigest() != proof.get('payload_sha256'):
+        raise ValueError('capture PC2 payload does not match its proof')
+    return np.frombuffer(raw, dtype='<f').reshape(count, vertices, 3) if raw is not None else None
+
+
+def read_bound_proof(path, frames=None, *, decode=False, observed=None):
+    """Read/verify only this actual input pair; never manufacture missing proof."""
+    path = os.fspath(path)
+    _assert_group_idle(os.path.dirname(path))
+    if os.path.exists(path + PENDING_SUFFIX):
+        raise ValueError('capture commit is incomplete or uncertain')
+    try:
+        proof_path = path + PROOF_SUFFIX
+        if observed is None:
+            proof = _read_capture_proof_bytes(Path(proof_path).read_bytes())
+        else:
+            with open(proof_path, 'rb') as handle:
+                path_initial = _file_identity(os.stat(proof_path))
+                descriptor_initial = _file_identity(os.fstat(handle.fileno()))
+                proof = _read_capture_proof_bytes(handle.read())
+                _record_verified_file(observed, proof_path, path_initial, descriptor_initial, handle)
+    except FileNotFoundError as exc:
+        raise ValueError('legacy or missing capture provenance; origin and vertex membership are unproven') from exc
+    decoded = _check_capture_payload(path, proof, decode=decode, observed=observed)
+    if decode:
+        if not np.isfinite(decoded).all():
+            raise ValueError("capture PC2 contains non-finite samples")
+        return proof, decoded
+    if frames is not None and (list(frames.shape) != proof['shape'] or not np.isfinite(frames).all()
+                               or _payload_digest(frames) != proof['payload_sha256']):
         raise ValueError('capture memory and proven disk payload differ')
     return proof
 
 
-def validate_capture(scene, obj, frames, kind, vg_name=None, pin_item=None):
+def validate_capture(scene, obj, frames, kind, vg_name=None, pin_item=None, *, decode=False):
     from . import pc2
     from .uuid_registry import get_object_uuid
     from ..ui.dynamics.static_deform_ops import _effective_frame_range
-    key = pc2.static_deform_pc2_key(obj) if kind == 'STATIC' else pc2.pin_anim_pc2_key(obj, vg_name)
+    key = pc2.static_deform_pc2_key(obj) if kind == 'STATIC' else pc2.pin_anim_pc2_key(obj, vg_name, scene=scene)
     try:
-        proof = read_bound_proof(pc2.get_pc2_path(key), frames)
+        observed = _transfer_observations.get()
+        verified = read_bound_proof(os.path.abspath(pc2.get_pc2_path(key)), frames,
+                                    decode=decode, observed=observed)
+        proof = verified[0] if decode else verified
         if bindings(scene).get(key) != proof['proof_sha256']:
             raise ValueError('this Scene cannot prove ownership of this capture generation')
         if proof.get('object_uuid') != get_object_uuid(obj) or proof.get('kind') != kind:
@@ -246,30 +352,75 @@ def validate_capture(scene, obj, frames, kind, vg_name=None, pin_item=None):
             indices = proof.get('vertex_indices')
             if not isinstance(indices, list) or any(type(i) is not int for i in indices) or indices != list(_get_pin_indices(obj, vg_name)):
                 raise ValueError('Pin vertex identities/order changed after capture')
-        return proof
+        return verified
     except (OSError, ValueError, TypeError, KeyError) as exc:
         label = obj.name + (" / Pin '" + vg_name + "'" if vg_name else '')
-        raise ValueError(f"Captured input '{label}' is stale or unproven: {exc}. Recapture Deformation before export/solve; existing files were retained.") from exc
+        from ..i18n import pgettext_iface as iface_
+        message = iface_("Captured input '{label}' is stale or unproven: {error}. Recapture Deformation before export or solve.")
+        raise ValueError(message.format(label=label, error=iface_(str(exc)))) from exc
 
 
-def copy_pair(source, destination):
+def copy_pair(source, destination, *, expected_proof=None):
     """Save As copies a known pair verbatim; never re-stamps current settings."""
     source, destination = os.fspath(source), os.fspath(destination)
     _assert_group_idle(os.path.dirname(source))
     _assert_group_idle(os.path.dirname(destination))
     if os.path.realpath(source) == os.path.realpath(destination):
         return
-    if os.path.exists(source + PENDING_SUFFIX):
-        raise ValueError('Cannot migrate an uncertain capture pair; recapture required')
+    for path in (source, destination):
+        for suffix in ('', PROOF_SUFFIX, PENDING_SUFFIX):
+            _regular_or_absent(path + suffix)
+        if os.path.lexists(path + PENDING_SUFFIX):
+            raise ValueError('Cannot migrate an uncertain capture pair; recapture required')
     proof_path = source + PROOF_SUFFIX
     proof_bytes = Path(proof_path).read_bytes() if os.path.exists(proof_path) else None
-    if os.path.exists(destination) or os.path.exists(destination + PROOF_SUFFIX):
-        source_proof = read_bound_proof(source)
+    proof = _read_capture_proof_bytes(proof_bytes) if proof_bytes is not None else None
+    if expected_proof is not None and (proof is None or proof['proof_sha256'] != expected_proof):
+        raise ValueError('Capture source does not match the Scene binding; recapture required')
+    if os.path.lexists(destination) or os.path.lexists(destination + PROOF_SUFFIX):
         target_proof = read_bound_proof(destination)
-        if source_proof['proof_sha256'] != target_proof['proof_sha256']:
+        if proof is None or proof['proof_sha256'] != target_proof['proof_sha256']:
             raise ValueError('Save As capture target already holds a different generation; target retained')
+        _check_capture_payload(source, proof)
         return
-    _commit_pair(destination, lambda temp: shutil.copyfile(source, temp), proof_bytes)
+    _commit_pair(destination, lambda temp: _check_capture_payload(source, proof, temp), proof_bytes)
+
+
+def load_for_export(scene, obj, kind, vg_name=None, *, required=False):
+    """A recorded but missing capture must never become uncaptured motion."""
+    from . import pc2
+    label = f"{obj.name} / Pin '{vg_name}'" if vg_name is not None else f"{obj.name} / Static"
+    try:
+        if kind == 'STATIC':
+            key = pc2.static_deform_pc2_key(obj)
+            frames = pc2.get_static_deform_cache(obj)
+        else:
+            key = pc2.pin_anim_pc2_key(obj, vg_name, scene=scene)
+            frames = pc2.get_pin_anim_cache(obj, vg_name, scene=scene)
+        if frames is None and (required or key in bindings(scene)):
+            raise ValueError("recorded PC2 file is missing")
+        return frames
+    except (OSError, ValueError) as exc:
+        from ..i18n import pgettext_iface as iface_
+        message = iface_("Captured input '{label}' cannot be used: {error}. Recapture Deformation before export.")
+        raise ValueError(message.format(label=label, error=iface_(str(exc)))) from exc
+
+
+def static_for_scene(scene, obj):
+    """Read a cold Static array with the existing Scene proof pass.
+
+    Param validation still rereads current on-disk proof and payload.
+    """
+    from . import pc2
+    key = pc2.static_deform_pc2_key(obj)
+    if not pc2.has_static_deform_cache_key(key) and os.path.lexists(pc2.get_pc2_path(key)):
+        _proof, frames = validate_capture(scene, obj, None, 'STATIC', decode=True)
+        pc2._static_deform_cache[key] = frames
+        return frames
+    frames = load_for_export(scene, obj, 'STATIC')
+    if frames is not None:
+        validate_capture(scene, obj, frames, 'STATIC')
+    return frames
 
 
 def validate_static_param_inputs(scene, groups):
@@ -285,6 +436,6 @@ def validate_static_param_inputs(scene, groups):
             obj = resolve_assigned(assigned)
             if obj is None or obj.type != 'MESH':
                 continue
-            frames = pc2.get_static_deform_cache(obj)
+            frames = load_for_export(scene, obj, 'STATIC')
             if frames is not None:
                 validate_capture(scene, obj, frames, 'STATIC')

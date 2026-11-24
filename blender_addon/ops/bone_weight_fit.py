@@ -10,7 +10,19 @@ from .bone_proxy import selected_bones, update_proxies, box_geometry, capsule_ge
 from ..models.proxy_generation import effective_proxy_quality, effective_proxy_face_mode
 from ..models.bone_bindings import bone_world_frame_scale
 from .bone_weight_deform import deform_weight_contour
-from .bone_weight_precision import MAX_SAMPLES, fit_height_envelope
+from .bone_weight_thickness import check_padded_clearance, pad_fitted_proxy
+from .bone_weight_precision import MAX_SAMPLES, PrecisionFitLimit, fit_height_envelope
+
+_DEFAULT_PRECISE_STRENGTH = 1.0
+
+
+def _initialize_inline_precision(wm, context):
+    # Initialize the displayed slider only on the first opt-in, not when a
+    # user deliberately set it to zero or picked any intermediate value.
+    if wm.ppf_bone_fit_precision and not wm.is_property_set('ppf_bone_fit_strength'):
+        wm.ppf_bone_fit_strength = _DEFAULT_PRECISE_STRENGTH
+
+
 
 
 def _minimum_weight_property(**kwargs):
@@ -23,6 +35,12 @@ def _contour_fit_property(**kwargs):
                          description='Reshape the starter proxy toward the convex skin-weight footprint; zero keeps the starter shape and adjusts its size if needed',
                          default=0.0, min=0.0, max=1.0, subtype='FACTOR', **kwargs)
 
+
+def _thickness_offset_property(**kwargs):
+    return FloatProperty(
+        name='Thickness Offset (mm)',
+        description='Expand fitted geometry outward in millimeters. Precision Fit moves each cap outward and preserves the outline. This does not change the solver contact offset.',
+        default=0.0, min=0.0, soft_max=10.0, max=1000.0, precision=3, **kwargs)
 
 def _precision_fit_property(**kwargs):
     return BoolProperty(
@@ -40,6 +58,7 @@ def draw_inline_fit(layout, context):
     settings.prop(wm, 'ppf_bone_fit_weight_threshold')
     settings.prop(wm, 'ppf_bone_fit_strength', slider=True)
     settings.prop(wm, 'ppf_bone_fit_precision', toggle=True)
+    settings.prop(wm, 'ppf_bone_fit_thickness_offset')
     controls.operator_context = 'EXEC_DEFAULT'
     action = controls.row()
     action.enabled = context.mode in {'POSE', 'OBJECT'}
@@ -47,6 +66,7 @@ def draw_inline_fit(layout, context):
     op.weight_threshold = wm.ppf_bone_fit_weight_threshold
     op.fit_strength = wm.ppf_bone_fit_strength
     op.precision_fit = wm.ppf_bone_fit_precision
+    op.thickness_offset_mm = wm.ppf_bone_fit_thickness_offset
 
 
 
@@ -94,11 +114,13 @@ class PPF_OT_FitBoneProxiesToWeights(bpy.types.Operator):
     weight_threshold: _minimum_weight_property()
     fit_strength: _contour_fit_property()
     precision_fit: _precision_fit_property()
+    thickness_offset_mm: _thickness_offset_property()
 
     def draw(self, context):
         self.layout.prop(self, 'weight_threshold')
         self.layout.prop(self, 'fit_strength', slider=True)
         self.layout.prop(self, 'precision_fit', toggle=True)
+        self.layout.prop(self, 'thickness_offset_mm')
 
     def execute(self, context):
         try:
@@ -106,8 +128,14 @@ class PPF_OT_FitBoneProxiesToWeights(bpy.types.Operator):
             sources = [obj for obj in context.scene.objects if obj.type == 'MESH'
                        and any(m.type == 'ARMATURE' and m.object == arm for m in obj.modifiers)]
             fit_strength = getattr(self, 'fit_strength', 0.0)
+            thickness_offset = self.thickness_offset_mm * 0.001
             threshold = float(self.weight_threshold)
-            precision = bool(fit_strength > 0.0 and getattr(self, 'precision_fit', False))
+            precision_requested = getattr(self, 'precision_fit', False)
+            if precision_requested and not self.properties.is_property_set('fit_strength'):
+                # Also cover direct invocation with no strength argument.
+                # Record it so Blender's Adjust Last Operation UI agrees.
+                self.fit_strength = fit_strength = _DEFAULT_PRECISE_STRENGTH
+            precision = bool(fit_strength > 0.0 and precision_requested)
             bounds, points, source_faces = {}, {}, {}
             arm_inverse = arm.matrix_world.inverted()
             for obj in sources:
@@ -145,7 +173,7 @@ class PPF_OT_FitBoneProxiesToWeights(bpy.types.Operator):
                         for bn in a.keys() & b.keys() & c.keys():
                             if len(points[bn]) <= MAX_SAMPLES:
                                 source_faces.setdefault(bn, []).append((a[bn], b[bn], c[bn]))
-            rows, missing, fell_back, repaired = {}, [], [], []
+            rows, missing, fell_back, repaired = {}, [], {}, []
             for bone in bones:
                 if bone.name not in bounds:
                     missing.append(bone.name)
@@ -183,15 +211,18 @@ class PPF_OT_FitBoneProxiesToWeights(bpy.types.Operator):
                 cx, cy, cz = center
                 weighted = [((point.y-cy)*scale, -(point.x-cx)*scale, (point.z-cz)*scale, weight)
                             for point, weight in points[bone.name]]
+                fitted_sheet = False
                 if precision:
                     try:
                         vertices, faces = fit_height_envelope(
                             [point[:3] for point in weighted], source_faces.get(bone.name, []),
                             sum(len(face)-2 for face in faces), fit_strength)
-                    except (ValueError, RuntimeError, np.linalg.LinAlgError):
-                        fell_back.append(bone.name)
+                    except (ValueError, RuntimeError, np.linalg.LinAlgError) as exc:
+                        reason = exc.reason if isinstance(exc, PrecisionFitLimit) else 'shape'
+                        fell_back.setdefault(reason, []).append(bone.name)
                         vertices = deform_weight_contour(vertices, faces, weighted, fit_strength)
                     else:
+                        fitted_sheet = True
                         offset = _known_absolute_contact_offset(context.scene, arm, bone)
                         if offset > 0.0:
                             from .bone_weight_repair import repair
@@ -210,6 +241,26 @@ class PPF_OT_FitBoneProxiesToWeights(bpy.types.Operator):
                                 repaired.append(bone.name)
                 else:
                     vertices = deform_weight_contour(vertices, faces, weighted, fit_strength)
+                if thickness_offset > 0.0:
+                    sample_xyz = np.asarray([point[:3] for point in weighted])
+                    try:
+                        if fitted_sheet:
+                            # Recover the exact cap direction, including any
+                            # retessellation already applied by clearance repair.
+                            v = np.asarray(vertices)
+                            n = len(v)//2
+                            axis = v[-1] - v[n-1]
+                            axis /= np.linalg.norm(axis)
+                            padded = pad_fitted_proxy(vertices, faces, sample_xyz, thickness_offset, sheet_axis=axis)
+                        else:
+                            padded = pad_fitted_proxy(vertices, faces, sample_xyz, thickness_offset)
+                        fixed_contact_offset = _known_absolute_contact_offset(context.scene, arm, bone)
+                        check_padded_clearance(padded, faces, fixed_contact_offset)
+                    except (ValueError, RuntimeError, np.linalg.LinAlgError) as exc:
+                        raise ValueError(iface(
+                            'Thickness Offset could not safely expand {bone}; try a smaller offset. No proxies were changed.'
+                        ).format(bone=bone.name)) from exc
+                    vertices = padded
                 frame = frame @ Matrix.Translation(tuple(v*scale for v in center)) @ Matrix.Rotation(math.pi/2, 4, 'Z')
                 # Rest-frame samples are expressed in bone local coordinates;
                 # place the result in the current pose using the same bone frame.
@@ -223,12 +274,17 @@ class PPF_OT_FitBoneProxiesToWeights(bpy.types.Operator):
                 self.report({'INFO'}, iface(
                     'Precision Fit repaired local face clearance for {bones} without changing contact offset.'
                 ).format(bones=', '.join(repaired[:8]) + (f' (+{len(repaired)-8})' if len(repaired) > 8 else '')))
-            if fell_back:
-                names = ', '.join(fell_back[:8])
-                if len(fell_back) > 8:
-                    names += f' (+{len(fell_back)-8})'
+            fallback_messages = {
+                'budget': 'Precision Fit fell back to convex fitting for {bones}: the current face preset cannot hold all selected points. Increase the triangle budget.',
+                'work': 'Precision Fit fell back to convex fitting for {bones}: the selected skin exceeds the bounded precision workload. The convex fit still includes all selected points.',
+                'shape': 'Precision Fit fell back to convex fitting for {bones}: no covered, closed concave proxy passed the shape checks.',
+            }
+            for reason, failed in fell_back.items():
+                names = ', '.join(failed[:8])
+                if len(failed) > 8:
+                    names += f' (+{len(failed)-8})'
                 self.report({'WARNING'}, iface(
-                    'Precision Fit fell back to convex fitting for {bones}; the selected skin or triangle budget did not meet the precision checks.'
+                    fallback_messages[reason]
                 ).format(bones=names))
             return {'FINISHED'}
         except (ValueError, RuntimeError) as exc:
@@ -240,11 +296,13 @@ def register():
     register_class(PPF_OT_FitBoneProxiesToWeights)
     bpy.types.WindowManager.ppf_bone_fit_weight_threshold = _minimum_weight_property(options={'SKIP_SAVE'})
     bpy.types.WindowManager.ppf_bone_fit_strength = _contour_fit_property(options={'SKIP_SAVE'})
-    bpy.types.WindowManager.ppf_bone_fit_precision = _precision_fit_property(options={'SKIP_SAVE'})
+    bpy.types.WindowManager.ppf_bone_fit_thickness_offset = _thickness_offset_property(options={'SKIP_SAVE'})
+    bpy.types.WindowManager.ppf_bone_fit_precision = _precision_fit_property(options={'SKIP_SAVE'}, update=_initialize_inline_precision)
 
 
 def unregister():
     del bpy.types.WindowManager.ppf_bone_fit_precision
+    del bpy.types.WindowManager.ppf_bone_fit_thickness_offset
     del bpy.types.WindowManager.ppf_bone_fit_strength
     del bpy.types.WindowManager.ppf_bone_fit_weight_threshold
     bpy.utils.unregister_class(PPF_OT_FitBoneProxiesToWeights)

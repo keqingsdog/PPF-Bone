@@ -287,7 +287,7 @@ __all__ = [
 ]
 
 
-def prepare_authoring_for_upload(context):
+def prepare_authoring_for_upload(context, *, scan_scale_frames=True):
     """Finish idle author edits before a staged upload acquires async state."""
     from ..pin_reference import validate_export_pin_references
     validate_export_pin_references(context)
@@ -298,7 +298,21 @@ def prepare_authoring_for_upload(context):
     from ...ops.bone_proxy import reconcile_deleted_proxies
     reconcile_deleted_proxies(context.scene)
     from ..bone_author_follow import sync_for_transfer
-    sync_for_transfer(context)
+    sync_for_transfer(context, scan_scale_frames=scan_scale_frames)
+
+
+def _capture_binding_stamp(scene):
+    # A committed recapture replaces the recorded generation even when its
+    # inputs are otherwise identical. Keep the whole Scene record to cover
+    # newly added/cleared bindings as well as replacement. No PC2 reads.
+    from ..capture_provenance import BINDINGS
+    return scene.get(BINDINGS, '{}')
+
+
+def _require_capture_binding_stamp(scene, expected):
+    if _capture_binding_stamp(scene) != expected:
+        from ...i18n import pgettext_iface as iface_
+        raise ValueError(iface_("Capture generation changed during Transfer. Start Transfer again."))
 
 
 def _encode_upload_payloads(context, *, want_data, want_param, bone_motion=None):
@@ -309,6 +323,9 @@ def _encode_upload_payloads(context, *, want_data, want_param, bone_motion=None)
     The private temporary file is closed on success and on every exception.
     """
     param_options = {"bone_motion": bone_motion} if bone_motion is not None else {}
+    check_generation = want_data and want_param
+    if check_generation:
+        capture_stamp = _capture_binding_stamp(context.scene)
     data, data_hash = encode_obj_with_hash(context) if want_data else (b"", "")
     if want_data and want_param and data:
         import tempfile
@@ -325,6 +342,8 @@ def _encode_upload_payloads(context, *, want_data, want_param, bone_motion=None)
                 raise OSError("Incomplete temporary Scene payload read")
     else:
         param, param_hash = encode_param_with_hash(context, **param_options) if want_param else (b"", "")
+    if check_generation:
+        _require_capture_binding_stamp(context.scene, capture_stamp)
     return data, param, data_hash, param_hash
 
 
@@ -342,15 +361,15 @@ def cancel_upload_steps():
         steps.close()
 
 
-def begin_upload_steps(context):
+def begin_upload_steps(context, *, bone_motion=None):
     global _active_upload_steps
     if _active_upload_steps is not None:
         raise RuntimeError("A Transfer encode is already active")
-    _active_upload_steps = prepare_upload_steps(context)
+    _active_upload_steps = prepare_upload_steps(context, bone_motion=bone_motion)
     return _active_upload_steps
 
 
-def prepare_upload_steps(context):
+def prepare_upload_steps(context, *, bone_motion=None):
     """Run the ordinary upload transaction, yielding after sampled frames."""
     from ..pin_reference import validate_export_pin_references
     from ..bone_author_follow import transfer_author_transaction, sync_for_transfer_steps
@@ -370,8 +389,9 @@ def prepare_upload_steps(context):
                 validate_export_pin_references(context)
                 assert_solver_available()
                 reconcile_deleted_proxies(context.scene)
-                yield from sync_for_transfer_steps(context)
+                yield from sync_for_transfer_steps(context, scan_scale_frames=False)
                 mass_scope.enter_context(producer_mass_transaction(context))
+                capture_stamp = _capture_binding_stamp(context.scene)
                 data, data_hash = yield from encode_obj_with_hash_steps(context)
                 if data:
                     import tempfile
@@ -381,13 +401,14 @@ def prepare_upload_steps(context):
                             raise OSError("Incomplete temporary Scene payload write")
                         staged_data.flush()
                         del data
-                        param, param_hash = yield from encode_param_with_hash_steps(context)
+                        param, param_hash = yield from encode_param_with_hash_steps(context, bone_motion=bone_motion)
                         staged_data.seek(0)
                         data = staged_data.read()
                         if len(data) != size:
                             raise OSError("Incomplete temporary Scene payload read")
                 else:
-                    param, param_hash = yield from encode_param_with_hash_steps(context)
+                    param, param_hash = yield from encode_param_with_hash_steps(context, bone_motion=bone_motion)
+                _require_capture_binding_stamp(context.scene, capture_stamp)
             commit_notification()
     return data, param, data_hash, param_hash
 
@@ -430,7 +451,7 @@ def prepare_upload(
         # exits only after playback restoration and the notification succeed.
         with ExitStack() as mass_scope:
             with suspend_playback():
-                prepare_authoring_for_upload(context)
+                prepare_authoring_for_upload(context, scan_scale_frames=not want_param)
                 mass_scope.enter_context(producer_mass_transaction(context))
                 data, param, data_hash, param_hash = _encode_upload_payloads(
                     context, want_data=want_data, want_param=want_param, bone_motion=bone_motion)

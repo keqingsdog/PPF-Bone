@@ -1076,6 +1076,12 @@ class State(PropertyGroup):
         description="Maximum number of PCG iterations before divergence",
         options=NOT_ANIMATABLE,
     )  # pyright: ignore
+    animation_mode: BoolProperty(
+        name="Animation Mode",
+        description="Try fewer substeps in dense contact. Chain, cloth and collision motion may change",
+        default=False,
+        options=NOT_ANIMATABLE,
+    )
     cg_tol: FloatProperty(
         name="PCG Tolerance",
         default=0.001,

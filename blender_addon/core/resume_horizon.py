@@ -77,7 +77,15 @@ def _matches_sealed_param(tree, sealed_hash, dumps_envelope, allow_legacy_policy
         return False
     def digest(value):
         return hashlib.sha256(dumps_envelope('Param', value)).hexdigest()
-    if digest(tree) == sealed_hash:
+    def matches(value):
+        if digest(value) == sealed_hash:
+            return True
+        if value.get('solver_mode') == 'strict':
+            # Older clients sealed the default strict mode without a field.
+            legacy = {key: item for key, item in value.items() if key != 'solver_mode'}
+            return digest(legacy) == sealed_hash
+        return False
+    if matches(tree):
         return True
     # A new export may describe v3, while an already sealed session is still
     # v2.  This projection is used only for the existing sealed-input guard;
@@ -88,9 +96,9 @@ def _matches_sealed_param(tree, sealed_hash, dumps_envelope, allow_legacy_policy
             item=row.get('physics',{}).get(field)
             if isinstance(item,dict) and item.get('coordinate_model')==MATERIAL_SPIN_MODEL:
                 item['coordinate_model']=CONTINUOUS_MODEL
-    if digest(candidate)==sealed_hash:
+    if matches(candidate):
         return True
-    return allow_legacy_policy and digest(_legacy_policy_candidate(tree)) == sealed_hash
+    return allow_legacy_policy and matches(_legacy_policy_candidate(tree))
 
 def normalized_param_tree(tree, sealed_target):
     """Allow only the count and redundant constant bone-root tail samples.
@@ -133,6 +141,11 @@ def prepare_request(context, response, from_frame, twist_resume_mode=None):
     producer_preflight(context,commit=False)
     pre_mmd_default=[]
     tree=_build_param_dict(context,pre_mmd_default=pre_mmd_default)
+    if 'solver_mode' in tree:
+        # A changed panel selection applies to the next Transfer. Resume
+        # validates the exact mode that owns the current checkpoints.
+        sealed_mode = response.get('solver_mode')
+        tree['solver_mode'] = sealed_mode if sealed_mode in ('strict', 'animation') else 'strict'
     if twist_resume_mode is not None:
         if twist_resume_mode != TWIST_MODE:raise ValueError('TWIST_RESUME_MODE_INVALID')
         tree=project_sealed_models(tree,response.get('twist_resume_contract'))

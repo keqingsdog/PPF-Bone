@@ -353,8 +353,17 @@ class OBJECT_OT_ConvertToParticleMesh(Operator):
         layout.label(text="Apply object scale before converting for best results.", icon="INFO")
         warn = layout.column()
         warn.alert = True
-        warn.label(text="Destructive: original faces are discarded", icon="ERROR")
-        warn.label(text="and replaced by a loose-vertex particle cloud.")
+        # Localize explicitly: nested native layouts must not fall back to
+        # Blender's global catalog for this destructive-operation warning.
+        warn.label(
+            text=iface_("Destructive: original faces are discarded"),
+            icon="ERROR",
+            translate=False,
+        )
+        warn.label(
+            text=iface_("and replaced by a loose-vertex particle cloud."),
+            translate=False,
+        )
 
     def execute(self, context):
         obj = context.active_object

@@ -241,6 +241,12 @@ def _has_frame_one_geometry_keys(obj):
 
 def prepare_animation_targets(context, *, clear_existing: bool):
     """Preserve the current visible shape as frame 1 before run/fetch work begins."""
+    from .encoder.captured_bone_motion import preserve_during_output
+    with preserve_during_output(context):
+        _prepare_animation_targets(context, clear_existing=clear_existing)
+
+
+def _prepare_animation_targets(context, *, clear_existing):
     from .uuid_registry import get_or_create_object_uuid
 
     scene = context.scene

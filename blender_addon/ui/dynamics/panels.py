@@ -1449,6 +1449,21 @@ class MAIN_PT_SceneConfiguration(Panel):
         if params.show_linear_system_solver:
             ls_box.prop(params, "cg_max_iter")
             _draw_pcg_tolerance(ls_box, context, params)
+            from ...core.facade import communicator
+            response = communicator._runner.current_mode_response()
+            mode_control = ls_box.row()
+            mode_control.enabled = response.get("solver_mode_v1") is True
+            mode_control.prop(params, "animation_mode")
+            if not response and communicator.is_connected() and communicator.is_server_running():
+                ls_box.label(text=iface_("Waiting for solver mode capability from the current connection"), icon="INFO")
+            elif response.get("solver_mode_v1") is not True:
+                ls_box.label(text=iface_("Current solver does not support Animation Mode"), icon="INFO")
+            elif response.get("solver_mode") in ("strict", "animation"):
+                mode = response["solver_mode"]
+                ls_box.label(text=iface_("Current session mode: {mode}").format(
+                    mode=iface_("Animation Mode") if mode == "animation" else iface_("Strict Mode")))
+                if params.animation_mode != (mode == "animation"):
+                    ls_box.label(text=iface_("Transfer again to change the session mode"), icon="INFO")
             ls_box.prop(params, "precond")
             if params.precond == "SCHWARZ":
                 ls_box.prop(params, "schwarz_levels")

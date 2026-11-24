@@ -5,7 +5,22 @@ from mathutils import Vector, geometry
 from mathutils.bvhtree import BVHTree
 
 
-MAX_SAMPLES = 160
+MAX_SAMPLES = 256
+# Keep the existing search unrestricted within its old sample domain. In the
+# extended domain explicitly bound source triangles, footprint trials and
+# face clipping work instead of letting arbitrary dense selections stall UI.
+_EXTENDED_MIN = 161
+_MAX_EXTENDED_SOURCE = 512
+_MAX_EXTENDED_TIERS = 512
+_MAX_EXTENDED_EDGE_TESTS = 2_000_000
+_MAX_EXTENDED_CLIPS = 16000
+
+
+class PrecisionFitLimit(ValueError):
+    def __init__(self, reason):
+        self.reason = reason
+        super().__init__(reason)
+
 MIN_PROTECTIVE_THICKNESS = 0.0005  # metres
 
 
@@ -46,8 +61,15 @@ def fit_height_envelope(points, source, budget, strength):
     The caller falls back to the original fitter for any rejection.
     """
     xyz=np.asarray(points,dtype=float)
-    if len(xyz)<4 or len(xyz)>MAX_SAMPLES or not source or budget<12:
+    if len(xyz)>MAX_SAMPLES:
+        raise PrecisionFitLimit('work')
+    if len(xyz)<4 or not source:
         raise ValueError('unsupported selected sheet size')
+    if budget<12:
+        raise PrecisionFitLimit('budget')
+    extended=len(xyz)>=_EXTENDED_MIN
+    if extended and len(source)>_MAX_EXTENDED_SOURCE:
+        raise PrecisionFitLimit('work')
     if not np.isfinite(xyz).all():
         raise ValueError('nonfinite skin samples')
     # Separate components must not be merged into a new collision bridge.
@@ -83,6 +105,11 @@ def fit_height_envelope(points, source, budget, strength):
         for i in ids:inp[i].append(j)
     if any(len(ids)!=1 for ids in inp):raise ValueError('could not map triangulation')
     qp=np.asarray([ids[0] for ids in inp],dtype=int)
+    # For a triangulated disk with n vertices and boundary b >= 3,
+    # the two caps and walls need 2*(2*n-2-b)+2*b = 4*n-4 faces.
+    # This algorithm keeps every distinct projected input vertex.
+    if budget < 4*len(q)-4:
+        raise PrecisionFitLimit('budget')
     q0,q1,q2=q[T[:,0]],q[T[:,1]],q[T[:,2]]
     signed=np.array([cross(b-a,c-a) for a,b,c in zip(q0,q1,q2)])
     radii=np.linalg.norm(q0-q1,axis=1)*np.linalg.norm(q0-q2,axis=1)*np.linalg.norm(q2-q1,axis=1)/np.maximum(2*np.abs(signed),eps)
@@ -93,7 +120,11 @@ def fit_height_envelope(points, source, budget, strength):
     src_e=q[qp[src_edge]]
     reference=np.abs(signed[np.isfinite(radii)]).sum()*.5
     footprints=[]
-    for cutoff in np.unique(radii[np.isfinite(radii)]):
+    tiers=np.unique(radii[np.isfinite(radii)])
+    if extended and len(tiers)>_MAX_EXTENDED_TIERS:
+        raise PrecisionFitLimit('work')
+    edge_work=0
+    for cutoff in tiers:
         selected=radii<=cutoff
         good=T[selected]
         if len(np.unique(good))!=len(q):continue
@@ -111,6 +142,9 @@ def fit_height_envelope(points, source, budget, strength):
         if ap>=.995*reference:continue
         # Reject any proper crossing of an authored source edge with contour boundary.
         # Remaining intersections (including grazing/overlap) are covered by exact per-face clip/area below.
+        edge_work+=len(boundary)*len(src_e)
+        if extended and edge_work>_MAX_EXTENDED_EDGE_TESTS:
+            raise PrecisionFitLimit('work')
         ay=q[[a for a,b in boundary]]; by=q[[b for a,b in boundary]]
         def ce(f,g):return f[...,0]*g[...,1]-f[...,1]*g[...,0]
         u=ce(by-ay,src_e[:,0,None,:]-ay[None,:,:])
@@ -123,6 +157,7 @@ def fit_height_envelope(points, source, budget, strength):
     if not footprints:
         raise ValueError('no covered concavity within triangle budget')
     target_area=reference+(min(a for a,_,_ in footprints)-reference)*strength
+    clip_work=0
     for ap,good,boundary in sorted(footprints,key=lambda x:abs(x[0]-target_area)):
         bot=np.full(len(q),np.inf);top=np.full(len(q),-np.inf)
         np.minimum.at(bot,qp,p[:,2]);np.maximum.at(top,qp,p[:,2])
@@ -131,6 +166,9 @@ def fit_height_envelope(points, source, budget, strength):
         for t,z in zip(projected,face_z):
             target=abs(area(t)); total=0
             appropriate=np.nonzero(np.all(maxs>=t.min(axis=0)-tol,axis=1)&np.all(mins<=t.max(axis=0)+tol,axis=1))[0]
+            clip_work+=len(appropriate)
+            if extended and clip_work>_MAX_EXTENDED_CLIPS:
+                raise PrecisionFitLimit('work')
             for ind in appropriate:
                 ix=good[ind]
                 xy,zs=_clip(t,z,candidates[ind],eps)

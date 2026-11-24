@@ -544,6 +544,8 @@ def _register_body():
     if not any(getattr(h, "__name__", "") == "_abort_capture_before_save"
                for h in bpy.app.handlers.save_pre):
         bpy.app.handlers.save_pre.append(_abort_capture_before_save)
+    from .core.encoder import captured_bone_motion
+    captured_bone_motion.register()
     for handlers, callback in (
         (bpy.app.handlers.save_pre, prepare_mesh_cache_save),
         (bpy.app.handlers.save_post_fail, rollback_mesh_cache_save),
@@ -709,6 +711,8 @@ def unregister():
         _cancel_captures_before_change()
     except Exception as e:
         print(f"cancel_capture_jobs failed: {e}")
+    from .core.encoder import captured_bone_motion
+    captured_bone_motion.unregister()
     for handlers in (bpy.app.handlers.load_pre, bpy.app.handlers.undo_pre, bpy.app.handlers.redo_pre):
         for handler in list(handlers):
             if getattr(handler, "__name__", "") in ("_cancel_captures_before_change", "_cancel_captures_before_undo"):

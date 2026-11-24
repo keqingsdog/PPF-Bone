@@ -44,12 +44,13 @@ class PerfTests(unittest.TestCase):
    f=real(*a,**kw);opened.append(f);return f
   m.encode_obj_with_hash=lambda c:(order.append('scene') or (b'scene','scene-token'))
   m.encode_param_with_hash=lambda c:(order.append('param') or (b'param','param-token'))
+  context=types.SimpleNamespace(scene={})
   with patch('tempfile.TemporaryFile',tracked):
-   self.assertEqual(m._encode_upload_payloads(None,want_data=True,want_param=True),(b'scene',b'param','scene-token','param-token'))
+   self.assertEqual(m._encode_upload_payloads(context,want_data=True,want_param=True),(b'scene',b'param','scene-token','param-token'))
    self.assertEqual(order,['scene','param']);self.assertTrue(all(f.closed for f in opened))
    def fail(c):raise RuntimeError('param failed')
    m.encode_param_with_hash=fail
-   with self.assertRaisesRegex(RuntimeError,'param failed'):m._encode_upload_payloads(None,want_data=True,want_param=True)
+   with self.assertRaisesRegex(RuntimeError,'param failed'):m._encode_upload_payloads(context,want_data=True,want_param=True)
    self.assertTrue(all(f.closed for f in opened))
  def test_capture_ownership_index(self):
   from types import SimpleNamespace as NS

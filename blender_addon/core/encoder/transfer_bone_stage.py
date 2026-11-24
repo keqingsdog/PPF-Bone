@@ -57,10 +57,10 @@ def _check_scene(context):
             f'Sliced Transfer cannot reorder frame or graph handlers ({registered}). Use Transfer.')
 
 
-def _signature(plan, state):
+def _signature(plan, state, *, include_scale_sources=True):
     result, _, scales, anchors, roots = plan
     flags = [(entry[2]['body_uuid'], entry[4]) for entry in roots]
-    refs = sorted((a.name, b.name, s) for a,b,s in scales)
+    refs = sorted((a.name, b.name, s) for a,b,s in scales) if include_scale_sources else []
     rows = [(key, request['parent'].name,
              request['ancestor'].name if request['ancestor'] else None,
              [pb.name for pb in request['chain']]) for key,request in anchors.items()]
@@ -143,10 +143,10 @@ class SlicedBoneStage:
                     self.proof = _signature(self.plan,self.state)
                     if any(row[4] == 'OBJECT' for row in self.plan[4]):
                         raise BoneSamplingRequiresLegacy('Sliced Transfer does not support proxy-driven bone roots')
-            if self.plan is not None and any(self.plan[2:]):
+            if self.plan is not None and bones.has_sampled_bone_motion(self.plan[3], self.plan[4]):
                 return True  # allow redraw after preparation as well
         with self._evaluation():
-            if self.plan is not None and any(self.plan[2:]):
+            if self.plan is not None and bones.has_sampled_bone_motion(self.plan[3], self.plan[4]):
                 _,_,scales,anchors,roots = self.plan
                 while self.next < self.count:
                     frame = self.start+self.next
@@ -166,6 +166,9 @@ class SlicedBoneStage:
                 self.scene.frame_set(self.start)
                 context.view_layer.update()
             if self.plan is not None:
+                _, _, scales, anchors, roots = self.plan
+                if roots and not bones.has_sampled_bone_motion(anchors, roots):
+                    bones.sample_transport_bone_frame(scales, anchors.values(), roots, 0, self.fps, self.start)
                 self.document = bones.finish_transport_bones(self.plan)
             self.plan = None
             self._restore()

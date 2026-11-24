@@ -575,6 +575,12 @@ class CommunicatorFacade:
     def info(self) -> CommunicatorInfo:
         s = self._engine.state
         retiring = self._runner.reload_retiring
+        response = dict(self._runner._response_cache.last_response)
+        mode = self._runner.current_mode_response()
+        for key in ("solver_mode_v1", "solver_mode"):
+            response.pop(key, None)
+            if key in mode:
+                response[key] = mode[key]
         return CommunicatorInfo(
             status=RemoteStatus.UNKNOWN if retiring else s.to_remote_status(),
             message=self._runner.reload_retirement_message if retiring else s.message,
@@ -582,7 +588,7 @@ class CommunicatorFacade:
             server_error=s.server_error,
             violations=list(s.violations),
             exemptions=list(s.exemptions),
-            response=dict(self._runner._response_cache.last_response),
+            response=response,
             progress=s.progress,
             traffic=s.traffic,
         )

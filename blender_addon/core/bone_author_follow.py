@@ -693,7 +693,7 @@ def _transfer_scale_preflight_applicable(context):
     return _author_scale_checks_enabled(context.scene)
 
 
-def _sync_steps(context, *, transfer=False):
+def _sync_steps(context, *, transfer=False, scan_scale_frames=True):
     """Stage a whole author batch before writes; Apply Transform preserves shape."""
     global _transfer_deferred
     if context is None or context.scene is None:
@@ -727,12 +727,15 @@ def _sync_steps(context, *, transfer=False):
     scene = context.scene
     if not _author_scale_checks_enabled(scene):
         return 0  # Edit uses a read-only overlay; retain all proven pose baselines.
-    if transfer:
+    if transfer and scan_scale_frames:
         # Cached physical display is not authored pose. Keep the existing cache
         # and busy gates ahead of this validator and ahead of any mesh bake.
         from ..models.groups import get_addon_data
         from .encoder.bones import _validate_static_pose_scales_steps
         yield from _validate_static_pose_scales_steps(context, get_addon_data(scene).state, scene.frame_current)
+    elif transfer:
+        from .encoder.bones import _pose_scale_sources
+        _pose_scale_sources(context)
     from .bone_geometry_edit import active
     if active():
         return 0
@@ -921,13 +924,13 @@ def apply_pending(context):
     return _sync(context)
 
 
-def _sync(context, *, transfer=False):
+def _sync(context, *, transfer=False, scan_scale_frames=True):
     from .utils import finish_encode_steps
-    return finish_encode_steps(_sync_steps(context, transfer=transfer))
+    return finish_encode_steps(_sync_steps(context, transfer=transfer, scan_scale_frames=scan_scale_frames))
 
 
-def sync_for_transfer_steps(context):
-    return (yield from _sync_steps(context, transfer=True))
+def sync_for_transfer_steps(context, *, scan_scale_frames=True):
+    return (yield from _sync_steps(context, transfer=True, scan_scale_frames=scan_scale_frames))
 
 
 @contextmanager
@@ -1010,13 +1013,13 @@ def transfer_author_geometry_changed():
     return _transfer_deferred
 
 
-def sync_for_transfer(context):
+def sync_for_transfer(context, *, scan_scale_frames=True):
     """Flush before geometry/mass sampling; usable without a Window or timer.
 
     Busy, cached or actively edited scenes remain untouched. Unsupported frames
     remain untouched for the original strict encoder to refuse.
     """
-    return _sync(context, transfer=True)
+    return _sync(context, transfer=True, scan_scale_frames=scan_scale_frames)
 
 
 def _copy_preset_record(value):

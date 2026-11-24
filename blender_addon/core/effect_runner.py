@@ -77,7 +77,8 @@ from .events import (
     ServerStopped,
     UploadPipelineComplete,
 )
-from .protocol import DEFAULT_CHUNK_SIZE
+from .protocol import DEFAULT_CHUNK_SIZE, PROTOCOL_VERSION
+from .transitions import is_solver_query_status
 from .server_kill import KillReport, kill_remote_server
 from .session import new_session_id
 from . import collision_receipt
@@ -274,6 +275,7 @@ class EffectRunner:
         # core/cache.py for the rationale.
         from .cache import ResponseCache
         self._response_cache = ResponseCache()
+        self._mode_snapshot = None
 
         # Only the main-thread effect boundary reads current authorship.
         # Background jobs receive immutable expectations and a generation
@@ -472,6 +474,10 @@ class EffectRunner:
 
     def prepare_fetch_event(self, event):
         """Main-thread author snapshot before acquiring the event transition guard."""
+        from .events import ConnectionLost
+        if isinstance(event, ConnectionLost):
+            self._take_connect_ticket()
+            return
         if not isinstance(event, FetchMapComplete) or event.fetch_generation < 0:
             return
         if not self.fetch_event_is_current(event):
@@ -1368,6 +1374,16 @@ class EffectRunner:
         with self._connect_lock:
             return (self._backend, self._connect_epoch, self._project_name)
 
+    def current_mode_response(self):
+        """Return mode fields only after a status from this connection."""
+        from .state import Phase
+        if self._engine.state.phase != Phase.ONLINE:
+            return {}
+        snapshot = self._mode_snapshot
+        if snapshot is None or snapshot[0] != self.capture_connection_ticket():
+            return {}
+        return dict(snapshot[1])
+
     def connection_ticket_is_current(self, expected):
         return expected == self.capture_connection_ticket()
 
@@ -1463,6 +1479,7 @@ class EffectRunner:
                             self._collision_build_started = True
                         self._collision_invalidate()
                     ticket = self._collision_ticket()
+                    request_connection = expected_connection or self.capture_connection_ticket()
                     if req and req.get("request") == "resume":
                         self._begin_resume_generation(req, ticket)
                 except Exception as exc:
@@ -1472,21 +1489,21 @@ class EffectRunner:
                     # Command query (build, start, etc.) — never drop
                     if status_query_id is not None:
                         self._submit_cmd(self._do_query, req, ticket,
-                                         self.capture_connection_ticket(), status_query_id)
+                                         request_connection, status_query_id)
                     elif expected_connection is None:
-                        self._submit_cmd(self._do_query, req, ticket)
+                        self._submit_cmd(self._do_query, req, ticket, request_connection)
                     else:
                         self._submit_cmd(self._do_query, req, ticket, expected_connection)
                 else:
                     # Status poll — latest wins
                     if status_query_id is None:
-                        self._submit_poll(self._do_query, req, ticket)
+                        self._submit_poll(self._do_query, req, ticket, request_connection)
                     else:
                         # A user probe is not expendable background polling.
                         # Queue it durably; _worker_loop still classifies the
                         # empty request as a poll and never auto-replays it.
                         self._submit_cmd(self._do_query, req, ticket,
-                                         self.capture_connection_ticket(), status_query_id)
+                                         request_connection, status_query_id)
 
             # -- Data transfer (commands) --
             case DoSendData(remote_path=p, data=d):
@@ -1914,6 +1931,8 @@ class EffectRunner:
                         break
                     if not alive:
                         from .events import ConnectionLost
+                        self._take_connect_ticket()
+                        self._response_cache.clear()
                         console.write(f"Connection lost: {exc}")
                         self._engine.dispatch(ConnectionLost(cause=str(exc)))
                         with self._lifecycle_commit() as current:
@@ -1957,6 +1976,8 @@ class EffectRunner:
         """
         with self._connect_lock:
             self._connect_epoch += 1
+            self._mode_snapshot = None
+            self._response_cache.clear()
             return self._connect_epoch
 
     def _connect_attempt_is_current(self, epoch: int) -> bool:
@@ -2394,6 +2415,16 @@ class EffectRunner:
     def _status_query_current(self, query_id):
         return query_id is None or self._status_query_matches(self._engine.state, query_id)
 
+    def _record_mode_status(self, connection_ticket, response):
+        # An error or partial reply can be visible in the status panel without
+        # confirming what modes the connected solver supports.
+        if (connection_ticket is not None
+                and not response.get("error")
+                and str(response.get("protocol_version")) == PROTOCOL_VERSION
+                and "upload_id" in response
+                and is_solver_query_status(response.get("status"))):
+            self._mode_snapshot = (connection_ticket, dict(response))
+
     def _publish_status_query_result(self, query_id, response, connection_ticket,
                                      failure_reason="", invalidate=False):
         # The caller holds _collision_lock. Pair the final query-id check with
@@ -2408,6 +2439,7 @@ class EffectRunner:
                 self._collision_invalidate(discard=True)
             if response is not None:
                 self._response_cache.record(response)
+                self._record_mode_status(connection_ticket, response)
             self._engine.dispatch(StatusQueryResult(
                 query_id=query_id, response=response,
                 expected_connection_ticket=connection_ticket,
@@ -2534,6 +2566,7 @@ class EffectRunner:
                     return
                 if status_query_id is None:
                     self._response_cache.record(response)
+                    self._record_mode_status(expected_connection_ticket, response)
                     self._engine.dispatch(ServerPolled(response=response))
                 else:
                     self._publish_status_query_result(

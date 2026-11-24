@@ -318,8 +318,7 @@ def transition(state: AppState, event: Event) -> tuple[AppState, list[Effect]]:
                 message = "Server query response is not an object; result remains unconfirmed."
                 return _query_finished(state, query_id, {}, message), [DoLog(message)]
             raw_status = r.get("status", "")
-            if raw_status and (not isinstance(raw_status, str)
-                    or raw_status not in (*_STATUS_MAP, STATUS_BUSY, STATUS_SAVE_AND_QUIT)):
+            if raw_status and not is_solver_query_status(raw_status):
                 message = "Server query response has an unknown status; result remains unconfirmed."
                 return _query_finished(state, query_id, r, message), [DoLog(message)]
             try:
@@ -871,6 +870,12 @@ _STATUS_MAP: dict[str, Solver] = {
     STATUS_RESUMABLE: Solver.RESUMABLE,
     STATUS_FAILED: Solver.FAILED,
 }
+
+
+def is_solver_query_status(status: object) -> bool:
+    return isinstance(status, str) and (
+        status in _STATUS_MAP or status in (STATUS_BUSY, STATUS_SAVE_AND_QUIT)
+    )
 
 
 def _remote_log_lines(error_msg: str, prefix: str = "Remote: ") -> list[Effect]:

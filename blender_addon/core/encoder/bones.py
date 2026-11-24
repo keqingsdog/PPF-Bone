@@ -154,6 +154,7 @@ def _known_scale_validation_handlers(scene):
     """Only allow the plugin's own reviewed callbacks, with pose playback off."""
     import bpy
     from .. import bone_author_follow, bone_mass, live_timeline, pc2, rigid_pose, uuid_registry
+    from . import captured_bone_motion
     from ...ui import bone_overlay, joint_axes_overlay
     from ...ui.dynamics import group_ops, statistics
 
@@ -166,13 +167,14 @@ def _known_scale_validation_handlers(scene):
             bone_overlay._frame_placement_post, bone_author_follow._observe_frame_object_basis,
             live_timeline._observe_frame_change, pc2.curve_frame_change_handler,
             rigid_pose.bone_pose_frame_change, statistics.statistics_frame_change_handler,
+            captured_bone_motion.author_frame_changed,
         ),
         'depsgraph_update_pre': (),
         'depsgraph_update_post': (
             bone_overlay._depsgraph_changed, bone_author_follow._mark_author_motion,
             joint_axes_overlay._invalidate_armature_index,
             bone_mass.mass_depsgraph_updated, uuid_registry._on_depsgraph_update,
-            group_ops._cleanup_deleted_objects,
+            group_ops._cleanup_deleted_objects, captured_bone_motion.author_graph_updated,
         ),
     }
     return all(all(any(handler is own for own in known)
@@ -595,6 +597,11 @@ def finish_transport_bones(plan):
     return result
 
 
+def has_sampled_bone_motion(anchors, roots):
+    return bool(anchors) or any(root[3]["mode"] != "static" or root[3].get("control_events")
+                                for root in roots)
+
+
 def encode_bones_steps(context, state, fps, start_frame, *, cone_restoring_joint_ids=None,
                  mmd_automatic_channels=None):
     """Capture authoring at start and root motion at the original frame times."""
@@ -605,8 +612,15 @@ def encode_bones_steps(context, state, fps, start_frame, *, cone_restoring_joint
     )
     if plan is None:
         return None
+    return (yield from sample_prepared_bones_steps(context, state, fps, start_frame, plan))
+
+
+def sample_prepared_bones_steps(context, state, fps, start_frame, plan):
     _, _, scale_sources, anchors, roots = plan
-    if scale_sources or roots or anchors:
+    needs_motion_samples = has_sampled_bone_motion(anchors, roots)
+    if roots and not needs_motion_samples:
+        sample_transport_bone_frame(scale_sources, anchors.values(), roots, 0, fps, start_frame)
+    if needs_motion_samples:
         from ..frame_time import set_scene_frame
         scene = context.scene
         previous, subframe = scene.frame_current, scene.frame_subframe

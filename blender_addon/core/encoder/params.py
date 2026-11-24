@@ -1158,7 +1158,7 @@ def _build_param_dict_steps(context, *, pre_mmd_default=None, bone_motion=None):
         pin_config = _encode_pin_config(context, groups, state, fps, start_frame)
         ordered_pair_ids = []
         cross_stitch = _encode_cross_stitch(context, groups, ordered_pair_ids)
-        from .bones import encode_bones_steps
+        from .bones import encode_bones_steps, sample_prepared_bones_steps
         cone_restoring_joint_ids = set()
         mmd_automatic_channels = []
         options = dict(cone_restoring_joint_ids=cone_restoring_joint_ids,
@@ -1169,6 +1169,8 @@ def _build_param_dict_steps(context, *, pre_mmd_default=None, bone_motion=None):
             from .bones import prepare_transport_bones
             fresh = prepare_transport_bones(context, state, fps, start_frame, **options)
             bone_data = bone_motion.consume(context, state, fresh)
+            if bone_data is None and fresh is not None:
+                bone_data = yield from sample_prepared_bones_steps(context, state, fps, start_frame, fresh)
         joint_curve_owners = _active_restoring_joint_owners(bone_data)
         multipliers = {bone.ppf_bone_physics.joint_uuid: float(bone.ppf_bone_physics.angular_restoring_multiplier)
                        for arm in scene.objects if arm.type == 'ARMATURE'
@@ -1234,6 +1236,15 @@ def _build_param_dict_steps(context, *, pre_mmd_default=None, bone_motion=None):
         "group": group_params,
         "pin_config": pin_config,
     }
+    from ..facade import communicator
+    mode_response = communicator._runner.current_mode_response()
+    from ..state import Phase
+    if state.animation_mode and communicator._engine.state.phase == Phase.ONLINE and not mode_response:
+        from ...i18n import pgettext_iface
+        raise ValueError(pgettext_iface("Waiting for solver mode capability from the current connection"))
+    mode_supported = mode_response.get("solver_mode_v1") is True
+    if mode_supported:
+        result["solver_mode"] = "animation" if state.animation_mode else "strict"
     if cross_stitch:
         result["cross_stitch"] = cross_stitch
     if dyn_param:
@@ -1280,11 +1291,11 @@ def _build_param_dict(context, **options):
     return finish_encode_steps(_build_param_dict_steps(context, **options))
 
 
-def encode_param_with_hash_steps(context):
+def encode_param_with_hash_steps(context, *, bone_motion=None):
     from ..bone_mass import producer_mass_transaction
     with producer_mass_transaction(context):
         from .cbor_encode import dumps_envelope
-        tree = yield from _build_param_dict_steps(context)
+        tree = yield from _build_param_dict_steps(context, bone_motion=bone_motion)
         encoded = dumps_envelope("Param", tree)
         return encoded, hashlib.sha256(encoded).hexdigest()
 

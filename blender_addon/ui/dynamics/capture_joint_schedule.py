@@ -17,6 +17,11 @@ class JointCapture:
         # validity proof or an input-cache contract for a later Transfer.
         self._frame_reader = frame_reader
         self.bone_sampling = bone_sampling
+        from ...core.rigid_pose import _capture_native_channels
+        self.pose_channels = [(arm.name, arm.as_pointer(), arm.data, pb.name, _capture_native_channels(pb))
+                              for arm in context.scene.objects if arm.type == 'ARMATURE'
+                              for pb in arm.pose.bones] if bone_sampling is not None and context.mode == 'POSE' else []
+        self.bone_watch = None
         self._reader_done_frame = None
         self.context = context
         self.scene = context.scene
@@ -54,6 +59,10 @@ class JointCapture:
                 if not ok:
                     raise RuntimeError(why)
             self._guard()
+            if self.bone_sampling is not None:
+                context.view_layer.update()
+                from ...core.encoder.captured_bone_motion import CaptureWatch
+                self.bone_watch = CaptureWatch()
         except BaseException:
             self.close()
             raise
@@ -98,6 +107,11 @@ class JointCapture:
         if self.restored:
             raise RuntimeError("Combined capture frame was already restored")
         try:
+            if self.bone_watch is not None:
+                self.bone_watch.require_current()
+                from ...core.encoder.captured_bone_motion import evaluating
+                with evaluating(self.bone_watch):
+                    return self._tick(budget_ms)
             return self._tick(budget_ms)
         except BaseException:
             self.close()
@@ -120,6 +134,10 @@ class JointCapture:
                     self.scene.frame_set(f)
                     self.frame_sets += 1
                     self.seeded = f
+                    if (self.pose_channels and f == self.bone_sampling.start
+                            and f == self.bone_sampling.job['saved_frame']
+                            and not self.bone_sampling.job['saved_subframe']):
+                        self._restore_pose()
                     self._guard()
                 # Same hide-after-frame-set rule as the standalone production path.
                 with origin.sampling_cache_scope(self._capture_sampling_targets):
@@ -169,6 +187,11 @@ class JointCapture:
                 job, token = self.jobs[0][2:4]
                 if origin.owns_capture_job(job, token):
                     origin.restore_frame(job)
+                    self._restore_pose()
+
+    def _restore_pose(self):
+        from .bone_capture import restore_sampled_author_pose
+        restore_sampled_author_pose(self.context, self.scene, self.pose_channels)
 
     def tasks(self, context=None):
         """Return live writer inputs; also usable as prepublication recheck.
@@ -220,6 +243,8 @@ class JointCapture:
         if self.closed:
             return
         try:
+            if self.bone_watch is not None:
+                self.bone_watch.close()
             self._restore_once()
         finally:
             for _, mod, job, token, _ in self.jobs:

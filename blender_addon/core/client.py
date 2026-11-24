@@ -349,7 +349,12 @@ def _gap_fill_poses(obj, n_verts):
     # still show the depsgraph-baked pose at each gap frame.
     sd_cache_world = None
     if has_static_deform_animation(obj):
-        sd_cache = get_static_deform_cache(obj)
+        try:
+            sd_cache = get_static_deform_cache(obj)
+        except (OSError, ValueError) as exc:
+            from ..i18n import pgettext_iface as iface_
+            message = iface_("Cannot read the Static capture for '{object}' while fetching animation. Recapture Deformation and fetch again.")
+            raise ValueError(message.format(object=obj.name)) from exc
         if sd_cache is not None and sd_cache.shape[1] == n_verts:
             sd_cache_world = sd_cache.astype(numpy.float64)
     return rest_co, sd_cache_world
@@ -1300,6 +1305,13 @@ def apply_animation(context=None):
         return
     _applying_animation = True
     try:
-        _apply_animation_impl(context)
+        from .encoder.captured_bone_motion import has_capture, preserve_during_output
+        context = context if context is not None else bpy.context
+        if (has_capture(context.scene)
+                and communicator.has_pending_animation_frames()):
+            with preserve_during_output(context):
+                _apply_animation_impl(context)
+        else:
+            _apply_animation_impl(context)
     finally:
         _applying_animation = False

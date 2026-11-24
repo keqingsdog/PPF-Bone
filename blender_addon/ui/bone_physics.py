@@ -540,10 +540,10 @@ class PPF_PT_BonePhysics(bpy.types.Panel):
 
     def _draw_read_contents(self, context, frozen=False):
         from ..core.bone_selection_parameters import SelectionLayout,active_author,resolve_selected_authors
-        from .dynamics.bone_capture import draw_preview_controls
+        from .dynamics.bone_capture import draw_capture_controls
         base = _FrozenPropertyLayout(self.layout, context) if frozen else self.layout
         layout = SelectionLayout(base, context)
-        draw_preview_controls(layout, context)
+        draw_capture_controls(layout, context)
         bone = active_bone(context)
         if active_armature(context) is None and not (context.object and context.object.get('ppf_bone_proxy_owned')):
             header, editor = layout.panel('ppf_bone_editor_workspace', default_closed=False)

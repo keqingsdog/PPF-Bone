@@ -954,7 +954,7 @@ def pin_has_captured_anim(pin_item) -> bool:
         _, vg_name = decode_stored_pin_identifier(pin_item.name)
         if not vg_name:
             return False
-        return has_pin_anim_pc2(obj, vg_name)
+        return has_pin_anim_pc2(obj, vg_name, include_missing=True)
     except Exception:
         return False
 

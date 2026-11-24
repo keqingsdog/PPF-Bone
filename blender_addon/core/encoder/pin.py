@@ -226,6 +226,12 @@ def _encode_pin_config(context, groups, state, fps=None, start_frame=None):
     # Collect per-object pin config (duration, pull, operations) keyed by vertex index
     # Structure: {obj_name: {vertex_index: {"unpin_time": ..., "pull_strength": ..., "operations": [...]}}}
     pin_config = {}
+    from ..capture_provenance import bindings
+    from ..pc2 import PIN_DEFORM_SUFFIX, PIN_DEFORM_V2_SUFFIX
+    captured_pin_owners = {
+        key.partition("__")[0] for key in bindings(context.scene)
+        if key.endswith((PIN_DEFORM_SUFFIX, PIN_DEFORM_V2_SUFFIX))
+    }
     for group in groups:
         if group.object_type == "STATIC":
             continue
@@ -253,7 +259,8 @@ def _encode_pin_config(context, groups, state, fps=None, start_frame=None):
             # Capture owns its track independently of the operations marker.
             # Keep ordinary plain pins (including old unflagged caches) cheap.
             if plain_pin:
-                if not getattr(pin_item, "has_captured_anim", False):
+                if (not getattr(pin_item, "has_captured_anim", False)
+                        and pin_item.object_uuid not in captured_pin_owners):
                     continue
                 from ..uuid_registry import plan_pin_reference
                 capture_plan = plan_pin_reference(pin_item)
@@ -544,9 +551,10 @@ def _encode_pin_config(context, groups, state, fps=None, start_frame=None):
             # (capture finalize sets it), but we also probe the cache
             # directly in case a .blend was opened without the
             # load_post reconciler having had a chance to run yet.
-            from ..pc2 import get_pin_anim_cache
+            from ..capture_provenance import load_for_export
             pin_cache = (
-                get_pin_anim_cache(obj, vg_name)
+                load_for_export(context.scene, obj, "PIN", vg_name,
+                                required=bool(getattr(pin_item, "has_captured_anim", False)))
                 if obj.type == "MESH" else None
             )
             if (obj.type == "MESH"

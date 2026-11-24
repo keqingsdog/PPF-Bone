@@ -164,3 +164,11 @@ def cancel_pending():
     _pending.clear()
     if bpy.app.timers.is_registered(_flush):
         bpy.app.timers.unregister(_flush)
+
+
+def flush_pending():
+    """Complete pending Outliner-only work before an authoring capture starts."""
+    if _pending:
+        if bpy.app.timers.is_registered(_flush):
+            bpy.app.timers.unregister(_flush)
+        _flush()

@@ -7,6 +7,7 @@
 
 import os
 import errno
+import math
 import stat
 import json
 import struct
@@ -187,6 +188,30 @@ def _load_pc2_array(filepath):
             return None
         data = numpy.frombuffer(f.read(), dtype="<f")
     return data.reshape(n_frames, n_verts, 3).copy()
+
+
+def _load_captured_input_array(filepath):
+    """Validate a finalized input; output/playback files can still be appended."""
+    try:
+        f = open(filepath, "rb")
+    except FileNotFoundError:
+        return None
+    with f:
+        size = os.fstat(f.fileno()).st_size
+        header = f.read(PC2_HEADER_SIZE)
+        if len(header) != PC2_HEADER_SIZE:
+            raise ValueError("incomplete PC2 header")
+        magic, version, verts, start, sampling, frames = struct.unpack("<12siiffi", header)
+        if (magic != PC2_HEADER or version != PC2_VERSION or verts < 1 or frames < 1
+                or not math.isfinite(start) or not math.isfinite(sampling) or sampling <= 0):
+            raise ValueError("invalid PC2 header")
+        expected = frames * verts * FRAME_VERTEX_SIZE
+        if size != PC2_HEADER_SIZE + expected:
+            raise ValueError(f"PC2 payload size mismatch (expected {expected}, found {size-PC2_HEADER_SIZE})")
+        body = f.read(expected)
+        if len(body) != expected or f.read(1):
+            raise ValueError("PC2 payload changed while reading")
+    return numpy.frombuffer(body, dtype="<f").reshape(frames, verts, 3).copy()
 
 
 def fill_gap_frames(filepath, from_frame_idx, to_frame_idx, n_verts, obj_key=None):
@@ -910,10 +935,16 @@ def scene_has_solver_cache(scene=None) -> bool:
     return any(key in uids for key in _curve_cache)
 
 
+def _recorded_static_binding(scene):
+    from .capture_provenance import bindings
+    return {key for key in bindings(scene) if key.endswith(STATIC_DEFORM_SUFFIX)} if scene is not None else set()
+
+
 def scene_has_static_deform_cache(scene=None) -> bool:
     """Only captures with exact ownership in this scene enable its Clear button."""
-    # Skip walking scene objects when the project has no static capture files.
-    if not any(key.endswith(STATIC_DEFORM_SUFFIX) for key in _static_deform_cache):
+    scene = _capture_scene(scene)
+    # Skip scene walking when there is no capture file, array or binding.
+    if not _recorded_static_binding(scene) and not any(key.endswith(STATIC_DEFORM_SUFFIX) for key in _static_deform_cache):
         try:
             with os.scandir(get_pc2_dir()) as entries:
                 possible = any(entry.name.casefold().endswith((STATIC_DEFORM_SUFFIX + '.pc2').casefold())
@@ -1691,7 +1722,7 @@ def write_static_deform_pc2(obj, frames, *, proof=None, scene=None):
 
 def load_static_deform_cache(key):
     """Load a static-deform PC2 file into the in-memory cache."""
-    arr = _load_pc2_array(get_pc2_path(key))
+    arr = _load_captured_input_array(get_pc2_path(key))
     if arr is not None:
         _static_deform_cache[key] = arr
 
@@ -1716,7 +1747,7 @@ def has_static_deform_animation(obj):
     key = static_deform_pc2_key(obj)
     if key in _static_deform_cache:
         return True
-    return os.path.exists(get_pc2_path(key))
+    return os.path.exists(get_pc2_path(key)) or key in _recorded_static_binding(_capture_scene())
 
 
 def get_static_deform_cache(obj):
@@ -1822,10 +1853,11 @@ def _owned_capture_keys(scene=None, *, static_cache_only=False):
     if static_cache_only:
         # This runs from an operator poll during redraw. Restrict the ownership
         # checks to present static files or arrays before resolving paths.
+        bound = _recorded_static_binding(scene)
         candidates = {
             key: uid for key, uid in candidates.items()
             if uid and _safe_capture_key(key)
-            and (key in _static_deform_cache or os.path.exists(get_pc2_path(key)))
+            and (key in _static_deform_cache or key in bound or os.path.exists(get_pc2_path(key)))
         }
         if not candidates:
             return set()
@@ -1881,10 +1913,12 @@ def _clear_capture_keys(keys, scene=None, *, include_missing=False):
     allowed = _owned_capture_keys(scene)
     records = _capture_records(scene)
     original_records = dict(records)
+    bound = provenance.bindings(scene) if scene is not None else {}
     cleared = []
     for key in set(keys) & allowed:
         path = get_pc2_path(key)
-        existed = os.path.exists(path) or key in _static_deform_cache or key in _pin_anim_cache
+        existed = (os.path.exists(path) or key in _static_deform_cache or key in _pin_anim_cache
+                   or key in bound or key in records or os.path.exists(path + provenance.PROOF_SUFFIX))
         try:
             if os.path.exists(path):
                 os.remove(path)
@@ -1937,7 +1971,23 @@ def count_deform_cache_files(scene=None) -> int:
 
 def clear_orphan_deform_caches(scene=None, *, exclude_keys=()) -> int:
     """Clear only this scene's proven captures, including memory-only/orphaned ones."""
-    return len(_clear_capture_keys(_owned_capture_keys(scene) - set(exclude_keys), scene))
+    scene = _capture_scene(scene)
+    excluded = set(exclude_keys)
+    suppressed = _legacy_pin_suppressed(scene)
+    if suppressed:
+        from .uuid_registry import get_object_uuid
+        for obj in scene.objects:
+            if obj.type != 'MESH':
+                continue
+            uid = get_object_uuid(obj)
+            if not uid:
+                continue
+            for vg in obj.vertex_groups:
+                v2 = f"{uid}__{_safe_vg_for_key(vg.name)}{PIN_DEFORM_V2_SUFFIX}"
+                if v2 in suppressed:
+                    legacy = vg.name.replace(' ', '_').replace('/', '_')
+                    excluded.add(f"{uid}__{legacy}{PIN_DEFORM_SUFFIX}")
+    return len(_clear_capture_keys(_owned_capture_keys(scene) - excluded, scene))
 
 
 # ---------------------------------------------------------------------------
@@ -1976,12 +2026,26 @@ def _safe_vg_for_key(vg_name: str) -> str:
     return 'vg2-' + vg_name.encode('utf-8').hex()
 
 
-def pin_anim_pc2_key(obj, vg_name: str) -> str:
+_PIN_LEGACY_SUPPRESS = 'ppf_legacy_pin_suppress_v1'
+
+
+def _legacy_pin_suppressed(scene):
+    try:
+        raw = json.loads(scene.get(_PIN_LEGACY_SUPPRESS, '[]'))
+    except (AttributeError, TypeError, ValueError):
+        return set()
+    return {key for key in raw if isinstance(key, str) and key.endswith(PIN_DEFORM_V2_SUFFIX)} if isinstance(raw, list) else set()
+
+
+def pin_anim_pc2_key(obj, vg_name: str, *, scene=None) -> str:
     """Return the UUID-backed key for a pin's depsgraph-captured cache."""
     from .uuid_registry import get_or_create_object_uuid
     uid = get_or_create_object_uuid(obj)
     key = f"{uid}__{_safe_vg_for_key(vg_name)}{PIN_DEFORM_V2_SUFFIX}"
-    if os.path.exists(get_pc2_path(key)):
+    from .capture_provenance import bindings
+    scene = _capture_scene(scene)
+    bound = bindings(scene) if scene is not None else {}
+    if key in bound or key in _pin_anim_cache or os.path.lexists(get_pc2_path(key)) or key in _legacy_pin_suppressed(scene):
         return key
     legacy_name = vg_name.replace(' ', '_').replace('/', '_')
     legacy = f"{uid}__{legacy_name}{PIN_DEFORM_SUFFIX}"
@@ -1991,7 +2055,8 @@ def pin_anim_pc2_key(obj, vg_name: str) -> str:
     same_names = sum(group.name.replace(' ', '_').replace('/', '_').casefold() == legacy_name.casefold()
                      for group in obj.vertex_groups)
     if ('\\' not in legacy_name and same_names == 1
-            and (legacy in _pin_anim_cache or os.path.exists(get_pc2_path(legacy)))):
+            and _safe_capture_key(legacy)
+            and (legacy in bound or legacy in _pin_anim_cache or os.path.lexists(get_pc2_path(legacy)))):
         return legacy
     return key
 
@@ -2013,7 +2078,7 @@ def write_pin_anim_pc2(obj, vg_name: str, frames, *, proof=None, scene=None):
 
 def load_pin_anim_cache(key):
     """Load a pin-deform PC2 file into the in-memory cache (no-op if missing)."""
-    arr = _load_pc2_array(get_pc2_path(key))
+    arr = _load_captured_input_array(get_pc2_path(key))
     if arr is not None:
         _pin_anim_cache[key] = arr
 
@@ -2026,32 +2091,31 @@ def unload_pin_anim_cache(key=None):
         _pin_anim_cache.pop(key, None)
 
 
-def has_pin_anim_pc2(obj, vg_name: str) -> bool:
+def has_pin_anim_pc2(obj, vg_name: str, *, scene=None, include_missing=False) -> bool:
     """True if a pin-deform PC2 exists (in memory or on disk)."""
     if obj is None or getattr(obj, "type", None) != "MESH":
         return False
-    key = pin_anim_pc2_key(obj, vg_name)
-    if key in _pin_anim_cache:
+    scene = _capture_scene(scene)
+    key = pin_anim_pc2_key(obj, vg_name, scene=scene)
+    if key in _pin_anim_cache or os.path.exists(get_pc2_path(key)):
         return True
-    return os.path.exists(get_pc2_path(key))
+    if not include_missing or scene is None:
+        return False
+    from .capture_provenance import bindings
+    return key in bindings(scene)
 
 
-def get_pin_anim_cache(obj, vg_name: str):
+def get_pin_anim_cache(obj, vg_name: str, *, scene=None):
     """Return ``(n_frames, n_pin_verts, 3)`` for a pin, lazy-loading from disk."""
-    key = pin_anim_pc2_key(obj, vg_name)
+    key = pin_anim_pc2_key(obj, vg_name, scene=scene)
     if key not in _pin_anim_cache:
         load_pin_anim_cache(key)
     return _pin_anim_cache.get(key)
 
 
-def peek_pin_anim_frame_count(obj, vg_name: str) -> int:
-    """Read the displayed count without loading the pin's vertex samples."""
-    key = pin_anim_pc2_key(obj, vg_name)
-    cache = _pin_anim_cache.get(key)
-    if cache is not None:
-        return int(cache.shape[0])
+def _peek_capture_frame_count(filepath):
     try:
-        with open(get_pc2_path(key), "rb") as handle:
+        with open(filepath, "rb") as handle:
             header = handle.read(PC2_HEADER_SIZE)
             if len(header) != PC2_HEADER_SIZE:
                 return 0
@@ -2066,15 +2130,42 @@ def peek_pin_anim_frame_count(obj, vg_name: str) -> int:
         return 0
 
 
+
+def peek_static_deform_frame_count(obj) -> int:
+    key = static_deform_pc2_key(obj)
+    cache = _static_deform_cache.get(key)
+    if cache is not None:
+        return int(cache.shape[0])
+    return _peek_capture_frame_count(get_pc2_path(key))
+
+
+def peek_pin_anim_frame_count(obj, vg_name: str) -> int:
+    """Read the displayed count without loading the pin's vertex samples."""
+    key = pin_anim_pc2_key(obj, vg_name)
+    cache = _pin_anim_cache.get(key)
+    if cache is not None:
+        return int(cache.shape[0])
+    return _peek_capture_frame_count(get_pc2_path(key))
+
+
 def remove_pin_anim_pc2(obj, vg_name: str, scene=None, *, allow_missing=False):
     scene = _capture_scene(scene)
     from .uuid_registry import get_object_uuid
     uid = get_object_uuid(obj)
     if scene is None or not uid or not _exclusive_capture_object(scene, obj, uid):
         return False
-    # Metadata-only cleanup is successful only after the same full ownership guard.
-    return bool(_clear_capture_keys([pin_anim_pc2_key(obj, vg_name)], scene,
-                                    include_missing=allow_missing))
+    key = pin_anim_pc2_key(obj, vg_name, scene=scene)
+    from . import capture_provenance as provenance
+    legacy = f"{uid}__{vg_name.replace(' ', '_').replace('/', '_')}{PIN_DEFORM_SUFFIX}"
+    cleared = bool(_clear_capture_keys([key], scene, include_missing=allow_missing))
+    # A successful, explicit clear of the canonical capture must not reveal
+    # an older filename as motion. Never touch that legacy file here.
+    if (cleared and key.endswith(PIN_DEFORM_V2_SUFFIX) and _safe_capture_key(legacy)
+            and (legacy in provenance.bindings(scene) or os.path.lexists(get_pc2_path(legacy)))):
+        suppressed = _legacy_pin_suppressed(scene)
+        suppressed.add(key)
+        scene[_PIN_LEGACY_SUPPRESS] = json.dumps(sorted(suppressed))
+    return cleared
 
 
 def clear_all_pin_anim_animation(scene=None):
@@ -2217,15 +2308,20 @@ def migrate_pc2_on_save(*_args):
     target_dir = get_pc2_dir()
     global _capture_project_dir
     previous_dir = _capture_project_dir
-    from .capture_provenance import copy_pair
+    from .capture_provenance import bindings, copy_pair
     if previous_dir is not None and os.path.realpath(previous_dir) != os.path.realpath(target_dir):
+        # A cache dict is scoped to the former PC2 directory, not just UUIDs.
+        # Removing old references is O(number of cached inputs), with no I/O.
+        unload_static_deform_cache()
+        unload_pin_anim_cache()
         for scene in bpy.data.scenes:
+            bound = bindings(scene)
             for key in _owned_capture_keys(scene):
                 name = os.path.basename(get_pc2_path(key))
                 source, destination = os.path.join(previous_dir, name), os.path.join(target_dir, name)
                 if os.path.exists(source):
                     try:
-                        copy_pair(source, destination)
+                        copy_pair(source, destination, expected_proof=bound.get(key))
                     except (OSError, ValueError, RuntimeError) as exc:
                         _log_curve_handler_error(f"Capture '{key}' migration refused; source retained: {exc}")
     _capture_project_dir = target_dir

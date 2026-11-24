@@ -1,4 +1,4 @@
-"""Modal authored bone survey. No persistent or Transfer-consumable cache."""
+"""Capture authored bone motion for reuse by Transfer."""
 import time
 
 import bpy
@@ -8,7 +8,6 @@ from ...core.encoder import resolve_solver_fps, resolve_start_frame
 from ...core.encoder import bones
 from ...core.rigid_pose import has_bone_pose_cache, _detached_display_pending
 from ...i18n import pgettext_iface as iface_
-from ...models.bone_bindings import bone_frame_cache
 from ...models.groups import get_addon_data
 from . import capture_frame_batch as guard
 
@@ -33,8 +32,36 @@ def _require_idle(context):
         raise RuntimeError(iface_("Stop playback and clear displayed solver bone animation before bone capture"))
 
 
+def prepare_capture_authoring(context):
+    """Synchronize edited proxy geometry before recording the motion snapshot."""
+    from ...core.bone_author_follow import transfer_author_transaction, sync_for_transfer
+    from ...core.bone_proxy_outliner import flush_pending
+    from ...core.rigid_pose import suspend_playback
+    with transfer_author_transaction(context) as commit_notification:
+        with suspend_playback():
+            sync_for_transfer(context, scan_scale_frames=False)
+        commit_notification()
+    flush_pending()
+    context.view_layer.update()
+
+
+def restore_sampled_author_pose(context, scene, saved_channels):
+    from ...core.rigid_pose import _capture_native_channels, _restore_native_channels
+    changed = False
+    for arm_name, pointer, data, name, channels in saved_channels:
+        arm = scene.objects.get(arm_name)
+        if arm is None or arm.as_pointer() != pointer or arm.data != data:
+            continue
+        pose = arm.pose.bones.get(name)
+        if pose is not None and _capture_native_channels(pose) != channels:
+            _restore_native_channels(pose, channels)
+            changed = True
+    if changed:
+        context.view_layer.update()
+
+
 class BoneSampling:
-    """Explicit per-frame demand from potentially different author and solver windows."""
+    """Read bone motion at the solver's requested sample times."""
     def __init__(self, context):
         _require_idle(context)
         self.job = {'saved_frame': int(context.scene.frame_current)}
@@ -43,25 +70,18 @@ class BoneSampling:
         self.start, self.count, self.fps, *_ = self.stamp
         if self.count <= 0:
             raise ValueError(iface_("Bone capture requires at least one solver frame"))
-        # Freeze the author scale reference at the original playhead/subframe,
-        # separately from the document's reference at the solver start frame.
-        self.author_start = int(context.scene.frame_current)
-        with bone_frame_cache():
-            self.author_sources = tuple(bones._pose_scale_sources(context))
-        self.author_next = self.author_start if self.author_sources else None
         self.solver_next = self.start
         self.solver_plan = None
         self.actor_sources = tuple((o, o.data, o.as_pointer()) for o in context.scene.objects
                                    if o.type == 'ARMATURE')
-        self.processed = self.elapsed_sampling = 0
+        self.processed = 0
         self.total = self.count
-        if self.author_sources:
-            self.total += min(self.count, abs(self.author_start - self.start))
         self.document = None
+        self.proof = None
 
     @property
     def pending(self):
-        return min((i for i in (self.author_next, self.solver_next) if i is not None), default=None)
+        return self.solver_next
 
     def require_valid(self, context):
         origin.require_origin(self.job, context)
@@ -77,27 +97,23 @@ class BoneSampling:
         if self.pending != f:
             return False
         self.require_valid(context)
-        begin = time.perf_counter()
-        if self.author_next == f:
-            with bone_frame_cache():
-                bones._validate_pose_scales_at_frame(self.author_sources, f)
-            self.author_next = f + 1 if f + 1 < self.author_start + self.count else None
-        if self.solver_next == f:
-            if f == self.start:
-                self.solver_plan = bones.prepare_transport_bones(
-                    context, get_addon_data(context.scene).state, self.fps, self.start)
-                if self.solver_plan is None:
-                    raise RuntimeError(iface_("No enabled bone transport bindings found"))
-                self._has_track = any(self.solver_plan[2:])
-            if self._has_track:
-                _, _, scale_sources, anchors, roots = self.solver_plan
-                bones.sample_transport_bone_frame(
-                    scale_sources, anchors.values(), roots, f - self.start, self.fps, f)
-            self.solver_next = f + 1 if f + 1 < self.start + self.count else None
-            if self.solver_next is None:
-                self.document = bones.finish_transport_bones(self.solver_plan)
+        if f == self.start:
+            state = get_addon_data(context.scene).state
+            self.solver_plan = bones.prepare_transport_bones(context, state, self.fps, self.start)
+            if self.solver_plan is None:
+                raise RuntimeError(iface_("No enabled bone transport bindings found"))
+            from ...core.encoder.transfer_bone_stage import _signature
+            self.proof = _signature(self.solver_plan, state, include_scale_sources=False)
+            self._has_track = bones.has_sampled_bone_motion(self.solver_plan[3], self.solver_plan[4])
+            self.total = self.count if self._has_track else 1
+        _, _, scale_sources, anchors, roots = self.solver_plan
+        if self._has_track or roots:
+            bones.sample_transport_bone_frame(
+                scale_sources, anchors.values(), roots, f - self.start, self.fps, f)
+        self.solver_next = f + 1 if self._has_track and f + 1 < self.start + self.count else None
+        if self.solver_next is None:
+            self.document = bones.finish_transport_bones(self.solver_plan)
         self.processed += 1
-        self.elapsed_sampling += time.perf_counter() - begin
         self.require_valid(context)
         return True
 
@@ -107,6 +123,11 @@ class StandaloneBoneCapture:
         from . import pin_capture_ops as pin, static_deform_ops as static
         if is_active() or pin.is_pin_capture_running() or static.is_capture_running():
             raise RuntimeError(iface_("Another deformation capture is in progress"))
+        prepare_capture_authoring(context)
+        from ...core.rigid_pose import _capture_native_channels
+        self.pose_channels = [(arm.name, arm.as_pointer(), arm.data, pb.name, _capture_native_channels(pb))
+                              for arm in context.scene.objects if arm.type == 'ARMATURE'
+                              for pb in arm.pose.bones] if context.mode == 'POSE' else []
         self.bones = BoneSampling(context)
         self.context = context
         self.scene = context.scene
@@ -117,6 +138,9 @@ class StandaloneBoneCapture:
         self.closed = False
         self.frame_sets = 0
         self.started = time.perf_counter()
+        context.view_layer.update()
+        from ...core.encoder.captured_bone_motion import CaptureWatch
+        self.watch = CaptureWatch()
 
     def _require(self, context):
         if self.closed or self.layer != context.view_layer.as_pointer():
@@ -131,27 +155,39 @@ class StandaloneBoneCapture:
     def tick(self, context, *, budget_ms=35):
         try:
             deadline = time.perf_counter() + budget_ms / 1000
-            self._require(context)
-            while (frame := self.bones.pending) is not None:
-                self.scene.frame_set(frame)
-                self.frame_sets += 1
-                self.seeded = frame
-                context.view_layer.update()
-                self._require(context)
-                self.bones.sample(context, frame)
-                if time.perf_counter() >= deadline:
-                    break
-            return self.bones.pending is not None
+            self.watch.require_current()
+            from ...core.encoder.captured_bone_motion import evaluating
+            with evaluating(self.watch):
+                return self._tick_evaluated(context, deadline)
         except BaseException:
             self.close()
             raise
+
+    def _tick_evaluated(self, context, deadline):
+        self._require(context)
+        while (frame := self.bones.pending) is not None:
+            self.scene.frame_set(frame)
+            self.frame_sets += 1
+            self.seeded = frame
+            context.view_layer.update()
+            if (self.pose_channels and frame == self.bones.start
+                    and frame == self.bones.job['saved_frame']
+                    and not self.bones.job['saved_subframe']):
+                restore_sampled_author_pose(context, self.scene, self.pose_channels)
+            self._require(context)
+            self.bones.sample(context, frame)
+            if time.perf_counter() >= deadline:
+                break
+        return self.bones.pending is not None
 
     def close(self, *, restore=True):
         if self.closed:
             return
         self.closed = True
+        self.watch.close()
         if restore:
             origin.restore_frame(self.bones.job)
+            restore_sampled_author_pose(self.context, self.scene, self.pose_channels)
 
 
 _active = None
@@ -168,10 +204,12 @@ def standalone_progress(context):
     return job.bones.processed, job.bones.total, job.seeded
 
 
-def draw_preview_controls(layout, context):
+def draw_capture_controls(layout, context):
     progress = standalone_progress(context)
     if progress is None:
-        layout.operator(SOLVER_OT_CaptureBoneMotion.bl_idname, icon="ARMATURE_DATA")
+        row = layout.row(align=True)
+        row.operator(SOLVER_OT_CaptureBoneMotion.bl_idname, icon="ARMATURE_DATA")
+        row.operator(SOLVER_OT_ClearBoneCapture.bl_idname, icon="TRASH")
         return
     done, total, _frame = progress
     layout.progress(
@@ -187,17 +225,17 @@ def cancel_active(*, restore=True):
 
 
 class SOLVER_OT_CaptureBoneMotion(bpy.types.Operator):
-    """Sample and validate authored bone inputs without writing solver caches."""
+    """Capture bone motion for Transfer in the current Blender session."""
     bl_idname = "solver.capture_bone_motion"
-    bl_label = "Capture Bone Motion (Preview)"
+    bl_label = "Capture Bone Motion"
 
     @classmethod
     def poll(cls, context):
         from . import static_deform_ops as static, pin_capture_ops as pin
-        if not context.window or context.mode != "OBJECT" or is_active() or static.is_capture_running() or pin.is_pin_capture_running():
+        if not context.window or context.mode not in {"OBJECT", "POSE"} or is_active() or static.is_capture_running() or pin.is_pin_capture_running():
             return False
-        from ..solver import com, is_bake_running, is_running
-        return (not is_bake_running() and not com.busy() and not is_running(com.info.response)
+        from ..solver import com, is_bake_running, is_running, _staged_encode_active
+        return (not is_bake_running() and not _staged_encode_active() and not com.busy() and not is_running(com.info.response)
                 and has_bones(context))
 
     def execute(self, context):
@@ -246,7 +284,11 @@ class SOLVER_OT_CaptureBoneMotion(bpy.types.Operator):
                 from ..solver import redraw_all_areas
                 redraw_all_areas(context)
                 return {'RUNNING_MODAL'}
-            self.report({'INFO'}, iface_("Bone preview complete: {bindings} bindings, {frames} frame evaluations, {seconds:.2f} s").format(
+            job.close()
+            context.view_layer.update()
+            from ...core.encoder import captured_bone_motion
+            captured_bone_motion.publish(context, job.bones.proof, job.bones.document)
+            self.report({'INFO'}, iface_("Bone capture complete: {bindings} bindings, {frames} frame evaluations, {seconds:.2f} s").format(
                 bindings=len(job.bones.document['bindings']),
                 frames=job.frame_sets,
                 seconds=time.perf_counter() - job.started,
@@ -263,4 +305,24 @@ class SOLVER_OT_AbortBoneCapture(bpy.types.Operator):
 
     def execute(self, context):
         cancel_active()
+        return {'FINISHED'}
+
+
+class SOLVER_OT_ClearBoneCapture(bpy.types.Operator):
+    bl_idname = "solver.clear_bone_capture"
+    bl_label = "Clear Bone Capture"
+
+    @classmethod
+    def poll(cls, context):
+        from ...core.encoder.captured_bone_motion import has_capture
+        from ..solver import _staged_encode_active, com, is_bake_running, is_running
+        from . import static_deform_ops as static, pin_capture_ops as pin
+        return (has_capture(context.scene) and not is_active()
+                and not static.is_capture_running() and not pin.is_pin_capture_running()
+                and not _staged_encode_active() and not is_bake_running()
+                and not com.busy() and not is_running(com.info.response))
+
+    def execute(self, context):
+        from ...core.encoder.captured_bone_motion import clear
+        clear()
         return {'FINISHED'}

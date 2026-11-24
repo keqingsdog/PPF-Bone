@@ -798,11 +798,8 @@ def object_deformation_frame_count(obj) -> int:
     """Number of frames currently in *obj*'s static-deform cache (0 if absent)."""
     if obj is None:
         return 0
-    from ...core.pc2 import get_static_deform_cache
-    cache = get_static_deform_cache(obj)
-    if cache is None:
-        return 0
-    return int(cache.shape[0])
+    from ...core.pc2 import peek_static_deform_frame_count
+    return peek_static_deform_frame_count(obj)
 
 
 # ---------------------------------------------------------------------------

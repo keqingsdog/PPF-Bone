@@ -59,8 +59,8 @@ from ..models.groups import (
 )
 from .geometry_cleanup_ops import popup_transfer_error
 from .dynamics.bone_capture import (
-    SOLVER_OT_CaptureBoneMotion, SOLVER_OT_AbortBoneCapture, is_active as bone_capture_active,
-    draw_preview_controls, has_bones, standalone_progress,
+    SOLVER_OT_CaptureBoneMotion, SOLVER_OT_AbortBoneCapture, SOLVER_OT_ClearBoneCapture, is_active as bone_capture_active,
+    draw_capture_controls, has_bones, standalone_progress,
 )
 from .dynamics.bake_ops import bake_progress_snapshot, bake_scene_locked, is_bake_running
 from .dynamics.pin_capture_ops import (
@@ -391,6 +391,18 @@ def _staged_encode_active() -> bool:
     return encode_progress.is_active()
 
 
+def _selected_solver_mode(context):
+    if com._runner.current_mode_response().get("solver_mode_v1") is True:
+        return "animation" if get_addon_data(context.scene).state.animation_mode else "strict"
+    return None
+
+
+def _solver_mode_changed(context):
+    sealed = com._runner.current_mode_response().get("solver_mode")
+    selected = _selected_solver_mode(context)
+    return selected is not None and sealed in ("strict", "animation") and selected != sealed
+
+
 def _check_project_name_sync(context) -> str:
     """Detect project-name drift between UI and the active connection.
 
@@ -716,7 +728,7 @@ class SOLVER_PT_SolverPanel(Panel):
                     done=joint["pin_done"], total=joint["pin_total"]), translate=False)
 
             if joint["bone_total"]:
-                box.label(text=f'Bone preview frames: {joint["bone_done"]}/{joint["bone_total"]}')
+                box.label(text=iface_('Bone capture frames: {done}/{total}').format(done=joint['bone_done'], total=joint['bone_total']))
 
         if is_capture_running() and not joint_active:
             done, total, status, _ = capture_progress_snapshot()
@@ -795,23 +807,17 @@ class SOLVER_PT_SolverPanel(Panel):
         # out when there is nothing to capture / clear.
         box = layout.box()
         box.label(text="Deformations", icon="MOD_SIMPLEDEFORM")
-        batch_control = box.row()
+        batch_control = box.row(align=True)
         batch_control.enabled = not (is_capture_running() or is_pin_capture_running() or bone_capture_active())
         batch_control.prop(context.window_manager, "ppf_capture_frame_batch")
-        if context.window_manager.ppf_capture_frame_batch and has_bones(context):
-            sub = box.row()
-            sub.enabled = batch_control.enabled
-            sub.prop(context.window_manager, "ppf_capture_bones_in_batch")
+        if has_bones(context):
+            batch_control.prop(context.window_manager, "ppf_capture_bones_in_batch")
         box.operator(
             SOLVER_OT_RecaptureAllDeformations.bl_idname, icon="FILE_REFRESH"
         )
         box.operator(SOLVER_OT_ClearAllDeformations.bl_idname, icon="TRASH")
-        if has_bones(context):
-            bone_note = box.column(align=True)
-            bone_note.label(text="Bone preview is not cached.", icon="INFO")
-            bone_note.label(text=iface_("Transfer samples bones again."))
         if standalone_progress(context) is not None:
-            draw_preview_controls(box, context)
+            draw_capture_controls(box, context)
         _draw_bulk_capture_modes(box, context)
 
         # Export the simulated mesh sequence to a USD / Alembic cache: a
@@ -948,9 +954,13 @@ class SOLVER_OT_Transfer(AsyncOperator):
         self._mode = "pipeline"
         self._payload = {}
         self._transfer_frame = (context.scene.frame_current, context.scene.frame_subframe)
+        self._transfer_solver_mode = _selected_solver_mode(context)
         self._bone_stage = None
         self._upload_steps = None
+        self._captured_bone_motion = None
         self._upload_stamp = None
+        self._upload_capture_stamp = None
+        self._upload_capture_files = {}
         self._upload_mode = context.mode
         self._upload_layer = context.view_layer.as_pointer()
         self._stage_timer_interval = 0.02
@@ -1003,16 +1013,24 @@ class SOLVER_OT_Transfer(AsyncOperator):
 
     def _stage_encode_geometry(self, context):
         from ..core.async_op import STAGE_PENDING
+        from ..core.encoder import _capture_binding_stamp, _require_capture_binding_stamp
+        from ..core.capture_provenance import observe_transfer_capture_files
+        if _selected_solver_mode(context) != self._transfer_solver_mode:
+            raise StageAbort(iface_("Transfer again to change the session mode"), "WARNING")
+        if self._upload_capture_stamp is None:
+            self._upload_capture_stamp = _capture_binding_stamp(context.scene)
         try:
-            if self._bone_stage is not None:
-                if (context.scene.frame_current, context.scene.frame_subframe) != self._transfer_frame:
-                    raise ValueError(iface_("Timeline changed before Transfer encoding; start Transfer again"))
-                with self._bone_stage.encoding(context):
-                    prepared = prepare_upload(context, bone_motion=self._bone_stage)
-            else:
-                prepared = self._advance_upload_steps(context)
-                if prepared is None:
-                    return STAGE_PENDING
+            with observe_transfer_capture_files(self._upload_capture_files):
+                if self._bone_stage is not None:
+                    if (context.scene.frame_current, context.scene.frame_subframe) != self._transfer_frame:
+                        raise ValueError(iface_("Timeline changed before Transfer encoding; start Transfer again"))
+                    with self._bone_stage.encoding(context):
+                        prepared = prepare_upload(context, bone_motion=self._bone_stage)
+                else:
+                    prepared = self._advance_upload_steps(context)
+                    if prepared is None:
+                        return STAGE_PENDING
+            _require_capture_binding_stamp(context.scene, self._upload_capture_stamp)
             data, param, data_hash, param_hash = prepared
 
         except (Cbor2NotInstalledError, ValueError) as e:
@@ -1029,6 +1047,7 @@ class SOLVER_OT_Transfer(AsyncOperator):
         self._payload["param_hash"] = param_hash
 
     def _advance_upload_steps(self, context):
+        from ..core.encoder import captured_bone_motion
         from ..core.encoder import begin_upload_steps, cancel_upload_steps, upload_steps_active
         from ..core.encoder.transfer_bone_stage import _callback_token
         from ..core import encode_progress
@@ -1037,7 +1056,8 @@ class SOLVER_OT_Transfer(AsyncOperator):
         if self._upload_steps is None:
             if frame != self._transfer_frame:
                 raise ValueError(iface_("Timeline changed before Transfer encoding; start Transfer again"))
-            self._upload_steps = begin_upload_steps(context)
+            self._captured_bone_motion = captured_bone_motion.for_transfer(context)
+            self._upload_steps = begin_upload_steps(context, bone_motion=self._captured_bone_motion)
         if not upload_steps_active(self._upload_steps):
             raise StageAbort(iface_("Transfer was cancelled before a scene change"), "INFO")
         current_stamp = frame, _callback_token()
@@ -1048,7 +1068,8 @@ class SOLVER_OT_Transfer(AsyncOperator):
         deadline = time.monotonic() + 0.025
         while True:
             try:
-                label, done, total = next(self._upload_steps)
+                with captured_bone_motion.evaluating(self._captured_bone_motion):
+                    label, done, total = next(self._upload_steps)
             except StopIteration as finished:
                 self._upload_steps = None
                 cancel_upload_steps()
@@ -1059,16 +1080,31 @@ class SOLVER_OT_Transfer(AsyncOperator):
                 self._upload_stamp = frame, _callback_token()
                 return None
 
+    def _require_upload_capture_current(self, context):
+        from ..core.encoder import _require_capture_binding_stamp
+        from ..core.capture_provenance import require_transfer_capture_files_current
+        try:
+            motion = self._captured_bone_motion
+            if motion is not None:
+                motion.require_upload_ready(context)
+            _require_capture_binding_stamp(context.scene, self._upload_capture_stamp)
+            require_transfer_capture_files_current(self._upload_capture_files)
+        except ValueError as exc:
+            raise StageAbort(str(exc), 'WARNING') from exc
+
     def _stage_upload(self, context):
         # The topology stamp lands HERE, not in the encoder: every stage that
         # can refuse the Transfer has run by now, so a scene that never reached
         # the wire does not get recorded as transferred and its stale-topology
         # warning still fires.
         from ..core.async_op import _origin_cancel_message
+        if _selected_solver_mode(context) != self._transfer_solver_mode:
+            raise StageAbort(iface_("Transfer again to change the session mode"), "WARNING")
         if self._origin_changed(context):
             raise StageAbort(_origin_cancel_message(self), 'WARNING')
         if (context.scene.frame_current, context.scene.frame_subframe) != self._transfer_frame:
             raise StageAbort(iface_("Timeline changed during Transfer; start Transfer again"), 'WARNING')
+        self._require_upload_capture_current(context)
         stage = getattr(self, "_bone_stage", None)
         if stage is not None:
             stage.require_upload_ready(context)
@@ -1105,6 +1141,7 @@ class SOLVER_OT_Transfer(AsyncOperator):
         engine.on_change(observe_upload)
         from ..core.effect_runner import ConnectionOriginChanged
         try:
+            self._require_upload_capture_current(context)
             com.build_pipeline(
                 data=self._payload["data"], param=self._payload["param"],
                 data_hash=self._payload["data_hash"],
@@ -1139,6 +1176,8 @@ class SOLVER_OT_Transfer(AsyncOperator):
         # Submission has transferred ownership to the engine/worker queue.
         # Build completion needs only receipts, never the original bytes.
         self._payload = {}
+        self._upload_capture_stamp = None
+        self._upload_capture_files = {}
 
     def cleanup_modal(self, context):
         # Also release locally retained bytes after refusal/cancel/timeout.
@@ -1149,6 +1188,8 @@ class SOLVER_OT_Transfer(AsyncOperator):
         if upload_steps_active(steps):
             cancel_upload_steps()
         self._payload = {}
+        self._upload_capture_stamp = None
+        self._upload_capture_files = {}
         stage = getattr(self, "_bone_stage", None)
         if stage is not None:
             stage.close()
@@ -1244,6 +1285,8 @@ class SOLVER_OT_Run(AsyncOperator):
         return {"RUNNING_MODAL"}
 
     def _stage_check_geometry(self, context):
+        if _solver_mode_changed(context):
+            raise StageAbort(iface_("Transfer again to change the session mode"), "WARNING")
         try:
             stop_for_edit(context)
         except TimelineBusyError as exc:
@@ -1253,7 +1296,9 @@ class SOLVER_OT_Run(AsyncOperator):
         # ignores hashes so the button is always actionable; the user lands
         # here when their geometry edits haven't been pushed yet.
         try:
-            local_data = compute_data_hash(context)
+            from ..core.encoder.captured_bone_motion import preserve_during_output
+            with preserve_during_output(context):
+                local_data = compute_data_hash(context)
         except (Cbor2NotInstalledError, ValueError) as e:
             # The panel's repair branch reads `com.error`, so a dialog the
             # artist dismisses would otherwise take the repair with it.
@@ -1276,7 +1321,9 @@ class SOLVER_OT_Run(AsyncOperator):
         except TimelineBusyError as exc:
             raise StageAbort(str(exc))
         try:
-            local_param = compute_param_hash(context)
+            from ..core.encoder.captured_bone_motion import preserve_during_output
+            with preserve_during_output(context):
+                local_param = compute_param_hash(context)
         except (Cbor2NotInstalledError, ValueError) as e:
             # Same treatment as the geometry check above: a refusal here is
             # the artist's to act on, so it sets the panel error rather than
@@ -1294,6 +1341,8 @@ class SOLVER_OT_Run(AsyncOperator):
             )
 
     def _stage_start_run(self, context):
+        if _solver_mode_changed(context):
+            raise StageAbort(iface_("Transfer again to change the session mode"), "WARNING")
         try:
             stop_for_edit(context)
         except TimelineBusyError as exc:
@@ -1712,6 +1761,9 @@ class SOLVER_OT_UpdateParams(AsyncOperator):
         if not self._remote_root:
             self.report({"ERROR"}, iface_("Not connected; cannot send parameters"))
             return {"CANCELLED"}
+        if _solver_mode_changed(context):
+            self.report({"WARNING"}, iface_("Transfer again to change the session mode"))
+            return {"CANCELLED"}
 
         self._stage_communicator = com
         self._mode = "local"
@@ -1750,6 +1802,8 @@ class SOLVER_OT_UpdateParams(AsyncOperator):
                 com.info.response.get("sealed_target_frame"))
 
     def _require_current_inputs(self, context, *, check_frame=True):
+        if _solver_mode_changed(context):
+            raise StageAbort(iface_("Transfer again to change the session mode"), "WARNING")
         if self._origin_changed(context):
             raise StageAbort(iface_("Scene, project or connection changed before parameter update"), "WARNING")
         if check_frame and (context.scene.frame_current, context.scene.frame_subframe) != self._source_frame:
@@ -2015,12 +2069,11 @@ class SOLVER_OT_ClearAnimation(Operator):
         # channels. This original effect is local and retains the upload/seal.
         from ..core.effects import DoClearAnimation
         from ..core.facade import runner
-        runner.execute(DoClearAnimation())
-        from ..core.encoder import resolve_start_frame
-        context.scene.frame_set(
-            resolve_start_frame(get_addon_data(context.scene).state)
-        )
-        clear_animation_data(context)
+        from ..core.encoder import captured_bone_motion, resolve_start_frame
+        with captured_bone_motion.preserve_during_output(context):
+            runner.execute(DoClearAnimation())
+            context.scene.frame_set(resolve_start_frame(get_addon_data(context.scene).state))
+            clear_animation_data(context)
         return {"FINISHED"}
 
 
@@ -2074,7 +2127,7 @@ def _recapture_pin_queue_identity(scene, specs):
 
 
 class SOLVER_OT_RecaptureAllDeformations(Operator):
-    """Re-capture Static and Pin inputs. For bones alone, run Bone Preview. With meshes, enable frame batching and Include Bone Preview to sample bones too. Transfer still evaluates bone animation live."""
+    """Re-capture Static and Pin inputs. Enable frame batching to include bone motion."""
 
     bl_idname = "solver.recapture_all_deformations"
     bl_label = "Re-capture All Deformations"
@@ -2098,7 +2151,8 @@ class SOLVER_OT_RecaptureAllDeformations(Operator):
         return bool(
             scene_has_capturable_static(context)
             or collect_capturable_pins(context, cheap=True)
-            or SOLVER_OT_CaptureBoneMotion.poll(context)
+            or (context.window_manager.ppf_capture_bones_in_batch
+                and SOLVER_OT_CaptureBoneMotion.poll(context))
         )
 
     def execute(self, context):
@@ -2113,6 +2167,15 @@ class SOLVER_OT_RecaptureAllDeformations(Operator):
             getattr(context.window_manager, "ppf_capture_frame_batch", False)
         )
         self._capture_frame_batch_active = False
+        self._capture_include_bones = bool(context.window_manager.ppf_capture_bones_in_batch and has_bones(context))
+        self._capture_pose_channels = []
+        if self._capture_include_bones and not self._capture_frame_batch_requested and context.mode == "POSE":
+            from ..core.rigid_pose import _capture_native_channels
+            self._capture_pose_channels = [
+                (arm.name, arm.as_pointer(), arm.data, pb.name, _capture_native_channels(pb))
+                for arm in context.scene.objects if arm.type == "ARMATURE"
+                for pb in arm.pose.bones
+            ]
         self._joint_capture = None
         from .dynamics.static_deform_ops import collect_capturable_static_objects
         from .dynamics.pin_capture_ops import collect_capturable_pins, validate_pin_capture_specs
@@ -2133,9 +2196,8 @@ class SOLVER_OT_RecaptureAllDeformations(Operator):
             self.report({"WARNING"}, str(exc))
             return {"CANCELLED"}
         if not static_objs and not pin_specs:
-            # Bone Preview owns its own modal timer and never publishes a
-            # deformation input cache. Do not require a saved blend for it.
-            if SOLVER_OT_CaptureBoneMotion.poll(context):
+            # Bone capture owns its own modal timer and does not require a saved blend.
+            if self._capture_include_bones and SOLVER_OT_CaptureBoneMotion.poll(context):
                 result = bpy.ops.solver.capture_bone_motion("EXEC_DEFAULT")
                 # The child owns the modal handler; this wrapper has no
                 # timer or modal state of its own in the bone-only route.
@@ -2184,11 +2246,12 @@ class SOLVER_OT_RecaptureAllDeformations(Operator):
         if self._capture_frame_batch_requested:
             try:
                 from .dynamics.capture_joint_schedule import JointCapture
-                from .dynamics.bone_capture import BoneSampling
+                from .dynamics.bone_capture import BoneSampling, prepare_capture_authoring
                 sampling = None
-                if context.window_manager.ppf_capture_bones_in_batch and has_bones(context):
-                    if context.mode != "OBJECT" or com.busy() or is_running(com.info.response):
-                        raise RuntimeError(iface_("Bone sampling requires Object Mode and an idle solver"))
+                if self._capture_include_bones:
+                    if context.mode not in {"OBJECT", "POSE"} or com.busy() or is_running(com.info.response):
+                        raise RuntimeError(iface_("Bone capture requires Object or Pose Mode and an idle solver"))
+                    prepare_capture_authoring(context)
                     sampling = BoneSampling(context)
                 self._joint_capture = JointCapture(context, static_objs, pin_specs, bone_sampling=sampling)
                 self._joint_capture._timer_owner = self
@@ -2364,6 +2427,8 @@ class SOLVER_OT_RecaptureAllDeformations(Operator):
         _bulk_capture_display["joint"] = self._bulk_display["joint"]
 
     def _modal_joint_capture(self, context, event):
+        if event.type == "ESC" and event.value == "PRESS":
+            return self._abort(context, None)
         if event.type != "TIMER" or getattr(event, "timer", self._timer) != self._timer:
             return {"PASS_THROUGH"}
         joint = self._joint_capture
@@ -2373,9 +2438,16 @@ class SOLVER_OT_RecaptureAllDeformations(Operator):
             if more:
                 redraw_all_areas(context)
                 return {"RUNNING_MODAL"}
+            if joint.bone_watch is not None:
+                joint.bone_watch.require_current()
+                joint.bone_watch.close()
             from ..core.capture_batch_commit import commit_batch_capture
             tasks = joint.tasks(context)
             commit_batch_capture(context.scene, tasks, recheck=lambda: joint.tasks(context))
+            if joint.bone_sampling is not None:
+                context.view_layer.update()
+                from ..core.encoder import captured_bone_motion
+                captured_bone_motion.publish(context, joint.bone_sampling.proof, joint.bone_sampling.document)
             self._summary["objs"] = sum(kind == "STATIC" for kind, *_ in tasks)
             self._summary["pins"] = sum(kind == "PIN" for kind, *_ in tasks)
             if joint.bone_sampling is not None:
@@ -2479,6 +2551,20 @@ class SOLVER_OT_RecaptureAllDeformations(Operator):
     def _finish(self, context):
         if getattr(self, '_capture_cancelled', False):
             return self._end_timer(context, {"CANCELLED"})
+        if not self._capture_frame_batch_requested and self._capture_include_bones:
+            self._capture_include_bones = False
+            from ..core.rigid_pose import _restore_native_channels
+            for arm_name, pointer, data, name, channels in self._capture_pose_channels:
+                arm = context.scene.objects.get(arm_name)
+                if arm is not None and arm.as_pointer() == pointer and arm.data == data:
+                    pb = arm.pose.bones.get(name)
+                    if pb is not None:
+                        _restore_native_channels(pb, channels)
+            if self._capture_pose_channels:
+                context.view_layer.update()
+            self._end_timer(context, {"FINISHED"})
+            result = bpy.ops.solver.capture_bone_motion("EXEC_DEFAULT")
+            return {"FINISHED"} if "RUNNING_MODAL" in result else result
         redraw_all_areas(context)
         parts = []
         if self._summary["objs"]:
@@ -2486,7 +2572,7 @@ class SOLVER_OT_RecaptureAllDeformations(Operator):
         if self._summary["pins"]:
             parts.append(iface_("{count} pin(s)").format(count=self._summary["pins"]))
         if self._summary.get("bone"):
-            parts.append(f'{self._summary["bone"]} bone bindings (preview)')
+            parts.append(f'{self._summary["bone"]} bone bindings')
         target = ", ".join(parts) if parts else iface_("nothing")
         self.report({"INFO"}, iface_("Re-captured deformation for {target}").format(target=target))
         return self._end_timer(context, {"FINISHED"})
@@ -2508,7 +2594,7 @@ class SOLVER_OT_RecaptureAllDeformations(Operator):
 
 
 class SOLVER_OT_ClearAllDeformations(Operator):
-    """Clear owned Static and Pin input caches only. Shared or unproven caches, authored geometry and keyframes are kept. Bone Preview has no cache to clear; solver playback is not cleared here."""
+    """Clear owned Static and Pin input caches."""
 
     bl_idname = "solver.clear_all_deformations"
     bl_label = "Clear All Deformations"
@@ -2977,6 +3063,7 @@ classes = (
     SOLVER_OT_RecaptureAllDeformations,
     SOLVER_OT_CaptureBoneMotion,
     SOLVER_OT_AbortBoneCapture,
+    SOLVER_OT_ClearBoneCapture,
     SOLVER_OT_ClearAllDeformations,
     SOLVER_OT_MigratePC2Folder,
     SOLVER_OT_UpdateParams,
@@ -2987,8 +3074,7 @@ classes = (
 
 def register():
     bpy.types.WindowManager.ppf_capture_bones_in_batch = BoolProperty(
-        name="Include Bone Preview", description="Share frame evaluation with authored bone input checks. "
-        "Preview only; Transfer still evaluates live inputs", default=False, options={"SKIP_SAVE"},
+        name="Include Bone Motion", description="Capture bone motion along with deformation", default=True, options={"SKIP_SAVE"},
     )
     bpy.types.WindowManager.ppf_capture_frame_batch = BoolProperty(
         name="Batch capture by frame",
@@ -2996,7 +3082,7 @@ def register():
             "On: sample Static and Pin in one timeline pass; errors stop capture. "
             "Off: sample sequentially. Stateful scenes may differ; keep a project copy"
         ),
-        default=False,
+        default=True,
         options={"SKIP_SAVE"},
     )
     for cls in classes:

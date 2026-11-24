@@ -201,8 +201,8 @@ def compute_mesh_hash(context):
             # this, the encoder would happily ship the OLD cache after
             # an Armature tweak because the rest mesh is unchanged.
             if group.object_type == "STATIC" and obj.type == "MESH":
-                from ..pc2 import get_static_deform_cache
-                cache = get_static_deform_cache(obj)
+                from ..capture_provenance import load_for_export
+                cache = load_for_export(context.scene, obj, "STATIC")
                 if cache is not None:
                     from ..uuid_registry import get_or_create_object_uuid
                     obj_uuid = get_or_create_object_uuid(obj)
@@ -749,12 +749,14 @@ def _build_author_obj_data(context, *, persist_topology_hash: bool):
     # the upload is actually accepted. Stamping here would record a topology as
     # transferred even when the Transfer went on to fail in the parameter
     # stage, and the stale-topology warning would then never fire.
-    if persist_topology_hash:
-        state.set_pending_mesh_hash(compute_mesh_hash(context))
-
     data = []
     with evaluate_at_start_frame(context, state):
-        return (yield from _encode_obj_inner(context, scene, state, data))
+        encoded = yield from _encode_obj_inner(context, scene, state, data)
+    # Scene validated and populated its cold Static arrays, so this
+    # topology stamp does not independently read the same input.
+    if persist_topology_hash:
+        state.set_pending_mesh_hash(compute_mesh_hash(context))
+    return encoded
 
 
 def _refuse_degenerate_tessellation(context, scene, state):
@@ -1076,15 +1078,10 @@ def _encode_obj_inner(context, scene, state, data):
                 # the depsgraph already composes parent/object fcurves
                 # and modifier deformation into the cache, so the rigid
                 # T/R/S path would double-count if both were emitted.
-                from ..pc2 import (
-                    get_static_deform_cache,
-                    has_static_deform_animation,
-                )
-                _has_sd_cache = (
-                    obj.type == "MESH" and has_static_deform_animation(obj)
-                )
-                if _has_sd_cache:
-                    cache = get_static_deform_cache(obj)
+                from ..capture_provenance import static_for_scene
+                cache = static_for_scene(context.scene, obj) if obj.type == "MESH" else None
+                _has_sd_cache = cache is not None
+                if cache is not None:
                     if cache is None or cache.shape[1] == 0 or cache.shape[0] == 0:
                         raise ValueError(
                             f"STATIC object '{obj.name}' in group "
@@ -1100,8 +1097,6 @@ def _encode_obj_inner(context, scene, state, data):
                             "last capture changed the topology; click "
                             "'Clear Cache' and re-run 'Capture Deformation'."
                         )
-                    from ..capture_provenance import validate_capture
-                    validate_capture(context.scene, obj, cache, "STATIC")
                     info["static_deform_animation"] = {
                         # Row i IS frame offset i (row 0 = pose at the resolved
                         # starting frame; ``_effective_frame_range`` anchors the

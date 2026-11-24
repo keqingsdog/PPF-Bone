@@ -192,6 +192,8 @@ def cancel_capture_jobs(*, restore=True):
     from ..ui.dynamics import static_deform_ops, pin_capture_ops
     from ..ui.dynamics.bone_capture import cancel_active
     cancel_active(restore=restore)
+    from .encoder.captured_bone_motion import clear
+    clear()
     errors = []
     combined_seen = set()
     for module in (static_deform_ops, pin_capture_ops):
