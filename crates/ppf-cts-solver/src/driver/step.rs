@@ -100,7 +100,7 @@
 //! to dispatch. Adding one is what closes every one of those folds at once, and
 //! converting any of them any other way would be inventing a second design.
 
-use crate::data::{DataSet, ParamSet, StepResult};
+use crate::data::{DataSet, FixPair, ParamSet, StepResult, VertexProp};
 
 use super::contact::Windows;
 use super::fixedcsr::FixedCsr;
@@ -110,7 +110,9 @@ use super::state::SolverState;
 use super::{assemble, dirichlet, log, pcg};
 
 #[path = "b32_shadow.rs"]
-mod b32_shadow;
+pub(super) mod b32_shadow;
+#[path = "bounded_animation_progress.rs"]
+mod bounded_animation_progress;
 
 use ppf_cts_compute::{Device, EncoderExt, Fault, Handle};
 
@@ -122,6 +124,23 @@ static PRIVATE_TEST_COMMIT_STAGE:std::sync::atomic::AtomicU8=std::sync::atomic::
 static PRIVATE_TEST_B3_PCG:std::sync::atomic::AtomicU8=std::sync::atomic::AtomicU8::new(0);
 #[cfg(all(test,feature="cpu"))]
 static PRIVATE_TEST_B3_DT:std::sync::atomic::AtomicU32=std::sync::atomic::AtomicU32::new(0);
+#[cfg(all(test, feature = "cpu"))]
+thread_local! {
+    pub(super) static PRIVATE_TEST_AFFINE_B3: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static PRIVATE_TEST_AFFINE_MESH_CUT: std::cell::Cell<Option<f64>> = const { std::cell::Cell::new(None) };
+    pub(super) static PRIVATE_TEST_AFFINE_CLIPPED_ENABLED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    pub(super) static PRIVATE_TEST_AFFINE_C2_REJECT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn affine_clipped_correction_enabled() -> bool {
+    #[cfg(all(test, feature = "cpu"))]
+    if let Some(enabled) = PRIVATE_TEST_AFFINE_CLIPPED_ENABLED.with(|value| value.get()) {
+        return enabled;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PPF_AFFINE_PIN_CLIPPED_CORRECTION")
+        .is_some_and(|value| value == "1"))
+}
 #[cfg(all(test,feature="cpu"))]
 pub(super) fn arm_private_b3_pcg(){PRIVATE_TEST_B3_DT.store(0,std::sync::atomic::Ordering::SeqCst);PRIVATE_TEST_B3_PCG.store(1,std::sync::atomic::Ordering::SeqCst);}
 #[cfg(all(test,feature="cpu"))]
@@ -378,10 +397,77 @@ fn root_final_budget_exhausted(step:u32,maximum:u32,final_step:bool,active_roots
     (!final_step||active_roots)&&maximum>0&&step>=maximum
 }
 fn initialize_final_clock(final_step:bool,initialized:bool)->bool {final_step&&!initialized}
+
+/// Map a certified fraction to scene time without stepping past either the
+/// spatial prefix or the shortened physical integration duration.
+fn affine_prefix_clock(
+    plan: crate::joint_root_motion_state::NativeStep, playback: f32, fraction: f64,
+    shortened: f32,
+) -> Option<(f64, f32)> {
+    let playback = f64::from(playback);
+    let limit = ((plan.end_s - plan.start_s) * fraction).min(f64::from(shortened) / playback);
+    let mut end = plan.start_s + limit;
+    if end - plan.start_s > limit {
+        end = end.next_down();
+    }
+    let elapsed = end - plan.start_s;
+    let h = (elapsed * playback) as f32;
+    (elapsed > 0.0 && elapsed <= limit && end < plan.end_s
+        && h > 0.0 && h <= shortened).then_some((end, h))
+}
+
+/// The host divides by playback before comparing retry duration to its
+/// requested scene step. An inward physical ULP alone can round back to it.
+fn affine_prefix_retry_duration(physical_limit: f32, scene_h: f32, playback: f32) -> Option<f32> {
+    let mut dt = physical_limit.min(scene_h.next_down() * playback);
+    if dt / playback >= scene_h {
+        dt = dt.next_down();
+    }
+    let retry_h = dt / playback;
+    (retry_h > 0.0 && retry_h < scene_h).then_some(dt)
+}
+
+/// Test the rounded solver position against the winning Dirichlet row. An
+/// earlier duplicate pin may carry a different target for the same vertex.
+fn affine_clipped_endpoint_reached(fixed: &[FixPair], props: &[VertexProp], xyz: &[f32]) -> bool {
+    let mut moving_hard_row = false;
+    let exact = fixed.iter().enumerate().all(|(row, pin)| {
+        let vertex = pin.index as usize;
+        let Some(prop) = props.get(vertex) else { return false; };
+        let Some(active_row) = prop.fix_index.checked_sub(1).map(|r| r as usize) else { return false; };
+        if prop.pdrd_body_index != 0 {
+            return false;
+        }
+        if active_row != row {
+            return fixed.get(active_row).is_some_and(|active| active.index == pin.index);
+        }
+        moving_hard_row |= pin.kinematic && pin.step_delta.iter().any(|&delta| delta != 0.0);
+        xyz.get(3 * vertex..3 * vertex + 3).is_some_and(|position| {
+            position.iter().zip(pin.position.iter()).all(|(&actual, &target)| {
+                actual.is_finite() && actual == target
+            })
+        })
+    });
+    exact && moving_hard_row
+}
+
 fn root_boundary_ready(preserve_boundary:bool,full_sweep_accepted:bool,step:u32,maximum:u32)->bool {
     // The final iteration uses the same index and still runs its own
     // shortened solve and CCD. Leave that slot available.
     !preserve_boundary || full_sweep_accepted || step.saturating_add(1)>=maximum
+}
+
+fn final_integration_dt(dt: f32, advanced: f64) -> f32 {
+    (f64::from(dt) * advanced) as f32
+}
+
+/// B3 uses the original pin positions and exact authored endpoint if neither
+/// its f32 rewind scalar nor its integration duration changes.
+fn final_clock_preserves_root_endpoint(dt: f32, advanced: f64, root_dt: Option<f32>) -> bool {
+    dt.is_finite() && dt > 0.0 && (0.0..=1.0).contains(&advanced)
+        && 1.0 - advanced as f32 == 0.0
+        && final_integration_dt(dt, advanced).to_bits() == dt.to_bits()
+        && root_dt.is_some_and(|value| value.to_bits() == dt.to_bits())
 }
 // Experimental routing into the existing bounded, fully restored subdivision.
 // A rounded candidate refusal still refuses the entire uncommitted trial.
@@ -403,12 +489,12 @@ fn root_trial_needs_subdivision(outcome:&FatalResult<StepResult>)->bool {
 }
 
 pub unsafe fn advance<D:Device>(device:&mut D,data:&DataSet,param:*mut ParamSet,state:&mut SolverState)->FatalResult<StepResult> {
-    advance_impl(device,data,param,state,false,None,false,false,false,false,None,None,None,false)
+    advance_impl(device,data,param,state,false,None,false,false,false,false,None,None,None,false,None)
 }
 
 pub unsafe fn advance_retry<D:Device>(device:&mut D,data:&DataSet,param:*mut ParamSet,state:&mut SolverState,
     control_boundary_already_applied:bool,rejection_budget:u32)->FatalResult<StepResult> {
-    advance_impl(device,data,param,state,control_boundary_already_applied,Some(rejection_budget),true,false,false,false,None,None,None,false)
+    advance_impl(device,data,param,state,control_boundary_already_applied,Some(rejection_budget),true,false,false,false,None,None,None,false,None)
 }
 
 pub(crate) struct FemHostRefusal {
@@ -434,19 +520,21 @@ impl HostDomainRefusal {
     fn original(&self)->&Fatal {match self {Self::Kinematics(v)=>&v.original,Self::Fem(v)=>&v.original,Self::Swing(v)=>&v.original,Self::Chart(v)=>&v.original,Self::MaterialSpin(v)=>&v.original,Self::NewtonCap(v)=>&v.original}}
 }
 pub(super) unsafe fn advance_host<D:Device>(device:&mut D,data:&DataSet,param:*mut ParamSet,state:&mut SolverState,
-    control_boundary_already_applied:bool,rejection_budget:u32,allow_cg:bool,allow_fem:bool,allow_swing:bool,allow_newton:bool,prepared:Option<crate::joint_root_motion_state::NativeStep>,allow_kinematics:bool)
+    control_boundary_already_applied:bool,rejection_budget:u32,allow_cg:bool,allow_fem:bool,allow_swing:bool,allow_newton:bool,prepared:Option<crate::joint_root_motion_state::NativeStep>,allow_kinematics:bool,
+    affine_pins:Option<&crate::scene::AffinePinPrefix<'_>>)
     ->FatalResult<(StepResult,Option<HostDomainRefusal>,Option<f32>)> {
     let mut refusal=None;
     let mut pcg_failed_dt=None;
     let route_domain=allow_kinematics||allow_fem||allow_swing||state.joints.material_spin_active()||state.joints.soft.material_spin_active();
     let result=advance_impl(device,data,param,state,control_boundary_already_applied,Some(rejection_budget),allow_cg,allow_fem,allow_swing,allow_newton,
-        if route_domain{Some(&mut refusal)}else{None},prepared,Some(&mut pcg_failed_dt),allow_kinematics)?;
+        if route_domain{Some(&mut refusal)}else{None},prepared,Some(&mut pcg_failed_dt),allow_kinematics,affine_pins)?;
     Ok((result,refusal,pcg_failed_dt))
 }
 
 unsafe fn advance_impl<D:Device>(device:&mut D,data:&DataSet,param:*mut ParamSet,state:&mut SolverState,
     control_boundary_already_applied:bool,retry_budget:Option<u32>,allow_cg:bool,allow_fem:bool,allow_swing:bool,allow_newton:bool,
-    mut domain_sink:Option<&mut Option<HostDomainRefusal>>,prepared:Option<crate::joint_root_motion_state::NativeStep>,mut pcg_sink:Option<&mut Option<f32>>,allow_kinematics:bool)->FatalResult<StepResult> {
+    mut domain_sink:Option<&mut Option<HostDomainRefusal>>,prepared:Option<crate::joint_root_motion_state::NativeStep>,mut pcg_sink:Option<&mut Option<f32>>,allow_kinematics:bool,
+    affine_pins:Option<&crate::scene::AffinePinPrefix<'_>>)->FatalResult<StepResult> {
     if !control_boundary_already_applied {
         super::roots::control_boundary(device,data,state,param)?;
     }
@@ -455,7 +543,7 @@ unsafe fn advance_impl<D:Device>(device:&mut D,data:&DataSet,param:*mut ParamSet
     let rotating_root=state.roots.rotating();
     let acceptance_retry_root=root_acceptance_retry_enabled() && state.roots.active();
     // Ordinary no-angular-control/no-rotating-root scenes keep the direct path.
-    if !rotating_root && !acceptance_retry_root && !state.joints.has_control() && !state.joints.soft.active() && !adaptive_retry && !allow_kinematics {let mut committed=false;let outcome=advance_trial(device,data,param,state,false,false,None,&mut committed,&mut None,&mut None);if !outcome.as_ref().is_ok_and(|r|r.success()){state.fem_roots.abort();}return outcome;}
+    if !rotating_root && !acceptance_retry_root && !state.joints.has_control() && !state.joints.soft.active() && !adaptive_retry && !allow_kinematics {let mut committed=false;let outcome=advance_trial(device,data,param,state,false,false,None,&mut committed,&mut None,&mut None,None);if !outcome.as_ref().is_ok_and(|r|r.success()){state.fem_roots.abort();}return outcome;}
     use ppf_cts_compute::{Buffer,AllocLabel};
     // Buffer has no releasing Drop. Keep every handle reachable even when a
     // size/copy/restore returns early, then explicitly attempt all four frees.
@@ -515,7 +603,7 @@ unsafe fn advance_impl<D:Device>(device:&mut D,data:&DataSet,param:*mut ParamSet
             let newton_scope=allow_newton && domain_sink.is_some() && super::newton_root_scope(state,(*param).playback);
             let mut newton_candidate=None;
             let mut kinematics_shortened=if allow_kinematics {Some(0.0)} else {None};
-            let outcome=advance_trial(device,data,param,state,adaptive_retry,swing_scope_supported,prepared,&mut committed,&mut newton_candidate,&mut kinematics_shortened);
+            let outcome=advance_trial(device,data,param,state,adaptive_retry,swing_scope_supported,prepared,&mut committed,&mut newton_candidate,&mut kinematics_shortened,affine_pins);
             let root_pcg=newton_scope && !committed && outcome.as_ref().is_ok_and(|r|r.retry_reason==crate::data::RETRY_REASON_PCG_MAX_ITERATIONS);
             let root_pcg_dt=if root_pcg {state.roots.trial_dt().filter(|h|h.is_finite() && *h>0.)} else {None};
             if !committed && outcome.is_err() && (material_spin||fem_material_spin) {
@@ -756,6 +844,7 @@ unsafe fn advance_trial<D: Device>(
     c5_committed:&mut bool,
     newton_candidate:&mut Option<(f32,u32,f32)>,
     kinematics_shortened:&mut Option<f32>,
+    affine_pins: Option<&crate::scene::AffinePinPrefix<'_>>,
 ) -> FatalResult<StepResult> {
     // Name: Time Per Simulation Step
     // Format: list[(time, ms)]
@@ -1239,7 +1328,25 @@ unsafe fn advance_trial<D: Device>(
     let mut step: u32 = 1;
     let mut final_step = false;
     let mut final_clock_initialized = false;
+    let mut affine_prefix_end = None;
+    let mut affine_prefix_fix = Vec::new();
+    let mut affine_clipped_fraction = None;
     let mut last_toi: f32 = 1.0;
+    let exact_root_final_mode = if cfg!(cuda_backend) {
+        std::env::var_os("PPF_ROOT_EXACT_FINAL")
+    } else {
+        None
+    };
+    let exact_root_final = exact_root_final_mode.as_deref().is_some_and(|value| value == "1");
+    let exact_root_final_shadow = exact_root_final_mode.as_deref().is_some_and(|value| value == "shadow");
+    let exact_root_final_receipt = exact_root_final_shadow
+        || std::env::var_os("PPF_ROOT_EXACT_FINAL_RECEIPT").is_some_and(|value| value == "1");
+    let mut exact_root_final_reported = false;
+    let mut bounded_progress = if std::env::var_os("PPF_ANIMATION_BOUNDED_PROGRESS")
+        .is_some_and(|value| value == "1")
+    { bounded_animation_progress::Progress::new(prm.target_toi) } else { None };
+    let bounded_progress_trace = bounded_progress.is_some()
+        && std::env::var_os("PPF_ANIMATION_BOUNDED_PROGRESS_TRACE").is_some_and(|value| value == "1");
     // This witness exists only for this advance and is set only after the
     // final successful root certificate fitted the current eval_x.
     let mut certified_final_fit_step: Option<u32>;
@@ -1256,6 +1363,7 @@ unsafe fn advance_trial<D: Device>(
         "pre_newton",
         log::Marked::quiet(_pre_newton.elapsed().as_secs_f64() * 1000.0),
     );
+    let measure_animation_work = crate::backend::animation_work::measuring();
     loop {
         certified_final_fit_step = None;
         let _nt_head = std::time::Instant::now();
@@ -1342,6 +1450,9 @@ unsafe fn advance_trial<D: Device>(
                     return Ok(result);
         }
 
+        if measure_animation_work {
+            crate::backend::animation_work::newton();
+        }
         // STEP B1. Open the iteration: every accumulator is cleared by the pass
         // that opens the assembly, never by a kernel inside it.
         // THE OPENING CLEAR, on the device. Every element model scatters into
@@ -1420,22 +1531,49 @@ unsafe fn advance_trial<D: Device>(
         // step with it BEFORE the targets are rebuilt off them.
         if final_step {
             if initialize_final_clock(final_step,final_clock_initialized) {
+            #[cfg(all(test, feature = "cpu"))]
+            if PRIVATE_TEST_AFFINE_B3.with(|active| active.replace(false)) {
+                toi_advanced *= 0.5;
+            }
+            #[cfg(all(test, feature = "cpu"))]
+            if let Some(fraction) = PRIVATE_TEST_AFFINE_MESH_CUT.with(|active| active.get()) {
+                toi_advanced *= fraction;
+            }
             #[cfg(all(test,feature="cpu"))]
             if PRIVATE_TEST_B3_PCG.compare_exchange(1,2,std::sync::atomic::Ordering::SeqCst,std::sync::atomic::Ordering::SeqCst).is_ok() {
                 // Exercise the real B3 shortening and solve on a controlled CCD fraction.
                 toi_advanced *= 0.5;
             }
-            // Host-only candidate. The host will resample authored input and
-            // retry through CCD after full precommit rollback.
             if kinematics_shortened.is_some() && toi_advanced < 1.0 {
                 let shortened = (f64::from(dt) * toi_advanced) as f32;
-                if shortened.is_finite() && shortened > 0.0 && shortened < dt {
-                    *kinematics_shortened = Some(shortened);
-                    result.newton_progress = false;
-                    return Ok(result);
+                if shortened.is_finite() && shortened > 0.0 {
+                    let prefix = affine_pins
+                        .filter(|_| pdrd_bodies == 0 && !prm.disable_pin_dof_removal)
+                        .and_then(|pins| affine_prefix_clock(root_plan, prm.playback, toi_advanced, shortened)
+                            .map(|(end, h)| (pins, end, h)));
+                    if let Some((pins, end, h)) = prefix {
+                        let fix = pins.sample_fix(root_plan.start_s, end);
+                        if fix.len() != state.fix.len() {
+                            return Err(Fatal::invariant("affine pin prefix changed membership"));
+                        }
+                        if !fix.is_empty() {
+                            state.fix.write(device, 0, &fix)?;
+                        }
+                        // The scene clock can shorten within one f32 duration
+                        // cell. Any subsequent host retry still needs a
+                        // strictly smaller requested integration duration.
+                        affine_prefix_end = Some((end, shortened.min(dt.next_down())));
+                        affine_prefix_fix = fix;
+                        dt = h;
+                    } else if shortened < dt {
+                        // Rebuild all authored inputs and run a fresh sweep.
+                        *kinematics_shortened = Some(shortened);
+                        result.newton_progress = false;
+                        return Ok(result);
+                    }
                 }
             }
-            if toi_advanced < 1.0 && !state.fix.is_empty() {
+            if affine_prefix_end.is_none() && toi_advanced < 1.0 && !state.fix.is_empty() {
                 let back = 1.0 - toi_advanced as f32;
                 let pins = state.fix.len() as u32;
                 let rewind_args = RewindFixArgs {
@@ -1451,7 +1589,9 @@ unsafe fn advance_trial<D: Device>(
             // formed in double and rounded ONCE on the way back. Multiplying in
             // f32 rounds twice and gives a different final step size, which is
             // the clock the whole trailing iteration integrates against.
-            dt = (f64::from(dt) * toi_advanced) as f32;
+            if affine_prefix_end.is_none() {
+                dt = final_integration_dt(dt, toi_advanced);
+            }
             let certified_requested_dt=dt;
             if let Some(old)=root_attempt.take(){
                 let next=state.roots.shorten(device,&old,dt)?;
@@ -1960,7 +2100,7 @@ unsafe fn advance_trial<D: Device>(
         // a term of the solve, and the one
         // stream that separates a scene whose geometry never touches from a
         // backend whose broad phase found nothing.
-        {
+        let (has_assembled_contact, no_assembled_contact) = {
             let (self_contact, static_contact) = if prm.disable_contact {
                 (0, 0)
             } else {
@@ -1980,11 +2120,18 @@ unsafe fn advance_trial<D: Device>(
             // self-contact, collision-mesh contact, and analytic constraints
             // (sphere, floor). A useful proxy for how crowded the collision
             // scene is at this iteration.
-            log::mark("advance", "num_contact", (self_contact + static_contact + constraint) as f64);
+            let total = self_contact + static_contact + constraint;
+            log::mark("advance", "num_contact", total as f64);
             log::mark("advance", "num_contact_dynamic", self_contact as f64);
             log::mark("advance", "num_contact_static_mesh", static_contact as f64);
             log::mark("advance", "num_contact_analytic", constraint as f64);
-        }
+            // Keep the original backend-specific contact gate. The opt-in
+            // anchored path requires every contact family to be empty.
+            (
+                if device.info().backend == "host" { total != 0 } else { self_contact != 0 },
+                total == 0,
+            )
+        };
         // Name: Matrix Assembly Time
         // Format: list[(time, ms)]
         // Description:
@@ -2400,6 +2547,7 @@ unsafe fn advance_trial<D: Device>(
                 );
             }
             reduction.prepare_mixed_precond(device, inverse.span(0, 9 * vertices), arithmetic_eligible)?;
+            let prescribed_bodies = roots.constraint_enabled_bodies();
             reduction.staged.reduced_schwarz.rebuild(device,reduction.map,&operator,
                 reduction.staged.empty_dyn_offset.handle(),joint_view,
                 reduction.staged.vbody.handle(),reduction.staged.prot.handle(),
@@ -2407,7 +2555,7 @@ unsafe fn advance_trial<D: Device>(
                     joint_mode:reduction.staged.jmode.handle(),joint_axis:reduction.staged.jaxis.handle(),
                     translation_lock:reduction.staged.tlock.handle(),translation_axis:reduction.staged.tlock_axis.handle(),translation_mode:reduction.staged.tlock_mode.handle(),
                     rotation_lock:reduction.staged.rlock.handle(),rotation_axis:reduction.staged.rlock_axis.handle(),rotation_mode:reduction.staged.rlock_mode.handle()},
-                &roots.constraint_enabled_bodies())?;
+                &prescribed_bodies)?;
             // The projector, built exactly as the locked branch builds it, and
             // `None` when the scene carries no lock so the reduced apply keeps
             // its unlocked shape.
@@ -2455,6 +2603,18 @@ unsafe fn advance_trial<D: Device>(
             // Borrow the already assembled block handle; optional capture only
             // reads it after the same frozen solve reports failure.
             pcg_rigid.failure_precond_blocks = Some(rigid_blocks.handle());
+            let full_body_admission = if has_assembled_contact {
+                pcg::FullBodyAdmission::ExistingContact
+            } else if cfg!(cuda_backend) && no_assembled_contact && !prm.disable_contact && !hard.active()
+                && reduction.map.n_cloth == 0 && !operator.has_tet_factor()
+                && joint_view.soft.is_none() && joint_view.curves.is_none()
+                && root_view.is_some_and(|root| root.constraint_domain.is_cacheable())
+                && joints.anchored_flight_covers(&prescribed_bodies)
+            {
+                pcg::FullBodyAdmission::AnchoredFreeFlight
+            } else {
+                pcg::FullBodyAdmission::Unqualified
+            };
             let solved = pcg::solve_rigid(
                 device,
                 &operator,
@@ -2489,6 +2649,7 @@ unsafe fn advance_trial<D: Device>(
                     pull: pull.handle(),
                     pull_count: pull.len(),
                 }) },
+                full_body_admission,
             )?;
             // Optional selected-iteration D2D freeze; no read/probe before B0 cap.
             if prm.max_newton_steps==2048 && analytic_assembly_ledger.selected(step,prm.max_newton_steps) && analytic_assembly_ledger.post_complete {
@@ -2699,6 +2860,11 @@ unsafe fn advance_trial<D: Device>(
             report.outcome=pcg::Outcome::MaxIterations;
             report.iterations=prm.cg_max_iter;
             report.relative_residual=prm.cg_tol.max(1.0);
+        }
+        if measure_animation_work {
+            crate::backend::animation_work::pcg(
+                report.iterations, matches!(report.outcome, pcg::Outcome::MaxIterations),
+            );
         }
         drop(operator);
         // Host tags only. In the qualified no-hard/no-lock path these solve buffers persist to B0.
@@ -3012,7 +3178,7 @@ unsafe fn advance_trial<D: Device>(
         // turns into 1.
         // THE LINE SEARCH, timed as `line_search`.
         let _line_search = std::time::Instant::now();
-        let (mut toi, b29_certificate) = {
+        let (mut toi, b29_certificate, mesh_only_cut) = {
             let filter = if prm.disable_contact {
                 None
             } else {
@@ -3139,15 +3305,17 @@ unsafe fn advance_trial<D: Device>(
                         / prm.line_search_max_t,
                 )),
             );
-            let smallest = filter
+            let mesh_toi = filter
                 .as_ref()
-                .map_or(prm.line_search_max_t, super::ccd::Filter::time_of_impact)
-                .min(sweep.time_of_impact);
+                .map_or(prm.line_search_max_t, super::ccd::Filter::time_of_impact);
+            let smallest = mesh_toi.min(sweep.time_of_impact);
+            let mesh_only_cut = mesh_toi < prm.line_search_max_t
+                && sweep.time_of_impact >= prm.line_search_max_t;
             let certificate = filter.as_ref().map(|mesh| b32_shadow::SweepCertificate {
                 raw_toi: mesh.time_of_impact(), ceiling: prm.line_search_max_t,
                 overlapping_start: mesh.overlapping_start().is_some(),
             });
-            ((smallest / prm.line_search_max_t).min(1.0), certificate)
+            ((smallest / prm.line_search_max_t).min(1.0), certificate, mesh_only_cut)
         };
         // THE STRAIN LIMITER'S OWN HALF, folded in after the contact CCD.
         // This is the half that makes the limit
@@ -3242,6 +3410,17 @@ unsafe fn advance_trial<D: Device>(
         }
         // Determine the actual safe rounded candidate BEFORE advancing B30's clock.
         let controlled=root_attempt.as_ref().map_or(&[][..],|a|a.body_indices.as_slice());
+        #[cfg(all(test, feature = "cpu"))]
+        let mesh_only_cut = if final_step && PRIVATE_TEST_AFFINE_MESH_CUT.with(|active| active.take()).is_some() {
+            assert_eq!(toi, 1.0, "the fixture needs a certified full candidate");
+            // The production acceptor and exact re-sweep still handle the
+            // injected strict subset of an already certified full sweep.
+            toi = 0.5;
+            true
+        } else {
+            mesh_only_cut
+        };
+        let pre_rounding_toi = toi;
         let toi = if toi>f32::EPSILON {
             let origin=state.target.handle();let proposed=state.eval_x.handle();
             let certify_mesh=!prm.disable_contact && (state.joints.active() || !controlled.is_empty());
@@ -3253,9 +3432,9 @@ unsafe fn advance_trial<D: Device>(
             // those used by the sweep; handle equality alone is not the proof.
             // The acceptor separately compares every finite rounded candidate
             // coordinate bitwise with its captured proposal on the first full trial.
-            let mode=std::env::var("PPF_B31_CERTIFICATE_MODE").unwrap_or_default();
-            let shadow_enabled=mode=="shadow";
-            let reuse_enabled=mode=="reuse";
+            let mode=std::env::var_os("PPF_B31_CERTIFICATE_MODE");
+            let shadow_enabled=mode.as_deref().is_some_and(|value| value=="shadow");
+            let reuse_enabled=mode.as_deref().map_or(cfg!(cuda_backend), |value| value=="reuse");
             let receipt=std::env::var_os("PPF_B31_REUSE_RECEIPT").is_some_and(|v|v=="1");
             let compare=certify_mesh && (shadow_enabled || reuse_enabled)
                 && b29_certificate.is_some_and(b32_shadow::SweepCertificate::covers_endpoint)
@@ -3322,6 +3501,34 @@ unsafe fn advance_trial<D: Device>(
                     return Ok(result);
         }
 
+        if let Some((_, shortened)) = affine_prefix_end {
+            if toi_recale != 1.0 || toi != 1.0 {
+                // The acceptor has written the rounded clipped pose. Hold it
+                // provisionally for the endpoint, rounded sweep, and C2 checks.
+                // Pure affine candidates cannot change target or eval_x in
+                // B32; this final Newton iteration then exits without B33.
+                let mesh_clipped = affine_clipped_correction_enabled()
+                    && toi_recale == 1.0 && sl_toi == 1.0
+                    && mesh_only_cut && toi == pre_rounding_toi
+                    && !prm.disable_contact && prm.line_search_max_t >= 1.0
+                    && pdrd_bodies == 0 && root_attempt.is_none()
+                    && grains == 0 && !state.plastic.any()
+                    && locked_groups == 0 && state.sphere.is_empty() && state.floor.is_empty()
+                    && !state.hard.active() && state.fem_roots.runtime.is_none()
+                    && !state.joints.active() && !state.joints.soft.active()
+                    && !state.joints.curves.active();
+                if mesh_clipped {
+                    affine_clipped_fraction = Some(toi);
+                } else {
+                    *kinematics_shortened = Some(
+                        affine_prefix_retry_duration(shortened, prm.dt, prm.playback)
+                            .ok_or_else(|| Fatal::invariant("affine pin prefix has no shorter scene duration"))?,
+                    );
+                    result.newton_progress = false;
+                    return Ok(result);
+                }
+            }
+        }
         let _nt_tail = std::time::Instant::now();
         // STEP B30. How far through its span the step has advanced. Kept in
         // double, because it accumulates across every Newton iteration.
@@ -3634,9 +3841,9 @@ unsafe fn advance_trial<D: Device>(
             } else {
                 let certify_mesh=state.joints.active() || !controlled.is_empty();
                 let SolverState {analytic,contact,floor,..}=&mut *state;
-                let mode = std::env::var("PPF_B32_CERTIFICATE_MODE").unwrap_or_default();
-                let shadow_enabled = mode == "shadow";
-                let reuse_enabled = mode == "reuse";
+                let mode = std::env::var_os("PPF_B32_CERTIFICATE_MODE");
+                let shadow_enabled = mode.as_deref().is_some_and(|value| value == "shadow");
+                let reuse_enabled = mode.as_deref().map_or(cfg!(cuda_backend), |value| value == "reuse");
                 let reuse_receipt = std::env::var_os("PPF_B32_REUSE_RECEIPT").is_some_and(|v| v == "1");
                 let compare = certify_mesh && (shadow_enabled || reuse_enabled)
                     && b32_certificate.is_some_and(b32_shadow::SweepCertificate::covers_endpoint)
@@ -3765,8 +3972,48 @@ unsafe fn advance_trial<D: Device>(
             }
             break;
         }
-        if toi_advanced >= f64::from(prm.target_toi) && step >= prm.min_newton_steps
-            && root_boundary_ready(preserve_root_boundary,full_remaining_sweep_accepted,step,prm.max_newton_steps) {
+        let progress_ready = toi_advanced >= f64::from(prm.target_toi) && step >= prm.min_newton_steps;
+        let original_boundary_ready = root_boundary_ready(
+            preserve_root_boundary, full_remaining_sweep_accepted, step, prm.max_newton_steps,
+        );
+        // The final pass still rebuilds the target and runs its ordinary
+        // solve, CCD, root certification and precommit checks. This only
+        // avoids waiting for a full remaining sweep when B3 already retains
+        // the exact pending root event endpoint and the same pin fraction.
+        let exact_boundary_ready = progress_ready && !original_boundary_ready
+            && (exact_root_final || exact_root_final_shadow)
+            && kinematics_shortened.is_none() && state.fem_roots.runtime.is_none()
+            && root_attempt.as_ref().is_some_and(|attempt| {
+                !attempt.body_indices.is_empty()
+                    && attempt.start_s.to_bits() == authored_root_plan.start_s.to_bits()
+                    && attempt.end_s.to_bits() == authored_root_plan.end_s.to_bits()
+                    && final_clock_preserves_root_endpoint(dt, toi_advanced, attempt.integration_dt_s)
+            });
+        if exact_boundary_ready && exact_root_final_receipt && !exact_root_final_reported {
+            exact_root_final_reported = true;
+            eprintln!(
+                "PPF_ROOT_EXACT_FINAL eligible=true used={} start={:.17e} root_end={:.17e} step={} original_cap={} toi={:.17e} dt_bits={:08x} final_dt_bits={:08x}",
+                exact_root_final, authored_root_plan.start_s, authored_root_plan.end_s, step,
+                prm.max_newton_steps, toi_advanced, dt.to_bits(), final_integration_dt(dt, toi_advanced).to_bits(),
+            );
+        }
+        let final_ready = progress_ready && (original_boundary_ready || (exact_root_final && exact_boundary_ready));
+        // Delay only the normal final transition away from authored endpoint
+        // and host resampling paths. The extra passes use the existing ordinary
+        // Newton continuation and its existing precommit failure handling.
+        let delay_final = final_ready && original_boundary_ready
+            && !authored_root_plan.lands_on_boundary && !root_plan.lands_on_boundary
+            && kinematics_shortened.is_none() && state.fem_roots.runtime.is_none()
+            && bounded_progress.as_mut().is_some_and(|policy|
+                policy.delay_final(toi_advanced, step, prm.max_newton_steps));
+        if bounded_progress_trace && final_ready {
+            if let Some(policy) = bounded_progress.as_ref().filter(|policy| policy.used() != 0) {
+                let event = if delay_final { "extend" } else { "finalizing" };
+                eprintln!("PPF_ANIMATION_BOUNDED_PROGRESS event={event} step={step} extra={} authored={:.9e} goal={:.9e} toi={:.17e} cap={}",
+                    policy.used(), prm.target_toi, policy.goal(), toi_advanced, prm.max_newton_steps);
+            }
+        }
+        if final_ready && !delay_final {
             final_step = true;
         } else {
             step += 1;
@@ -3806,6 +4053,7 @@ unsafe fn advance_trial<D: Device>(
             let SolverState {
                 contact: contact_state,
                 eval_x,
+                target,
                 positions: last_accepted,
                 prop_vertex,
                 fix,
@@ -3819,6 +4067,32 @@ unsafe fn advance_trial<D: Device>(
                      allocated, so a penetrating pose would be committed unreported",
                 ));
             };
+            if affine_clipped_fraction.is_some() {
+                // Reuse C2's download before publishing or rejecting any
+                // intersection. An unmet authored endpoint makes this a
+                // shortened attempt, so the host must restore and resample.
+                // The optional exact rounded sweep reads pose and target
+                // without writing either, so C2 can use this same mirror.
+                eval_x.download(device)?;
+                let endpoint_reached = affine_clipped_endpoint_reached(
+                    &affine_prefix_fix, prop_vertex.host(), eval_x.host(),
+                );
+                let mesh_certified = endpoint_reached && contact.certify_rounded_candidate(
+                    device, data, mesh_refs, &*param, target.handle(), pose, windows,
+                )?;
+                if !mesh_certified {
+                    let (_, shortened) = affine_prefix_end.expect("clipped correction needs an affine prefix");
+                    *kinematics_shortened = Some(
+                        affine_prefix_retry_duration(shortened, prm.dt, prm.playback)
+                            .ok_or_else(|| Fatal::invariant("affine pin prefix has no shorter scene duration"))?,
+                    );
+                    result.newton_progress = false;
+                    if !endpoint_reached {
+                        ::log::debug!("affine pin clipped correction: endpoint-mismatch start={:.17e}", prm.time);
+                    }
+                    return Ok(result);
+                }
+            }
             let _phase = super::phase::start("contact.refresh_leaves");
             let _aabb = std::time::Instant::now();
             contact.refresh_leaves(device, data, mesh_refs, pose, pose, 1.0, windows)?;
@@ -3842,11 +4116,12 @@ unsafe fn advance_trial<D: Device>(
             // `contact/ccd_sweep.kernel.cpp`, which is the shape this one takes
             // next; nothing blocks it. This download is the transport that host
             // walk needs and comes out with it.
-            // THE FINAL PENETRATION GATE, timed as `check_intersection`. The
-            // download above is inside the scope because it is part of what the
-            // gate costs today.
+            // Time C2 and its usual download. Clipped steps already downloaded
+            // once to validate their endpoint before C1.
             let _gate = std::time::Instant::now();
-            eval_x.download(device)?;
+            if affine_clipped_fraction.is_none() {
+                eval_x.download(device)?;
+            }
             let mut report =
                 contact.check_intersection(device, data, mesh_refs, pose, last_accepted.handle(), eval_x.host(), prop_vertex.host(), windows, !prm.disable_pin_dof_removal)?;
             if !prm.disable_pin_dof_removal {
@@ -3866,6 +4141,11 @@ unsafe fn advance_trial<D: Device>(
                     "NARROW_FE_SCOPED: start={:.17e} scoped_pairs={} rejected_pairs={}",
                     prm.time, report.scoped_soft_static_fe, report.found
                 );
+            }
+            #[cfg(all(test, feature = "cpu"))]
+            if affine_clipped_fraction.is_some() && PRIVATE_TEST_AFFINE_C2_REJECT.with(|armed| armed.replace(false)) {
+                // Inject at C2's normal verdict after genuine mesh checks.
+                report.found = report.found.max(1);
             }
             if report.is_clean() {
                 // THE CLEAN PATH IS `debug!`, SO THE TRANSCRIPT ONLY SPEAKS
@@ -3994,7 +4274,9 @@ unsafe fn advance_trial<D: Device>(
 
         // Compute and validate the same scene-clock duration before writing
         // the accepted clock or previous integration step.
-        let (accepted_end, accepted_scene_dt) = if kinematics_shortened.is_some() {
+        let (accepted_end, accepted_scene_dt) = if let Some((end, _)) = affine_prefix_end {
+            (end, (end - root_plan.start_s) as f32)
+        } else if kinematics_shortened.is_some() {
             (root_plan.end_s, (root_plan.end_s - root_plan.start_s) as f32)
         } else if let Some(attempt) = root_attempt.as_ref() {
             (attempt.end_s, (attempt.end_s - attempt.start_s) as f32)
@@ -4097,6 +4379,15 @@ unsafe fn advance_trial<D: Device>(
         if let Some(accepted)=material_commit {state.joints.finish_material_spin_commit(accepted);}
         if let Some(accepted)=fem_material_commit {state.joints.soft.finish_material_spin_commit(accepted);}
         *c5_committed=true;
+        if let Some(fraction) = affine_clipped_fraction {
+            ::log::debug!("affine pin clipped correction: committed start={:.17e} fraction={fraction:.9e}", prm.time);
+        }
+        if affine_prefix_end.is_some() {
+            ::log::debug!(
+                "affine pin B3 prefix committed: start={:.17e} end={accepted_end:.17e} integration_dt={dt:.9e}",
+                root_plan.start_s,
+            );
+        }
         #[cfg(test)]
         if private_test_commit_stage(2) {return Err(Fatal::invariant("PRIVATE_TEST_POST_C5"));}
 
@@ -4262,6 +4553,94 @@ unsafe fn compute_target<D: Device>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn affine_clipped_endpoint_requires_exact_effective_fixed_rows() {
+        let fixed = [
+            FixPair { index: 0, position: crate::data::Vec3f::new(9.0, 2.0, 3.0), ..FixPair::default() },
+            FixPair {
+                index: 0,
+                position: crate::data::Vec3f::new(1.0, 2.0, 3.0),
+                step_delta: crate::data::Vec3f::new(0.1, 0.0, 0.0),
+                kinematic: true,
+                ..FixPair::default()
+            },
+            FixPair { index: 1, position: crate::data::Vec3f::new(4.0, 5.0, 6.0), ..FixPair::default() },
+        ];
+        let mut props = [
+            VertexProp { fix_index: 2, ..VertexProp::default() },
+            VertexProp { fix_index: 3, ..VertexProp::default() },
+            VertexProp::default(),
+        ];
+        let mut xyz = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+        assert!(affine_clipped_endpoint_reached(&fixed, &props, &xyz));
+        xyz[6] = 0.0; // A free vertex is not required to reach the full proposal.
+        assert!(affine_clipped_endpoint_reached(&fixed, &props, &xyz));
+        xyz[0] = xyz[0].next_down();
+        assert!(!affine_clipped_endpoint_reached(&fixed, &props, &xyz));
+        xyz[0] = 1.0;
+        xyz[5] = f32::NAN;
+        assert!(!affine_clipped_endpoint_reached(&fixed, &props, &xyz));
+        xyz[5] = 6.0;
+        props[1].fix_index = 2;
+        assert!(!affine_clipped_endpoint_reached(&fixed, &props, &xyz));
+        props[1].fix_index = 3;
+        props[1].pdrd_body_index = 1;
+        assert!(!affine_clipped_endpoint_reached(&fixed, &props, &xyz));
+        props[1].pdrd_body_index = 0;
+        let mut static_fix = fixed;
+        static_fix[1].kinematic = false;
+        assert!(!affine_clipped_endpoint_reached(&static_fix, &props, &xyz));
+    }
+
+    #[test]
+    fn affine_pin_prefix_clock_preserves_the_certified_interval() {
+        use super::affine_prefix_clock;
+        use crate::joint_root_motion_state::native_step_before_scene_boundary;
+        for playback in [0.5_f32, 1.0, 2.0, 1.3] {
+            let start = 10.0_f64;
+            let boundary = 10.037_f64;
+            let plan = native_step_before_scene_boundary(start, 0.1, Some(boundary), playback).unwrap();
+            assert_eq!(plan.end_s, boundary);
+            for fraction in [0.5_f64, 0.989_999_91, 0.999_999_8, 0.999_999_999] {
+                let shortened = (f64::from(plan.integration_dt_s) * fraction) as f32;
+                let (end, h) = affine_prefix_clock(plan, playback, fraction, shortened).unwrap();
+                assert!(start < end && end < boundary);
+                assert!(end - start <= (boundary - start) * fraction);
+                assert!(h > 0.0 && h <= shortened);
+                assert_eq!(h.to_bits(), (((end - start) * f64::from(playback)) as f32).to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn affine_pin_prefix_retry_shortens_the_requested_scene_duration() {
+        let scene_h = 0.000_019_f32;
+        let playback = 1.3_f32;
+        let physical = (scene_h * playback).next_down();
+        assert_eq!(physical / playback, scene_h);
+        let retry = super::affine_prefix_retry_duration(physical, scene_h, playback).unwrap();
+        assert!(retry <= physical);
+        assert!(retry / playback < scene_h);
+    }
+
+    #[test]
+    fn root_final_clock_requires_exact_dt_and_zero_pin_rewind() {
+        use super::final_clock_preserves_root_endpoint as qualifies;
+        assert!(qualifies(1.0, 1.0, Some(1.0)));
+        assert!(qualifies(1.0, 1.0 - 2.0_f64.powi(-27), Some(1.0)));
+        // Exercise the f32 rounding midpoint and a mismatched pending root
+        // duration one ULP away from the B3 integration duration.
+        let dt = f32::from_bits(2.0_f32.to_bits() - 1);
+        let near_one = 1.0 - 2.0_f64.powi(-25);
+        assert_eq!(near_one as f32, 1.0);
+        assert!(qualifies(dt, near_one, Some(dt)));
+        assert!(!qualifies(dt, near_one, Some(f32::from_bits(dt.to_bits() - 1))));
+        assert!(!qualifies(1.0, 1.0 - 2.0_f64.powi(-24), Some(1.0)));
+        assert!(!qualifies(1.0, f64::NAN, Some(1.0)));
+        assert!(!qualifies(1.0, 1.0, None));
+        assert!(!qualifies(1.0, 1.0, Some(0.5)));
+    }
+
     #[test]
     fn authored_root_boundary_leaves_the_last_iteration_for_shorter_recertification() {
         assert!(!super::root_boundary_ready(true, false, 2, 4));

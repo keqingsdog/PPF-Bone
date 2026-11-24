@@ -275,6 +275,8 @@ inline int clz(unsigned value) {
 
 namespace compute {
 
+constexpr bool has_contact_query_witness = true;
+
 //
 // AN ACCUMULATOR SLOT IS ITS OWN TYPE, AND THE OPERATIONS BELOW ARE THE ONLY
 // WAY TO REACH ONE.

@@ -432,6 +432,37 @@ struct Pin {
     allow_intersection: bool,
 }
 
+impl Pin {
+    fn supports_affine_prefix(&self, start: f64, end: f64) -> bool {
+        if self.unpin_time.is_some() {
+            return false;
+        }
+        let [PinOperation::MoveBy { t_start, t_end, transition, .. }] =
+            self.operations.as_slice()
+        else {
+            return self.operations.is_empty();
+        };
+        if !t_start.is_finite() || !t_end.is_finite() || t_start >= t_end {
+            return false;
+        }
+        // A hold has the same membership and pin flags at every endpoint.
+        // A moving segment is supported only for exact Dirichlet rows.
+        end < *t_start || start >= *t_end
+            || (start >= *t_start && end <= *t_end && transition == "linear"
+                && self.pull_w <= 0.0 && self.pull_weights.is_none())
+    }
+}
+
+/// Every endpoint in this interval has the same pin membership and other
+/// authored inputs. Moving hard rows follow a single translation segment.
+pub(crate) struct AffinePinPrefix<'a>(&'a Scene);
+
+impl AffinePinPrefix<'_> {
+    pub(crate) fn sample_fix(&self, start: f64, end: f64) -> Vec<FixPair> {
+        self.0.make_pins(end, start, start).0
+    }
+}
+
 struct InvisibleSphere {
     center: Matrix3xX<f32>,
     radius: Vec<f32>,
@@ -904,7 +935,19 @@ impl Scene {
     /// True when an integration retry must resample authored input.
     pub(crate) fn has_time_sensitive_inputs(&self) -> bool {
         self.pin.iter().any(|pin| !pin.operations.is_empty() || pin.unpin_time.is_some())
-            || self.wall.iter().any(|wall| wall.timing.len() > 1 || wall.active_duration >= 0.0)
+            || self.has_time_sensitive_non_pin_inputs()
+    }
+
+    pub(crate) fn affine_pin_prefix(
+        &self, start: f64, end: f64, collision_windows_enabled: bool,
+    ) -> Option<AffinePinPrefix<'_>> {
+        (!collision_windows_enabled && !self.has_time_sensitive_non_pin_inputs()
+            && self.pin.iter().all(|pin| pin.supports_affine_prefix(start, end)))
+            .then_some(AffinePinPrefix(self))
+    }
+
+    fn has_time_sensitive_non_pin_inputs(&self) -> bool {
+        self.wall.iter().any(|wall| wall.timing.len() > 1 || wall.active_duration >= 0.0)
             || self.sphere.iter().any(|sphere| sphere.timing.len() > 1 || sphere.active_duration >= 0.0)
             || self.rest_vert_schedule.is_some() || !self.param_anim_times.is_empty()
             || self.dyn_args.iter().any(|(name, _)| {
@@ -2785,6 +2828,101 @@ impl Scene {
         self.vel.clone()
     }
 
+    fn make_pins(
+        &self, time: f64, prev_time: f64, membership_time: f64,
+    ) -> (Vec<FixPair>, Vec<PullPair>) {
+        let mut fix = Vec::new();
+        let mut pull = Vec::new();
+
+        for pin in self.pin.iter() {
+            // Check if this pin should be active at current time
+            if let Some(unpin_t) = pin.unpin_time {
+                if membership_time >= unpin_t {
+                    continue; // Skip this pin, it's been unpinned
+                }
+            }
+
+            // If pin has ONLY torque operations, skip fix/pull; vertices are
+            // free to move and receive force from the torque kernel instead.
+            let torque_only = !pin.operations.is_empty()
+                && pin
+                    .operations
+                    .iter()
+                    .all(|op| matches!(op, PinOperation::Torque { .. }));
+            if torque_only {
+                continue;
+            }
+
+            for (i, &ind) in pin.index.iter().enumerate() {
+                let dx = self.displacement.column(self.vert_dmap[ind] as usize);
+
+                let mut kinematic = false;
+                let mut position: Vector3<f32> = self.vert.column(ind).into();
+
+                for op in pin.operations.iter() {
+                    let (new_pos, did_move) = apply_pin_op(op, position, i, time);
+                    position = new_pos;
+                    kinematic = kinematic || did_move;
+                }
+
+                // Run the same op chain at the step's start time to get the
+                // displacement this pin is scheduled to cover. `advance` walks a
+                // kinematic fix pin back along it when the line search truncates
+                // the step, so a driven collider advances in lockstep with the
+                // clock instead of jumping to the full step's pose and snapping
+                // back on the next step.
+                //
+                // What leaves here is the DIFFERENCE of the two posed positions,
+                // never either position itself: two nearby coordinates far from
+                // the origin cancel their leading digits, so a delta recovered
+                // downstream from an absolute pose would keep only round-off.
+                let step_delta = if kinematic {
+                    let mut start: Vector3<f32> = self.vert.column(ind).into();
+                    for op in pin.operations.iter() {
+                        let (new_pos, _) = apply_pin_op(op, start, i, prev_time);
+                        start = new_pos;
+                    }
+                    (position - start).map(f32::from)
+                } else {
+                    // A static pin holds still, so it has nowhere to be walked
+                    // back to.
+                    Vec3f::zeros()
+                };
+
+                // Per-vertex pull weight overrides the scalar when present.
+                // The decoder drops weight-~0 verts from `index`, so every
+                // member of a per-vertex-weighted holder has w > 0 and takes
+                // the pull branch (a zero weight here would otherwise route a
+                // vertex to the hard `fix` branch and lock it).
+                let w = pin
+                    .pull_weights
+                    .as_ref()
+                    .map(|v| v[i])
+                    .unwrap_or(pin.pull_w);
+
+                if w > 0.0 {
+                    pull.push(PullPair {
+                        position: position + dx,
+                        index: ind as u32,
+                        weight: w,
+                        allow_intersection: pin.allow_intersection,
+                    });
+                } else {
+                    fix.push(FixPair {
+                        position: position + dx,
+                        step_delta,
+                        ghat: self.args.constraint_ghat,
+                        index: ind as u32,
+                        kinematic,
+                        allow_intersection: pin.allow_intersection,
+                    });
+                }
+            }
+        }
+
+        (fix, pull)
+    }
+
     /// Build the constraint set for a step that runs from `prev_time` to
     /// `time`. Pins are evaluated at `time` (the step's target end), and a
     /// kinematic fix pin also records the displacement it covers from
@@ -2910,94 +3048,7 @@ impl Scene {
                 (coeff.0[0], coeff.0[1], coeff.1, true)
             }
         };
-        let mut fix = Vec::new();
-        let mut pull = Vec::new();
-
-        for pin in self.pin.iter() {
-            // Check if this pin should be active at current time
-            if let Some(unpin_t) = pin.unpin_time {
-                if membership_time >= unpin_t {
-                    continue; // Skip this pin, it's been unpinned
-                }
-            }
-
-            // If pin has ONLY torque operations, skip fix/pull; vertices are
-            // free to move and receive force from the torque kernel instead.
-            let torque_only = !pin.operations.is_empty()
-                && pin
-                    .operations
-                    .iter()
-                    .all(|op| matches!(op, PinOperation::Torque { .. }));
-            if torque_only {
-                continue;
-            }
-
-            for (i, &ind) in pin.index.iter().enumerate() {
-                let dx = self.displacement.column(self.vert_dmap[ind] as usize);
-
-                let mut kinematic = false;
-                let mut position: Vector3<f32> = self.vert.column(ind).into();
-
-                for op in pin.operations.iter() {
-                    let (new_pos, did_move) = apply_pin_op(op, position, i, time);
-                    position = new_pos;
-                    kinematic = kinematic || did_move;
-                }
-
-                // Run the same op chain at the step's start time to get the
-                // displacement this pin is scheduled to cover. `advance` walks a
-                // kinematic fix pin back along it when the line search truncates
-                // the step, so a driven collider advances in lockstep with the
-                // clock instead of jumping to the full step's pose and snapping
-                // back on the next step.
-                //
-                // What leaves here is the DIFFERENCE of the two posed positions,
-                // never either position itself: two nearby coordinates far from
-                // the origin cancel their leading digits, so a delta recovered
-                // downstream from an absolute pose would keep only round-off.
-                let step_delta = if kinematic {
-                    let mut start: Vector3<f32> = self.vert.column(ind).into();
-                    for op in pin.operations.iter() {
-                        let (new_pos, _) = apply_pin_op(op, start, i, prev_time);
-                        start = new_pos;
-                    }
-                    (position - start).map(f32::from)
-                } else {
-                    // A static pin holds still, so it has nowhere to be walked
-                    // back to.
-                    Vec3f::zeros()
-                };
-
-                // Per-vertex pull weight overrides the scalar when present.
-                // The decoder drops weight-~0 verts from `index`, so every
-                // member of a per-vertex-weighted holder has w > 0 and takes
-                // the pull branch (a zero weight here would otherwise route a
-                // vertex to the hard `fix` branch and lock it).
-                let w = pin
-                    .pull_weights
-                    .as_ref()
-                    .map(|v| v[i])
-                    .unwrap_or(pin.pull_w);
-
-                if w > 0.0 {
-                    pull.push(PullPair {
-                        position: position + dx,
-                        index: ind as u32,
-                        weight: w,
-                        allow_intersection: pin.allow_intersection,
-                    });
-                } else {
-                    fix.push(FixPair {
-                        position: position + dx,
-                        step_delta,
-                        ghat: self.args.constraint_ghat,
-                        index: ind as u32,
-                        kinematic,
-                        allow_intersection: pin.allow_intersection,
-                    });
-                }
-            }
-        }
+        let (fix, pull) = self.make_pins(time, prev_time, membership_time);
 
         // Build torque groups and vertex arrays (PCA + force computed on GPU)
         // Group by pin_group_id (Blender vertex group) so all vertices from
@@ -3930,6 +3981,49 @@ mod pin_op_tests {
             t_start: 1.0,
             t_end: 2.0,
         }
+    }
+
+    #[test]
+    fn affine_pin_prefix_requires_one_hard_linear_piece() {
+        let linear_move = || PinOperation::MoveBy {
+            delta: Matrix3xX::zeros(1),
+            t_start: 1.0,
+            t_end: 2.0,
+            transition: "linear".into(),
+            bezier_handles: None,
+        };
+        let mut pin = Pin {
+            index: vec![0],
+            operations: vec![linear_move()],
+            unpin_time: None,
+            pull_w: 0.0,
+            pull_weights: None,
+            pin_group_id: String::new(),
+            allow_intersection: false,
+        };
+        assert!(pin.supports_affine_prefix(1.0, 2.0));
+        assert!(pin.supports_affine_prefix(0.0, 0.9));
+        assert!(pin.supports_affine_prefix(2.0, 3.0));
+        assert!(!pin.supports_affine_prefix(0.9, 1.0));
+        assert!(!pin.supports_affine_prefix(0.9, 1.1));
+        assert!(!pin.supports_affine_prefix(1.9, 2.1));
+        pin.pull_w = 0.5;
+        assert!(!pin.supports_affine_prefix(1.2, 1.8));
+        pin.pull_w = 0.0;
+        pin.pull_weights = Some(vec![0.5]);
+        assert!(!pin.supports_affine_prefix(1.2, 1.8));
+        pin.pull_weights = None;
+        pin.unpin_time = Some(1.5);
+        assert!(!pin.supports_affine_prefix(1.2, 1.8));
+        pin.unpin_time = None;
+        if let PinOperation::MoveBy { transition, .. } = &mut pin.operations[0] {
+            *transition = "smooth".into();
+        }
+        assert!(!pin.supports_affine_prefix(1.2, 1.8));
+        pin.operations = vec![linear_move(), spin(90.0)];
+        assert!(!pin.supports_affine_prefix(1.2, 1.8));
+        pin.operations.clear();
+        assert!(pin.supports_affine_prefix(1.2, 1.8));
     }
 
     #[test]

@@ -198,8 +198,8 @@ impl EffectExecutor for DefaultExecutor {
                 }
                             });
             }
-            Effect::DoSpawnBuild { preserve_output } => {
-                build::spawn_build_task(engine, preserve_output);
+            Effect::DoSpawnBuild { preserve_output, context } => {
+                build::spawn_build_task(engine, preserve_output, &context).await;
             }
             Effect::DoLaunchTwistUpgrade { generation, from_frame, target_frame } => {
                 solver::launch_solver_twist_upgrade(engine, from_frame, target_frame,generation).await;
@@ -695,11 +695,10 @@ mod tests {
         // Use /bin/sh as the "python" so the script runs directly.
         let outcome = build::drive_build_worker(
             &engine,
+            &engine.state(),
             cancel,
             Path::new("/bin/sh"),
             &script,
-            "demo",
-            "/tmp/demo",
             false,
         )
         .await;
@@ -743,11 +742,10 @@ mod tests {
         let cancel = engine.install_cancel_handle();
         let outcome = build::drive_build_worker(
             &engine,
+            &engine.state(),
             cancel,
             Path::new("/bin/sh"),
             &script,
-            "demo",
-            "/tmp/demo",
             false,
         )
         .await;
@@ -794,11 +792,10 @@ mod tests {
         let started = std::time::Instant::now();
         let outcome = build::drive_build_worker(
             &engine,
+            &engine.state(),
             cancel,
             Path::new("/bin/sh"),
             &script,
-            "demo",
-            "/tmp/demo",
             false,
         )
         .await;
@@ -839,11 +836,10 @@ mod tests {
         let cancel = engine.install_cancel_handle();
         let outcome = build::drive_build_worker(
             &engine,
+            &engine.state(),
             cancel,
             Path::new("/bin/sh"),
             script,
-            "demo",
-            "/tmp/demo",
             false,
         )
         .await;
@@ -1043,11 +1039,10 @@ mod tests {
 
         let outcome = build::drive_build_worker(
             &engine,
+            &engine.state(),
             cancel,
             Path::new("/bin/sh"),
             &script,
-            "demo",
-            "/tmp/demo",
             false,
         )
         .await;
@@ -1066,7 +1061,7 @@ mod tests {
             build::BuildOutcome::Completed => "Completed",
             build::BuildOutcome::Cancelled => "Cancelled",
             build::BuildOutcome::Failed(_) => "Failed",
-            build::BuildOutcome::AlreadyDispatched => "AlreadyDispatched",
+            build::BuildOutcome::GpuCheckFailed(_) => "GpuCheckFailed",
         }
     }
 
@@ -1131,11 +1126,10 @@ mod tests {
         let cancel = engine.install_cancel_handle();
         let outcome = build::drive_build_worker(
             &engine,
+            &engine.state(),
             cancel,
             Path::new("/bin/sh"),
             &script,
-            "demo",
-            "/tmp/demo",
             false,
         )
         .await;
@@ -1186,11 +1180,10 @@ mod tests {
         let cancel = engine.install_cancel_handle();
         let outcome = build::drive_build_worker(
             &engine,
+            &engine.state(),
             cancel,
             Path::new("/bin/sh"),
             &script,
-            "demo",
-            "/tmp/demo",
             false,
         )
         .await;

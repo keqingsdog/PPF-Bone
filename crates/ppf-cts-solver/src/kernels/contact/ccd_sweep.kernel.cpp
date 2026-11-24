@@ -242,7 +242,7 @@ struct CcdPointFaceVisitor {
             const Vec3f t10 = x1[f[0]];
             const Vec3f t11 = x1[f[1]];
             const Vec3f t12 = x1[f[2]];
-            result = accd::point_triangle_ccd(p0, p1, t00, t01, t02, t10, t11,
+            result = accd::point_triangle_ccd<true>(p0, p1, t00, t01, t02, t10, t11,
                                               t12, offset, ghat, max_t,
                                               ccd_eps, &info);
         } else {
@@ -512,7 +512,7 @@ struct CcdCollisionPointFaceM2cVisitor {
         info.offset = 0.0f;
         info.flagged = 0u;
         const float result =
-            accd::point_triangle_ccd(p0, p1, t0, t1, t2, t0, t1, t2, offset,
+            accd::point_triangle_ccd<true>(p0, p1, t0, t1, t2, t0, t1, t2, offset,
                                      ghat, max_t, ccd_eps, &info);
         ccd_record_overlap(overlap, CCD_SWEEP_POINT_TRIANGLE, vertex_index,
                            f[0], info);
@@ -590,7 +590,7 @@ struct CcdCollisionPointFaceC2mVisitor {
         info.offset = 0.0f;
         info.flagged = 0u;
         const float result =
-            accd::point_triangle_ccd(p, p, t00, t01, t02, t10, t11, t12, offset,
+            accd::point_triangle_ccd<true>(p, p, t00, t01, t02, t10, t11, t12, offset,
                                      ghat, max_t, ccd_eps, &info);
         ccd_record_overlap(overlap, CCD_SWEEP_POINT_TRIANGLE, f[0],
                            vertex_index, info);

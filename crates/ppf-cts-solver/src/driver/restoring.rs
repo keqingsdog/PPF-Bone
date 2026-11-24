@@ -208,3 +208,19 @@ mod empty_transport_tests {
 
 
 
+impl View {
+    pub(super) fn with_preview_buffers(
+        mut self,
+        map: &mut impl FnMut(Handle, bool) -> Result<Handle, Fault>,
+    ) -> Result<Self, Fault> {
+        self.fault = map(self.fault, true)?;
+        self.ball_fault = map(self.ball_fault, true)?;
+        self.angular_fault = map(self.angular_fault, true)?;
+        self.fem_fault = map(self.fem_fault, true)?;
+        self.stitch_fault = map(self.stitch_fault, true)?;
+        // Some FEM families read earlier observations during the product.
+        // Keep their bits while isolating the buffer from all trial writes.
+        self.observations = map(self.observations, false)?;
+        Ok(self)
+    }
+}

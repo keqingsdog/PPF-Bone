@@ -357,7 +357,7 @@ fn build_forwards_preserve_output() {
     };
     let (_s2, fx) = transition(s, Event::BuildRequested { preserve_output: true });
     let preserve = fx.iter().find_map(|e| match e {
-        Effect::DoSpawnBuild { preserve_output } => Some(*preserve_output),
+        Effect::DoSpawnBuild { preserve_output, .. } => Some(*preserve_output),
         _ => None,
     });
     assert_eq!(preserve, Some(true));

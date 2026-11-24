@@ -961,7 +961,8 @@ pub mod id {
     pub const JOINT_PATCH_ADD: KernelId = KernelId(393);
     pub const BODY_FACTOR_APPLY: KernelId = KernelId(395);
     pub const JOINT_PCG_BATCH8_FACTOR_FAULT: KernelId = KernelId(396);
-    pub const COUNT: usize = 397;
+    pub const AABB_REFIT_MERGE_THREE: KernelId = KernelId(397);
+    pub const COUNT: usize = 398;
 }
 
 // ===========================================================================
@@ -4767,6 +4768,10 @@ pub static TABLE: [KernelDecl; id::COUNT] = [
     decl_generated(id::PCG_WARM_MASK_HISTORY, PCG_WARM_MASK_HISTORY_NAME, Scatter::Disjoint, 1.0, size_of::<PcgWarmMaskHistoryArgs>(), PCG_WARM_MASK_HISTORY_HOST_REF_OFFSETS),
     decl_generated(id::BODY_FACTOR_APPLY, BODY_FACTOR_APPLY_NAME, Scatter::Disjoint, 1.0, size_of::<BodyFactorApplyArgs>(), BODY_FACTOR_APPLY_HOST_REF_OFFSETS),
     decl_generated(id::JOINT_PCG_BATCH8_FACTOR_FAULT, JOINT_PCG_BATCH8_FACTOR_FAULT_NAME, Scatter::Disjoint, 1.0, size_of::<JointPcgBatch8FactorFaultArgs>(), JOINT_PCG_BATCH8_FACTOR_FAULT_HOST_REF_OFFSETS),
+    decl_generated(
+        id::AABB_REFIT_MERGE_THREE, AABB_REFIT_MERGE_THREE_NAME, Scatter::Disjoint, 15.0,
+        size_of::<AabbRefitMergeThreeArgs>(), AABB_REFIT_MERGE_THREE_HOST_REF_OFFSETS,
+    ),
 ];
 
 #[cfg(test)]
@@ -5067,6 +5072,7 @@ include!(concat!(env!("OUT_DIR"), "/kernelgen/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz
 include!(concat!(env!("OUT_DIR"), "/kernelgen/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz_joint_rows/joint_rows.entry.rs"));
 include!(concat!(env!("OUT_DIR"), "/kernelgen/zz_joint_resident_batch8/joint_resident_batch8.entry.rs"));
 include!(concat!(env!("OUT_DIR"), "/kernelgen/zz_joint_batch8_fault/joint_batch8_fault.entry.rs"));
+include!(concat!(env!("OUT_DIR"), "/kernelgen/contact/aabb_refit_siblings.entry.rs"));
 
 include!(concat!(env!("OUT_DIR"), "/kernelgen/zz_coarse_contributions/coarse_contributions.entry.rs"));
 include!(concat!(env!("OUT_DIR"), "/kernelgen/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz_pcg_warm_mask_history/pcg_warm_mask_history.entry.rs"));

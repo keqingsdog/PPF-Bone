@@ -123,6 +123,8 @@ pub struct EngineConfig {
     /// What the solver in `solver_target_dir` printed for `--backend`, or
     /// empty when there is no solver there or it could not be asked.
     pub solver_backend: String,
+    /// The selected Windows runtime includes the per-session animation adapter.
+    pub solver_mode_v1: bool,
 }
 
 impl Default for EngineConfig {
@@ -137,6 +139,7 @@ impl Default for EngineConfig {
             data_root: None,
             solver_target_dir: String::new(),
             solver_backend: String::new(),
+            solver_mode_v1: false,
         }
     }
 }

@@ -95,7 +95,7 @@ fn backend_alloc_fault_invalidates_history_and_never_reaches_cold_solve() {
         // abort before the first cold operator or kernel can consume them.
         let result=unsafe {solve_rigid_impl(&mut device,&op,&mut reduction,Handle::NONE,Handle::NONE,
             Handle::NONE,Handle::NONE,&mut work,&mut workspace,None,None,view,None,Handle::NONE,
-            1e-3,100,RigidSolveInput::NewtonForce,false,true,Some(Handle::NONE),None)};
+            1e-3,100,RigidSolveInput::NewtonForce,false,true,Some(Handle::NONE),None,FullBodyAdmission::Unqualified)};
         let error=result.expect_err("backend alloc fault must abort solve");
         assert!(error.detail.contains("simulated backend device failure"),"unexpected fatal: {}",error.detail);
         assert!(error.detail.contains(failed),"missing allocation label: {}",error.detail);

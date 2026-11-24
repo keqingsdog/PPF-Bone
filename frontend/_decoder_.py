@@ -485,6 +485,10 @@ class BlenderApp:
         if origin is not None and type(origin) is not int:
             raise ValueError("source_playback_origin must be an integer")
         self._fixed_scene._source_playback_origin = origin
+        solver_mode = param_decoder._data.get("solver_mode", "strict")
+        if solver_mode not in ("strict", "animation"):
+            raise ValueError("solver_mode must be strict or animation")
+        self._fixed_scene._solver_mode = solver_mode
         bone_receipt = param_decoder.apply_bones(self._fixed_scene)
         self._report_progress(0.94, "Initializing session...")
         self._session = Session(

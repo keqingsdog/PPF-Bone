@@ -20,7 +20,9 @@ use tokio::process::{Child, Command};
 use ppf_cts_core::cancel::CancelHandle;
 use ppf_cts_core::events::Event;
 
-use super::dispatch_re_entrant;
+use super::DefaultExecutor;
+use ppf_cts_core::effects::BuildContext;
+use ppf_cts_core::state::ServerState;
 use crate::engine::ServerEngine;
 
 /// Worker stderr lines retained for the failure message. Only used when
@@ -72,40 +74,31 @@ pub(super) const MAX_ERROR_DETAIL_BYTES: usize = 8192;
 /// `drive_build_worker`, translating the worker's stdout
 /// PROGRESS/META/ERROR markers into `BuildProgress`/`BuildMetadata`/
 /// `BuildFailed` events and forwarding a SIGTERM on cooperative cancel.
-pub(super) fn spawn_build_task(engine: &ServerEngine, preserve_output: bool) {
-    let cancel = engine.install_cancel_handle();
+pub(super) async fn spawn_build_task(engine: &ServerEngine, preserve_output: bool, expected: &BuildContext) {
+    let Some((context, cancel, prepared)) = engine.begin_build(expected, || {
+        let root = &expected.root;
+        // Sidecars and output retention belong to the same selection as
+        // the command. Finish synchronously before selection can move.
+        clear_build_violations(root);
+        clear_sidecar(root, BUILD_EXEMPTIONS);
+        mark_retained_checkpoints(root, preserve_output)?;
+        clear_stale_status(root);
+        Ok(())
+    }) else {
+        finish_build(engine, expected, None).await;
+        return;
+    };
     let engine = engine.clone();
+    let expected = expected.clone();
 
     tokio::spawn(async move {
-        // Clear any sidecar left by a previous build so a later failure
-        // that produces no structured violations (e.g. a tetwild crash)
-        // can't inherit stale geometry. `root` is the project dir the
-        // worker also writes `build_violations.json` to. We snapshot
-        // name/root once here and thread the same values into the
-        // pipeline so the sidecar clear/read and the worker's write
-        // cannot disagree if the project context flips mid-build.
-        let (name, root) = {
-            let s = engine.state();
-            (s.name, s.root)
-        };
-        clear_build_violations(&root);
-        // The same for Allow Existing Intersections' record of what a build
-        // exempted: a build that exempts nothing writes no file, so a stale
-        // one would draw a previous build's tangle over this one.
-        clear_sidecar(&root, BUILD_EXEMPTIONS);
-        // Drop a prior run's status record so the post-rebuild status reads
-        // READY/RESUMABLE, not the stale "Failed" a reconnect would
-        // otherwise reconstruct from a previous run's status.cbor between
-        // build-done and the next run. The next launch scrubs it again;
-        // clearing here closes the build-done .. run window.
-        // Existing checkpoint files survive a preserve-output rebuild for
-        // diagnostics, but they are not checkpoints of the new build. Record
-        // the boundary before retiring the old native generation.
-        let result = match mark_retained_checkpoints(&root, preserve_output) {
-            Ok(()) => {
-                clear_stale_status(&root);
-                run_build_pipeline(&engine, cancel.clone(), &name, &root, preserve_output).await
-            }
+        let root = &context.root;
+        if !ServerEngine::same_project_context(&engine.state(), &context) {
+            finish_build(&engine, &expected, None).await;
+            return;
+        }
+        let result = match prepared {
+            Ok(()) => run_build_pipeline(&engine, &context, cancel, preserve_output).await,
             Err(e) => BuildOutcome::Failed(format!("cannot record retained checkpoint generation: {e}")),
         };
 
@@ -113,30 +106,42 @@ pub(super) fn spawn_build_task(engine: &ServerEngine, preserve_output: bool) {
         // engine was attached to (`ServerEngine::attach_executor`),
         // falling back to a fresh `DefaultExecutor` for tests that
         // drive the build pipeline in isolation.
-        match result {
+        let event = match result {
             BuildOutcome::Completed => {
-                let exemptions = read_build_exemptions(&root);
-                dispatch_re_entrant(&engine, Event::BuildCompleted { exemptions }).await;
+                let exemptions = read_build_exemptions(root);
+                Event::BuildCompleted { exemptions }
             }
             BuildOutcome::Cancelled => {
                 log::info!(target: "ppf::build", "[BUILD] cancelled by user");
-                dispatch_re_entrant(&engine, Event::BuildCancelledEvent).await;
+                Event::BuildCancelledEvent
             }
             BuildOutcome::Failed(error) => {
                 // The worker persists ValidationError's structured
                 // geometry to a sidecar; pull it in so the add-on can
                 // highlight the offending faces in the viewport.
-                let violations = read_build_violations(&root);
-                dispatch_re_entrant(&engine, Event::BuildFailed { error, violations }).await;
+                let violations = read_build_violations(root);
+                Event::BuildFailed { error, violations }
             }
-            BuildOutcome::AlreadyDispatched => {
-                // Pipeline body owns the terminal dispatch (e.g.
-                // GpuCheckFailed). No further event from us.
-            }
-        }
-
-        engine.clear_cancel_handle();
+            BuildOutcome::GpuCheckFailed(error) => Event::GpuCheckFailed { error },
+        };
+        finish_build(&engine, &expected, Some(event)).await;
     });
+}
+
+async fn dispatch_build_event(engine: &ServerEngine, context: &ServerState, event: Event) {
+    let Some(effects) = engine.dispatch_matching_context(context, event) else { return; };
+    execute_build_effects(engine, effects).await;
+}
+
+async fn finish_build(engine: &ServerEngine, expected: &BuildContext, event: Option<Event>) {
+    execute_build_effects(engine, engine.finish_build(expected, event)).await;
+}
+
+async fn execute_build_effects(engine: &ServerEngine, effects: Vec<ppf_cts_core::effects::Effect>) {
+    let executor = engine.executor().unwrap_or_else(|| std::sync::Arc::new(DefaultExecutor::new()));
+    for effect in effects {
+        executor.execute(effect, engine).await;
+    }
 }
 
 /// The sidecar the build worker writes on a SUCCESSFUL build when Allow
@@ -293,10 +298,7 @@ pub(super) enum BuildOutcome {
     /// after the worker prints `ERROR <msg>` and exits non-zero, or
     /// when we cannot launch the worker at all.
     Failed(String),
-    /// The pipeline already dispatched a terminal event (e.g.
-    /// `GpuCheckFailed`) and the caller must NOT dispatch another
-    /// `BuildCompleted` / `BuildCancelledEvent` / `BuildFailed`.
-    AlreadyDispatched,
+    GpuCheckFailed(String),
 }
 
 /// Run the build pipeline in a Python subprocess.
@@ -313,9 +315,8 @@ pub(super) enum BuildOutcome {
 /// the worker pid logged at spawn time.
 async fn run_build_pipeline(
     engine: &ServerEngine,
+    context: &ServerState,
     cancel: CancelHandle,
-    name: &str,
-    root: &str,
     preserve_output: bool,
 ) -> BuildOutcome {
     // Cached GPU check, mirroring the EffectExecutor._gpu_checked
@@ -328,21 +329,10 @@ async fn run_build_pipeline(
     // unconditionally here and the backend that cannot use a GPU says so
     // there rather than being skipped by a feature flag at the call site.
     if let Err(e) = ppf_cts_core::utils::check_gpu() {
-        // GPU check failure is its own event in transitions.
-        dispatch_re_entrant(
-            engine,
-            Event::GpuCheckFailed {
-                error: e.to_string(),
-            },
-        )
-        .await;
-        // GpuCheckFailed already moved state to Failed; we must NOT
-        // dispatch a follow-up BuildCancelledEvent / BuildFailed,
-        // both of which would clobber the Failed terminal state.
-        return BuildOutcome::AlreadyDispatched;
+        return BuildOutcome::GpuCheckFailed(e.to_string());
     }
 
-    if name.is_empty() || root.is_empty() {
+    if context.name.is_empty() || context.root.is_empty() {
         return BuildOutcome::Failed(
             "no project context: name/root must be set before BuildRequested".into(),
         );
@@ -359,7 +349,7 @@ async fn run_build_pipeline(
     };
     let (python, source) = python_executable();
     let outcome =
-        drive_build_worker(engine, cancel, &python, &worker, name, root, preserve_output).await;
+        drive_build_worker(engine, context, cancel, &python, &worker, preserve_output).await;
     // Rewrite a bare missing-dependency failure into an actionable
     // message about the interpreter / venv before it surfaces to the user.
     if let BuildOutcome::Failed(reason) = outcome {
@@ -373,13 +363,14 @@ async fn run_build_pipeline(
 /// can drive a mock worker without going through the GPU check.
 pub(super) async fn drive_build_worker(
     engine: &ServerEngine,
+    context: &ServerState,
     cancel: CancelHandle,
     python: &Path,
     worker: &Path,
-    name: &str,
-    root: &str,
     preserve_output: bool,
 ) -> BuildOutcome {
+    let name = &context.name;
+    let root = &context.root;
     let mut cmd = Command::new(python);
     cmd.arg(worker)
         .arg(name)
@@ -586,14 +577,16 @@ pub(super) async fn drive_build_worker(
                     if !info.is_empty() {
                         last_stage = Some(info.clone());
                     }
-                    dispatch_re_entrant(
+                    dispatch_build_event(
                         engine,
+                        context,
                         Event::BuildProgress { progress, info },
                     )
                     .await;
                 } else if let Some(total_frames) = parse_meta_frames_line(&text) {
-                    dispatch_re_entrant(
+                    dispatch_build_event(
                         engine,
+                        context,
                         Event::BuildMetadata { total_frames },
                     )
                     .await;
@@ -1043,6 +1036,7 @@ pub struct SolverBuild {
     /// writes the marker, so it states what the bundler believed it copied;
     /// the binary states what it is.
     pub backend: String,
+    pub solver_mode_v1: bool,
 }
 
 /// Resolve [`SolverBuild`] for this process, once, at startup.
@@ -1072,9 +1066,14 @@ pub fn solver_build() -> SolverBuild {
         );
         String::new()
     });
+    let solver_mode_v1 = cfg!(windows)
+        && matches!(backend.as_str(), "cpu" | "cuda")
+        && std::fs::read_to_string(worker.with_file_name("_bone_trial_options.py"))
+            .is_ok_and(|source| source.lines().any(|line| line == "SESSION_SOLVER_MODE_VERSION = 1"));
     SolverBuild {
         target_dir: target.to_string_lossy().into_owned(),
         backend,
+        solver_mode_v1,
     }
 }
 
@@ -1677,16 +1676,16 @@ mod tests {
         std::fs::set_permissions(&script, perms).unwrap();
 
         let engine = ServerEngine::new(EngineConfig::default());
+        engine.set_project_context("demo", "/tmp/demo");
         let cancel = engine.install_cancel_handle();
         let outcome = tokio::time::timeout(
             STDERR_DRAIN_JOIN_TIMEOUT * 3,
             drive_build_worker(
                 &engine,
+                &engine.state(),
                 cancel,
                 Path::new("/bin/sh"),
                 &script,
-                "demo",
-                "/tmp/demo",
                 false,
             ),
         )

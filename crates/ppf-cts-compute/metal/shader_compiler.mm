@@ -537,6 +537,8 @@ inline uint popcount(ulong value) { return uint(metal::popcount(value)); }
 
 namespace compute {
 
+constexpr bool has_contact_query_witness = false;
+
 // Measured 32 on Apple silicon (threadExecutionWidth and the
 // threads_per_simdgroup attribute agree, including in a live 26-lane trailing
 // simdgroup); entry points re-check it at run time and raise the diagnostic

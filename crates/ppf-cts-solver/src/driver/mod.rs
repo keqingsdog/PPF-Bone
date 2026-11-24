@@ -124,6 +124,8 @@ mod collider;
 mod collision_window;
 pub(crate) mod force_field;
 pub mod contact;
+#[cfg(feature = "cpu")]
+mod rigid_query_cull;
 mod constraint;
 mod dirichlet;
 mod dump_linsys;
@@ -138,6 +140,7 @@ mod plasticity;
 mod refusal;
 /// The PDRD reduced six-DOF solve's host orchestration.
 mod pdrd;
+mod anchored_flight;
 mod joints;
 mod restoring;
 pub(crate) mod checkpoint;
@@ -1335,10 +1338,10 @@ pub(crate) unsafe fn prepare_host_plan(continuation:u64,requested_h:f32)->Result
     Ok(HostPreparedPlan{dataset:dataset as usize,start_bits:start.to_bits(),continuation,requested_bits:requested_h.to_bits(),newton_root:pending.newton_root_route,plan})
 }
 pub(crate) unsafe fn advance_host(continuation:u64,budget:u32,allow_cg:bool,allow_fem:bool,prepared:Option<HostPreparedPlan>)->Result<HostAdvanceOutcome,Fatal>{
-    advance_host_impl(continuation,budget,allow_cg,allow_fem,false,prepared,false)
+    advance_host_impl(continuation,budget,allow_cg,allow_fem,false,prepared,false,None)
 }
 pub(crate) unsafe fn advance_host_swing(continuation:u64,budget:u32,allow_cg:bool,prepared:Option<HostPreparedPlan>)->Result<HostAdvanceOutcome,Fatal>{
-    advance_host_impl(continuation,budget,allow_cg,false,true,prepared,false)
+    advance_host_impl(continuation,budget,allow_cg,false,true,prepared,false,None)
 }
 pub(crate) fn host_kinematics_retry_scope(playback:f32)->Result<bool,Fatal> {
     let guard=SOLVER.lock().map_err(|_|Fatal::invariant("KINEMATICS_SCOPE: solver lock poisoned"))?;
@@ -1357,10 +1360,15 @@ pub(crate) fn host_kinematics_retry_scope(playback:f32)->Result<bool,Fatal> {
     let plan=crate::joint_root_motion_state::native_step_before_scene_boundary(start,requested_h,next_event,(*param).playback)
         .map_err(|e|Fatal::invariant(format!("KINEMATICS_PLAN: {e:?}")))?;
     Ok(HostPreparedPlan{dataset:dataset as usize,start_bits:start.to_bits(),continuation,requested_bits:requested_h.to_bits(),newton_root:false,plan})
-}pub(crate) unsafe fn advance_host_kinematics(continuation:u64,budget:u32,allow_cg:bool,prepared:Option<HostPreparedPlan>)->Result<HostAdvanceOutcome,Fatal>{
-    advance_host_impl(continuation,budget,allow_cg,false,false,prepared,true)
 }
-unsafe fn advance_host_impl(continuation:u64,budget:u32,allow_cg:bool,allow_fem:bool,allow_swing:bool,prepared:Option<HostPreparedPlan>,allow_kinematics:bool)->Result<HostAdvanceOutcome,Fatal>{
+pub(crate) unsafe fn advance_host_kinematics(
+    continuation: u64, budget: u32, allow_cg: bool, prepared: Option<HostPreparedPlan>,
+    affine_pins: Option<&crate::scene::AffinePinPrefix<'_>>,
+) -> Result<HostAdvanceOutcome, Fatal> {
+    advance_host_impl(continuation,budget,allow_cg,false,false,prepared,true,affine_pins)
+}
+unsafe fn advance_host_impl(continuation:u64,budget:u32,allow_cg:bool,allow_fem:bool,allow_swing:bool,prepared:Option<HostPreparedPlan>,allow_kinematics:bool,
+    affine_pins:Option<&crate::scene::AffinePinPrefix<'_>>)->Result<HostAdvanceOutcome,Fatal>{
     let live=SCENE.lock().ok().and_then(|slot|slot.as_ref().map(|s|(s.is_live(),s.dataset,s.param)));
     let Some((true,dataset,param))=live else{return Err(Fatal::invariant("HOST_RETRY: no live scene"));};
     let mut guard=SOLVER.lock().map_err(|_|Fatal::invariant("HOST_RETRY: solver lock poisoned"))?;
@@ -1383,7 +1391,7 @@ unsafe fn advance_host_impl(continuation:u64,budget:u32,allow_cg:bool,allow_fem:
         if plan.dataset!=dataset as usize || plan.start_bits!=start.to_bits() || plan.continuation!=continuation || plan.requested_bits!=h.to_bits(){return Err(Fatal::invariant("HOST_RETRY_PLAN: prepared identity mismatch"));}
     }
     let newton_enabled=prepared.is_some_and(|p|p.newton_root);
-    let (result,domain,pcg_failed_dt)=with_device(|device|step::advance_host(device,&*dataset,param,state,continuation!=0,budget,allow_cg,allow_fem,allow_swing,newton_enabled,prepared.map(|p|p.plan),allow_kinematics))?;
+    let (result,domain,pcg_failed_dt)=with_device(|device|step::advance_host(device,&*dataset,param,state,continuation!=0,budget,allow_cg,allow_fem,allow_swing,newton_enabled,prepared.map(|p|p.plan),allow_kinematics,affine_pins))?;
     state.host_retry_pending=None;
     let actual_pcg_dt=if newton_enabled && result.retry_reason==crate::data::RETRY_REASON_PCG_MAX_ITERATIONS {
         pcg_failed_dt.filter(|v|v.is_finite() && *v>0.).ok_or_else(||Fatal::invariant("HOST_NEWTON_PCG: invalid actual trial dt"))?
@@ -2386,6 +2394,7 @@ pub(crate) fn install_joints_from_rest(owned:&crate::joint::OwnedJointScene,seal
     let mut guard=SOLVER.lock().expect("solver state poisoned");
     let state=guard.as_mut().expect("joint install before initialization");
     let view=require_scene("install_joints");
+    state.pcg_rigid.invalidate_full_body_binding();
     if let Err(fatal)=with_device(|device| {
         state.joints.install(device,owned,state.rigid.n_bodies)?;
         unsafe { roots::install_native(device,view.data(),state,owned,sealed_initial) }
@@ -2407,6 +2416,7 @@ pub(crate) fn enable_mixed_pcg(precision: crate::args::PcgPrecision) -> FatalRes
 pub(crate) fn install_restoring(curves:&crate::restoring_native::Installed,stitches:usize)->FatalResult<()> {
     let mut guard=SOLVER.lock().map_err(|_|Fatal::invariant("restoring install: poisoned solver"))?;
     let state=guard.as_mut().ok_or_else(||Fatal::invariant("restoring install before initialization"))?;
+    state.pcg_rigid.invalidate_full_body_binding();
     let reference=state.joints.reference_handle();
     let view=state.joints.view(reference,&state.rigid,1.);
     let lanes=(view.count as usize).max(view.control_count as usize).max(view.soft.map_or(0,|s|s.count as usize)).max(stitches);
@@ -2470,6 +2480,7 @@ pub(crate) fn install_soft_joints_from_rest(owned:&crate::soft_joint::OwnedSoftS
     let records=&owned.records;
     let mut guard=SOLVER.lock().map_err(|_|Fatal::invariant("soft install: poisoned solver"))?;
     let state=guard.as_mut().ok_or_else(||Fatal::invariant("soft install before initialization"))?;
+    state.pcg_rigid.invalidate_full_body_binding();
     let scene=require_scene("install_soft_joints");
     let data=unsafe {scene.data()};
     if !records.is_empty() && data.translation_lock.size!=0 {
@@ -2556,6 +2567,9 @@ mod running_rotation_dispatch_test;
 
 #[cfg(all(test, feature = "cpu"))]
 mod swing_trial_retry_test;
+
+#[cfg(all(test, feature = "cpu"))]
+mod affine_pin_prefix_test;
 
 #[cfg(all(test, feature = "cpu"))]
 mod newton_root_transaction_test;

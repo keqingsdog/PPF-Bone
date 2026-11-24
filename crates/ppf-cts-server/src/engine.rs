@@ -194,10 +194,72 @@ impl ServerEngine {
         (guard.clone(), effects)
     }
 
+    pub(crate) fn same_project_context(current: &ServerState, expected: &ServerState) -> bool {
+        current.project_generation == expected.project_generation
+            && current.name == expected.name && current.root == expected.root
+            && current.upload_id == expected.upload_id
+            && current.param_hash == expected.param_hash && current.data_hash == expected.data_hash
+    }
+
     pub(crate) fn dispatch_matching_context(&self, expected:&ServerState, event:Event)->Option<Vec<Effect>> {
         let mut current=self.inner.state.write();
-        if current.project_generation!=expected.project_generation || current.name!=expected.name || current.root!=expected.root || current.upload_id!=expected.upload_id || current.param_hash!=expected.param_hash || current.data_hash!=expected.data_hash {return None;}
+        if !Self::same_project_context(&current, expected) {return None;}
         let (next,effects)=transition(current.clone(),event);*current=next;Some(effects)
+    }
+
+    pub(crate) fn begin_build(
+        &self,
+        expected: &ppf_cts_core::effects::BuildContext,
+        prepare: impl FnOnce() -> std::io::Result<()>,
+    ) -> Option<(ServerState, CancelHandle, std::io::Result<()>)> {
+        let current = self.inner.state.read();
+        (expected.matches(&current) && current.build == ppf_cts_core::state::Build::Building)
+            .then(|| (current.clone(), self.install_cancel_handle(), prepare()))
+    }
+
+    pub(crate) fn finish_build(
+        &self, expected: &ppf_cts_core::effects::BuildContext, event: Option<Event>,
+    ) -> Vec<Effect> {
+        let mut current = self.inner.state.write();
+        if current.project_generation != expected.generation
+            || current.build != ppf_cts_core::state::Build::Building
+        {
+            return vec![];
+        }
+        let event = if expected.matches(&current) {
+            event
+        } else {
+            Some(Event::BuildFailed {
+                error: "BUILD_INPUTS_CHANGED: build again with the latest transfer".into(),
+                violations: vec![],
+            })
+        };
+        let Some(event) = event else { return vec![]; };
+        self.clear_cancel_handle();
+        let (next, effects) = transition(current.clone(), event);
+        *current = next;
+        effects
+    }
+
+    pub(crate) fn dispatch_project_upload(&self, name: &str, root: &str, event: Event) -> Vec<Effect> {
+        let mut current = self.inner.state.write();
+        let context = if current.name == name && current.root == root {
+            current.clone()
+        } else {
+            let project_root = std::path::Path::new(root);
+            let mut context = ServerState {
+                project_generation: current.project_generation,
+                run_generation: current.run_generation,
+                data_hash: crate::upload::read_data_hash(project_root),
+                param_hash: crate::upload::read_param_hash(project_root),
+                ..ServerState::default()
+            };
+            Self::select_context(&mut context, name, root);
+            context
+        };
+        let (next, effects) = transition(context, event);
+        *current = next;
+        effects
     }
 
     /// Replace the project name + root without going through a full
@@ -205,14 +267,18 @@ impl ServerEngine {
     /// need to set context before dispatching guarded events.
     pub fn set_project_context(&self, name: &str, root: &str) {
         let mut guard = self.inner.state.write();
-        if guard.name != name || guard.root != root {
-            guard.run_generation = guard.run_generation.checked_add(1).expect("run generation exhausted");
-            guard.launch_pending = false;
-            guard.project_generation = guard.project_generation.checked_add(1)
+        Self::select_context(&mut guard, name, root);
+    }
+
+    fn select_context(current: &mut ServerState, name: &str, root: &str) {
+        if current.name != name || current.root != root {
+            current.run_generation = current.run_generation.checked_add(1).expect("run generation exhausted");
+            current.launch_pending = false;
+            current.project_generation = current.project_generation.checked_add(1)
                 .expect("project generation exhausted");
         }
-        guard.name = name.to_string();
-        guard.root = root.to_string();
+        current.name = name.to_string();
+        current.root = root.to_string();
     }
 
     // --- Cancellation token plumbing --------------------------------

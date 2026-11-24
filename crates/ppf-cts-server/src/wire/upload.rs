@@ -18,7 +18,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use super::{json_u64, write_response, MAX_PAYLOAD_BYTES};
 use crate::engine::ServerEngine;
 use crate::error::ServerError;
-use crate::executor::{dispatch_with_executor, EffectExecutor};
+use crate::executor::EffectExecutor;
 use crate::protocol::read_exact_n_chunked;
 use crate::upload;
 
@@ -167,11 +167,9 @@ where
     let has_param = param_final.exists();
 
     // Refresh project context so the engine knows about this upload.
-    engine.set_project_context(name, project_root.to_str().unwrap_or(""));
-
-    dispatch_with_executor(
-        engine,
-        executor,
+    let effects = engine.dispatch_project_upload(
+        name,
+        project_root.to_str().unwrap_or(""),
         Event::UploadLanded {
             upload_id,
             data_hash,
@@ -179,8 +177,10 @@ where
             has_data,
             has_param,
         },
-    )
-    .await;
+    );
+    for effect in effects {
+        executor.execute(effect, engine).await;
+    }
 
     writer.write_all(b"OK\n").await?;
     Ok(())
@@ -279,11 +279,9 @@ where
         }
     }
 
-    engine.set_project_context(name, project_root.to_str().unwrap_or(""));
-
-    dispatch_with_executor(
-        engine,
-        executor,
+    let effects = engine.dispatch_project_upload(
+        name,
+        project_root.to_str().unwrap_or(""),
         Event::UploadLanded {
             upload_id,
             data_hash,
@@ -291,8 +289,10 @@ where
             has_data,
             has_param,
         },
-    )
-    .await;
+    );
+    for effect in effects {
+        executor.execute(effect, engine).await;
+    }
 
     writer.write_all(b"OK\n").await?;
     Ok(())

@@ -79,7 +79,7 @@ use rayon::prelude::*;
 /// `block_reduce`, which is a barrier, so the entry would have to carry a
 /// cooperative body beside a serial twin.
 use ppf_cts_compute::{
-    AllocLabel, Buffer, Device, Encoder, EncoderExt, Fault, Handle, ReadbackBuffer,
+    AllocLabel, Buffer, Device, Encoder, EncoderExt, Fault, Handle,
 };
 use super::kernels::{
     ReduceMaxLeafArgs, ReduceMinLeafArgs, ReduceMinU32LeafArgs, ReduceSumU32LeafArgs,
@@ -409,8 +409,8 @@ mod tests {
 /// Which is the point: the levels run on the device and four bytes come back.
 #[derive(Debug, Default)]
 pub struct DeviceFold {
-    /// One float per block, ping-ponged between levels.
-    level: ReadbackBuffer<f32>,
+    /// The result at index zero, followed by the intermediate levels.
+    level: Buffer<f32>,
 }
 
 impl DeviceFold {
@@ -421,6 +421,39 @@ impl DeviceFold {
     /// maximum, which are exact; it is here so the two stay comparable when a
     /// test checks one against the other.
     const WIDTH: u32 = BLOCK as u32;
+
+    /// Reserve scratch for an encoded fold. An empty fold needs no dispatch.
+    pub fn prepare(&mut self, device: &mut impl Device, count: u32) -> Result<(), Fault> {
+        if count == 0 {
+            return Ok(());
+        }
+        let mut blocks = count.div_ceil(Self::WIDTH);
+        let mut span = 1;
+        while blocks > 1 {
+            span += blocks as usize;
+            blocks = blocks.div_ceil(Self::WIDTH);
+        }
+        self.level.size(device, span, AllocLabel("reduce.level"))
+    }
+
+    /// Append a minimum after the dispatches that write its input.
+    ///
+    /// # Safety
+    /// Scratch must be prepared for `count`, and both scratch and the input
+    /// of `count` floats must outlive the submission without aliasing.
+    pub unsafe fn encode_min(
+        &self,
+        encoder: &mut dyn Encoder,
+        values: Handle,
+        count: u32,
+    ) -> Result<(), Fault> {
+        self.encode(encoder, values, count, true)
+    }
+
+    /// Read the result after a successful encoded minimum.
+    pub fn read_min(&self, device: &mut impl Device, count: u32, floor: f32) -> Result<f32, Fault> {
+        Ok(self.read_result(device, count)?.map_or(floor, |v| v.min(floor)))
+    }
 
     /// The smallest value in `values[..count]`, not below `floor`.
     ///
@@ -434,7 +467,11 @@ impl DeviceFold {
         count: u32,
         floor: f32,
     ) -> Result<f32, Fault> {
-        Ok(self.fold(device, region, values, count, true)?.map_or(floor, |v| v.min(floor)))
+        if count != 0 {
+            self.prepare(device, count)?;
+            device.run(region, |encoder| self.encode_min(encoder, values, count))?;
+        }
+        self.read_min(device, count, floor)
     }
 
     /// The largest value in `values[..count]`, not below `floor`.
@@ -449,33 +486,29 @@ impl DeviceFold {
         count: u32,
         floor: f32,
     ) -> Result<f32, Fault> {
-        Ok(self.fold(device, region, values, count, false)?.map_or(floor, |v| v.max(floor)))
+        if count != 0 {
+            self.prepare(device, count)?;
+            device.run(region, |encoder| self.encode(encoder, values, count, false))?;
+        }
+        Ok(self.read_result(device, count)?.map_or(floor, |v| v.max(floor)))
     }
 
-    /// The levels, then the one float.
-    unsafe fn fold<D: Device>(
-        &mut self,
-        device: &mut D,
-        region: &'static str,
-        values: ppf_cts_compute::Handle,
+    unsafe fn encode(
+        &self,
+        encoder: &mut dyn Encoder,
+        values: Handle,
         count: u32,
         smallest: bool,
-    ) -> Result<Option<f32>, Fault> {
+    ) -> Result<(), Fault> {
         if count == 0 {
-            return Ok(None);
+            return Ok(());
         }
-        // TWO SPANS LIVE AT ONCE, the level being written and the one being
-        // read, so the buffer holds the first level plus everything below it.
-        let first = count.div_ceil(Self::WIDTH).max(1);
-        let span = (first + first.div_ceil(Self::WIDTH) + 2) as usize;
-        self.level.size(device, span, AllocLabel("reduce.level"))?;
-
-        let mut blocks = first;
+        let mut blocks = count.div_ceil(Self::WIDTH);
         let mut source = values;
         let mut length = count;
-        let mut at = 0usize;
+        let mut at = 1usize;
         loop {
-            let out = self.level.span(at, blocks as usize);
+            let out = self.level.span(if blocks == 1 { 0 } else { at }, blocks as usize);
             if smallest {
                 let args = ReduceMinLeafArgs {
                     values: source,
@@ -485,7 +518,7 @@ impl DeviceFold {
                     blocks,
                     seam_arena_count: 0,
                 };
-                device.launch(region, &args, blocks)?;
+                encoder.elements(&args, blocks)?;
             } else {
                 let args = ReduceMaxLeafArgs {
                     values: source,
@@ -495,17 +528,25 @@ impl DeviceFold {
                     blocks,
                     seam_arena_count: 0,
                 };
-                device.launch(region, &args, blocks)?;
+                encoder.elements(&args, blocks)?;
             }
             if blocks == 1 {
-                self.level.download(device)?;
-                return Ok(Some(self.level.host()[at]));
+                return Ok(());
             }
-            source = self.level.span(at, blocks as usize);
+            source = out;
             length = blocks;
             at += blocks as usize;
             blocks = blocks.div_ceil(Self::WIDTH);
         }
+    }
+
+    fn read_result(&self, device: &mut impl Device, count: u32) -> Result<Option<f32>, Fault> {
+        if count == 0 {
+            return Ok(None);
+        }
+        let mut result = [0.0f32];
+        self.level.read(device, 0, &mut result)?;
+        Ok(Some(result[0]))
     }
 }
 
@@ -514,8 +555,7 @@ impl DeviceFold {
 ///
 /// # Why they encode rather than submit
 ///
-/// Each level of [`DeviceFold`] is its own submit. These ENCODE into a region
-/// the caller opens instead: the analytic collider's contact tally adds its
+/// These encode into a region the caller opens: the analytic collider's contact tally adds its
 /// ladder to the submit that writes the tally, and the assembly overlap
 /// selection puts its two leaf passes and the ladder in one submit. The answer
 /// is left in the first words of the fold's own buffer, where one small read
@@ -662,6 +702,7 @@ impl DeviceWordFold {
 mod word_fold_tests {
     use super::*;
     use crate::driver::launch::host_device;
+    use ppf_cts_compute::ReadbackBuffer;
 
     /// A reproducible spread of words, with no dependency.
     fn word(i: u32) -> u32 {

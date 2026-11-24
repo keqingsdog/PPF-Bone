@@ -74,7 +74,7 @@
 //!
 //! Not one predicate is stated here.
 
-use ppf_cts_compute::{AllocLabel, Buffer, Device, Handle, ReadbackBuffer};
+use ppf_cts_compute::{AllocLabel, Buffer, Device, Fault, Handle, ReadbackBuffer};
 use super::lbvh::Tree;
 use crate::data::IntersectionRecord;
 use super::kernels::{
@@ -330,6 +330,8 @@ pub struct Collider {
 /// host value contributes to.
 #[derive(Default)]
 pub struct ScanState {
+    probe_flag: Buffer<u32>,
+    probe_enabled: bool,
     edge_flag: ReadbackBuffer<u32>,
     vert_flag: ReadbackBuffer<u32>,
     records: ReadbackBuffer<u32>,
@@ -437,11 +439,31 @@ impl ScanState {
             .size(device, slots, AllocLabel("intersection.flag_fold"))?;
         self.flag_total
             .size(device, 1, AllocLabel("intersection.flag_total"))?;
+        static PROBE_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let probe_on = *PROBE_ON.get_or_init(|| {
+            std::env::var_os("PPF_CPU_C2_PARALLEL_PROBE").is_some_and(|value| value == "1")
+        });
+        self.probe_enabled = probe_on && device.supports_empty_claim_probe();
+        self.prepare_probe_scratch(device)?;
         let edge_words = self.edge_flag.len();
         let vert_words = self.vert_flag.len();
         clear(device, self.edge_flag.handle(), edge_words)?;
         clear(device, self.vert_flag.handle(), vert_words)?;
         clear(device, self.counter.handle(), 2)?;
+        Ok(())
+    }
+
+    fn prepare_probe_scratch<D: Device>(&mut self, device: &mut D) -> FatalResult<()> {
+        if self.probe_enabled {
+            match self.probe_flag.size(
+                device, self.edges.max(self.surface_vertices).max(1),
+                AllocLabel("intersection.probe_flag"),
+            ) {
+                Ok(()) => {}
+                Err(Fault::Alloc { .. }) => self.probe_enabled = false,
+                Err(fault) => return Err(fault.into()),
+            }
+        }
         Ok(())
     }
 
@@ -492,6 +514,17 @@ impl ScanState {
             count,
             seam_arena_count: 0,
         };
+        if self.probe_enabled {
+            // Scratch flags are write-only in the probe. A capacity of zero
+            // makes the ordinary kernel count hits without writing records.
+            let probe = IntersectScanFaceEdgeArgs { flag: self.probe_flag.handle(), capacity: 0, ..args };
+            if device.probe_empty_claim(
+                &probe, count, std::mem::offset_of!(IntersectScanFaceEdgeArgs, counter),
+                u64::from(count) * u64::from(args.node_count),
+            ) {
+                return Ok(());
+            }
+        }
         device
             .launch("intersection.face_edge", &args, count)
             .map_err(|fault| scan_failed("face-edge", fault))?;
@@ -540,6 +573,17 @@ impl ScanState {
             count,
             seam_arena_count: 0,
         };
+        if self.probe_enabled {
+            // Scratch flags are write-only in the probe. A capacity of zero
+            // makes the ordinary kernel count hits without writing records.
+            let probe = IntersectScanEdgeEdgeArgs { flag: self.probe_flag.handle(), capacity: 0, ..args };
+            if device.probe_empty_claim(
+                &probe, count, std::mem::offset_of!(IntersectScanEdgeEdgeArgs, counter),
+                u64::from(count) * u64::from(args.node_count),
+            ) {
+                return Ok(());
+            }
+        }
         device
             .launch("intersection.edge_edge", &args, count)
             .map_err(|fault| scan_failed("edge-edge", fault))?;
@@ -587,6 +631,17 @@ impl ScanState {
             count,
             seam_arena_count: 0,
         };
+        if self.probe_enabled {
+            // Scratch flags are write-only in the probe. A capacity of zero
+            // makes the ordinary kernel count hits without writing records.
+            let probe = IntersectScanPointPointArgs { flag: self.probe_flag.handle(), capacity: 0, ..args };
+            if device.probe_empty_claim(
+                &probe, count, std::mem::offset_of!(IntersectScanPointPointArgs, counter),
+                u64::from(count) * u64::from(args.node_count),
+            ) {
+                return Ok(());
+            }
+        }
         device
             .launch("intersection.point_point", &args, count)
             .map_err(|fault| scan_failed("point-point", fault))?;
@@ -642,6 +697,17 @@ impl ScanState {
             count,
             seam_arena_count: 0,
         };
+        if self.probe_enabled {
+            // Scratch flags are write-only in the probe. A capacity of zero
+            // makes the ordinary kernel count hits without writing records.
+            let probe = IntersectScanCollisionMeshArgs { flag: self.probe_flag.handle(), capacity: 0, ..args };
+            if device.probe_empty_claim(
+                &probe, count, std::mem::offset_of!(IntersectScanCollisionMeshArgs, counter),
+                u64::from(count) * u64::from(args.node_count),
+            ) {
+                return Ok(());
+            }
+        }
         device
             .launch("intersection.collision_mesh", &args, count)
             .map_err(|fault| scan_failed("collision-mesh", fault))?;
@@ -1948,6 +2014,106 @@ mod tests {
             "the stored records stop at the buffer's capacity"
         );
     }
+    #[test]
+    fn cpu_empty_claim_probe_keeps_ordered_c2_reports_and_errors() {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+        pool.install(|| {
+            let query_count = max_records() + 17;
+            for (crosses, soft, bad_leaf) in [
+                (false, false, false),
+                (true, false, false),
+                (true, true, false),
+                (true, false, true),
+            ] {
+                let mut fx = Fixture::new();
+                let mut vertex = [
+                    point(-1.0, -1.0, 0.0), point(1.0, -1.0, 0.0), point(0.0, 1.0, 0.0),
+                    point(0.0, 0.0, -0.5), point(0.0, 0.0, 0.5),
+                ];
+                if !crosses {
+                    vertex[3][2] = 0.25;
+                }
+                let face = [[0u32, 1, 2]];
+                let edges = vec![[3u32, 4]; query_count];
+                let mut props = [free_vertex(0); 5];
+                let mut face_prop = free_face(0);
+                if soft {
+                    face_prop.collider = true;
+                    for (i, prop) in props.iter_mut().enumerate() {
+                        prop.object_index = if i < 3 { 1 } else { 2 };
+                        prop.collider = i < 3;
+                        prop.pull_index = if i < 3 { i as u32 + 1 } else { 0 };
+                        prop.fix_index = u32::from(i == 3);
+                        prop.pin_allow_intersection = i == 3;
+                    }
+                }
+                fx.stage_scene(
+                    &vertex, &face, &edges, &[face_prop], &vec![free_edge(0); query_count],
+                    &props, &[EdgeParam::default()], &[VertexParam::default()],
+                );
+                let mut scene = fx.scene();
+                scene.allow_soft_static_fe = soft;
+                let mut accepted = vertex;
+                accepted[3][2] = 0.5;
+                let mut previous = Buffer::none();
+                scene.accepted_vert = stage(&mut fx.device, &mut previous, &flat_points(&accepted));
+                let mut tree = fx.tree(&face_boxes_of(&vertex, &face));
+                if bad_leaf {
+                    // One leaf, but it names face 1 in a one-face scene.
+                    let words = [2u32.to_ne_bytes(), 0u32.to_ne_bytes()].concat();
+                    fx.device.write(tree.node.handle(), 0, &words).unwrap();
+                }
+                let mut boxes = edge_boxes_of(&vertex, &edges);
+                if !crosses {
+                    // Exercise an actual BVH hit with no narrow-phase crossing.
+                    boxes.iter_mut().for_each(|b| *b = inflated(*b, 1.0));
+                }
+                let query = fx.query(&boxes);
+
+                let mut scan = |parallel: bool| {
+                    fx.begin();
+                    assert!(fx.device.supports_empty_claim_probe());
+                    fx.scan.probe_enabled = parallel;
+                    fx.scan.prepare_probe_scratch(&mut fx.device).unwrap();
+                    assert_eq!(fx.scan.probe_enabled, parallel);
+                    let before = fx.device.counters().dispatches;
+                    let result = unsafe {
+                        fx.scan.scan_face_edge(&mut fx.device, &scene, &mut tree, query)
+                    };
+                    let launches = fx.device.counters().dispatches - before;
+                    assert_eq!(launches, if parallel && crosses { 2 } else { 1 });
+                    result.map(|()| fx.finish())
+                };
+                let serial = scan(false);
+                let parallel = scan(true);
+                if bad_leaf {
+                    let serial_error = serial.err().expect("serial scan rejects the bad leaf");
+                    let parallel_error = parallel.err().expect("probe never hides a bad leaf");
+                    assert_eq!(serial_error, parallel_error);
+                    assert!(parallel_error.detail.contains("failing check(s)"));
+                    continue;
+                }
+                let serial = serial.ok().expect("valid serial scan");
+                let parallel = parallel.ok().expect("valid parallel scan");
+                assert_eq!(parallel.found, serial.found);
+                assert_eq!(parallel.scoped_soft_static_fe, serial.scoped_soft_static_fe);
+                assert_eq!(parallel.edge_flag, serial.edge_flag);
+                assert_eq!(parallel.vert_flag, serial.vert_flag);
+                assert_eq!(parallel.edge_clear, serial.edge_clear);
+                assert_eq!(parallel.vert_clear, serial.vert_clear);
+                assert_eq!(parallel.scoped_soft_static_fe, if soft { query_count as u32 } else { 0 });
+                assert_eq!(parallel.found, if crosses && !soft { query_count as u32 } else { 0 });
+                assert_eq!(parallel.records.len(), serial.records.len());
+                for (i, (lhs, rhs)) in parallel.records.iter().zip(&serial.records).enumerate() {
+                    assert_eq!((lhs.itype, lhs.elem0, lhs.elem1), (rhs.itype, rhs.elem0, rhs.elem1));
+                    assert_eq!(lhs.elem1 as usize, i);
+                    assert_eq!(lhs.num_verts0, rhs.num_verts0);
+                    assert_eq!(lhs.num_verts1, rhs.num_verts1);
+                }
+            }
+        });
+    }
+
     #[test]
     fn narrow_soft_follow_face_edge_reporting_keeps_competing_crossings() {
         let vertex = [

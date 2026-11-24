@@ -616,7 +616,7 @@ fn guard_cpu() {
 /// both in the list below now, each having landed in the change that removed its
 /// entry from `refusal.rs`. `sand_rigid` needs `contact/grain_pair` with it,
 /// the per-grain angular accumulators being contact's to produce.
-const KERNELS: [&str; 131] = [
+const KERNELS: [&str; 132] = [
     // The linear solve.
     "solver/spmv",
     "solver/block_jacobi",
@@ -834,6 +834,7 @@ const KERNELS: [&str; 131] = [
     "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz_pcg_warm_mask_history/pcg_warm_mask_history",
     "zz_device_tree_factor/body_factor",
     "zz_joint_batch8_fault/joint_batch8_fault",
+    "contact/aabb_refit_siblings",
 ];
 
 /// Buffer fields the driver fills with an (arena, offset) handle rather than a
@@ -3536,6 +3537,15 @@ const HANDLE_FIELDS: &[(&str, &str)] = &[
     ("zz_joint_batch8_fault/joint_batch8_fault", "JointPcgBatch8FactorFaultArgs.status"),
     ("zz_joint_batch8_fault/joint_batch8_fault", "JointPcgBatch8FactorFaultArgs.first_iteration"),
     ("zz_joint_batch8_fault/joint_batch8_fault", "JointPcgBatch8FactorFaultArgs.current_iteration"),
+    ("contact/aabb_refit_siblings", "AabbRefitMergeThreeArgs.first_level"),
+    ("contact/aabb_refit_siblings", "AabbRefitMergeThreeArgs.first_nodes"),
+    ("contact/aabb_refit_siblings", "AabbRefitMergeThreeArgs.first_aabb"),
+    ("contact/aabb_refit_siblings", "AabbRefitMergeThreeArgs.second_level"),
+    ("contact/aabb_refit_siblings", "AabbRefitMergeThreeArgs.second_nodes"),
+    ("contact/aabb_refit_siblings", "AabbRefitMergeThreeArgs.second_aabb"),
+    ("contact/aabb_refit_siblings", "AabbRefitMergeThreeArgs.third_level"),
+    ("contact/aabb_refit_siblings", "AabbRefitMergeThreeArgs.third_nodes"),
+    ("contact/aabb_refit_siblings", "AabbRefitMergeThreeArgs.third_aabb"),
     ("zz_joint_resident_batch8/joint_resident_batch8", "JointPcgBatch8StopArgs.norm"),
     ("zz_joint_resident_batch8/joint_resident_batch8", "JointPcgBatch8StopArgs.initial"),
     ("zz_joint_resident_batch8/joint_resident_batch8", "JointPcgBatch8StopArgs.rz_next"),

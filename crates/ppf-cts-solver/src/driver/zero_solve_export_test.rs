@@ -50,7 +50,7 @@ fn run_case(root_enabled: bool, diagnostic: Option<&str>) {
     let mut reduction = Reduction { map: &map, staged: &mut staged };
     let result = unsafe { solve_rigid_impl(&mut device, &op, &mut reduction, Handle::NONE, Handle::NONE,
         b.handle(), x.handle(), &mut work, &mut rigid, Some(rot.handle()), None, view, root, Handle::NONE,
-        1e-3, 100, RigidSolveInput::NewtonForce, false, true, None, None) };
+        1e-3, 100, RigidSolveInput::NewtonForce, false, true, None, None, FullBodyAdmission::Unqualified) };
     let mut rotation = [0.0;3]; rot.read(&mut device,0,&mut rotation).unwrap();
     let mut full = [0.0;12]; x.read(&mut device,0,&mut full).unwrap();
     if diagnostic.is_some() {

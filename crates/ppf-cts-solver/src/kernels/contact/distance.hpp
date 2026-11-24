@@ -129,9 +129,33 @@ __device__ inline void vf_two_product(float a, float b, SM_THREAD float &hi,
     hi = SM_FMA(a, b, 0.0f);
     lo = SM_FMA(a, b, -hi);
 }
+// A normal binary32 value is significand * 2^(biased_exponent - 150).
+// Extract the least nonzero exponent without rounding any floating operand.
+__device__ inline bool vf_normal_low_bit(unsigned bits, SM_THREAD int &low) {
+    const unsigned exponent = (bits >> 23) & 255u;
+    if (exponent == 0u || exponent == 255u) {
+        return false;
+    }
+    const unsigned significand = (bits & 0x007fffffu) | 0x00800000u;
+#if defined(__CUDA_ARCH__)
+    low = static_cast<int>(exponent) - 151 + __ffs(static_cast<int>(significand));
+#else
+    // Portable spelling for the same integer test and host fixtures.
+    unsigned tail = significand;
+    int trailing = 0;
+    if ((tail & 0xffffu) == 0u) { tail >>= 16; trailing += 16; }
+    if ((tail & 0xffu) == 0u) { tail >>= 8; trailing += 8; }
+    if ((tail & 0xfu) == 0u) { tail >>= 4; trailing += 4; }
+    if ((tail & 0x3u) == 0u) { tail >>= 2; trailing += 2; }
+    if ((tail & 0x1u) == 0u) { ++trailing; }
+    low = static_cast<int>(exponent) - 150 + trailing;
+#endif
+    return true;
+}
+
 // Least nonzero binary exponent of a NORMAL finite float. This integer
 // significance test bounds every exact product limb away from FTZ/underflow.
-__device__ inline int vf_low_bit(float a) {
+__device__ inline int vf_low_bit_legacy(float a) {
     a = SM_ABS(a);
     int exponent = 0;
     while (a < 1.0f) { a *= 2.0f; --exponent; }
@@ -139,6 +163,17 @@ __device__ inline int vf_low_bit(float a) {
     unsigned mantissa = unsigned(a * 8388608.0f);
     while ((mantissa & 1u) == 0u) { mantissa >>= 1; ++exponent; }
     return exponent - 23;
+}
+
+template <bool CudaSweep = false>
+__device__ inline int vf_low_bit(float a) {
+#if defined(__CUDA_ARCH__)
+    int low;
+    if (CudaSweep && vf_normal_low_bit(__float_as_uint(a), low)) {
+        return low;
+    }
+#endif
+    return vf_low_bit_legacy(a);
 }
 __device__ inline bool vf_grow(float value, SM_THREAD float *e,
                               SM_THREAD unsigned &count) {
@@ -165,6 +200,7 @@ __device__ inline bool vf_grow(float value, SM_THREAD float *e,
 // scale protects products. Near cancellation uses at most 6*8*4=192 limbs:
 // six determinant terms, two-limb differences, exact three-factor products.
 // An unsupported range is reported false to the existing invalid-distance gate.
+template <bool CudaSweep = false>
 __device__ inline bool vf_signed_height_scaled(
     SM_THREAD const Vec3f &p, SM_THREAD const Vec3f &a,
     SM_THREAD const Vec3f &b, SM_THREAD const Vec3f &c,
@@ -252,7 +288,7 @@ __device__ inline bool vf_signed_height_scaled(
             for (unsigned k = 0; k < 2; ++k) {
                 const float value = d[i][j][k];
                 if (value != 0.0f && SM_ABS(value) < normal_min) { return false; }
-                low[i][j][k] = value == 0.0f ? 0 : vf_low_bit(value);
+                low[i][j][k] = value == 0.0f ? 0 : vf_low_bit<CudaSweep>(value);
             }
         }
     }
@@ -292,11 +328,12 @@ __device__ inline bool vf_signed_height_scaled(
         ((height > 0.0f) == (expansion[count - 1u] > 0.0f));
 }
 
+template <bool CudaSweep = false>
 __device__ inline bool vf_signed_height(
     SM_THREAD const Vec3f &p, SM_THREAD const Vec3f &a,
     SM_THREAD const Vec3f &b, SM_THREAD const Vec3f &c,
     SM_THREAD float &height) {
-    if (vf_signed_height_scaled(p, a, b, c, 1.0f, height)) {
+    if (vf_signed_height_scaled<CudaSweep>(p, a, b, c, 1.0f, height)) {
         return true;
     }
     // The original scale bounds coordinates by one, leaving enough exponent
@@ -304,7 +341,7 @@ __device__ inline bool vf_signed_height(
     // otherwise underflow. With coordinates <= 2^16, differences are <= 2^17,
     // determinant terms <= 2^51 and the squared cross-product norm <= 2^72.
     // The same exact expansion and all domain checks are applied again.
-    return vf_signed_height_scaled(p, a, b, c, 65536.0f, height);
+    return vf_signed_height_scaled<CudaSweep>(p, a, b, c, 65536.0f, height);
 }
 
 // A strict interior VF has a perpendicular separation, never an in-plane
@@ -312,7 +349,7 @@ __device__ inline bool vf_signed_height(
 // Coefficients remain the caller's closest-point weights; this helper changes
 // only the distance/normal representation. Boundary and degenerate features
 // return false so their existing edge/vertex arithmetic remains in charge.
-template <class T, class Y>
+template <class T, class Y, bool CudaSweep = false>
 __device__ bool point_triangle_interior_separation(
     SM_THREAD const Vec3<T> &p, SM_THREAD const Vec3<T> &t0,
     SM_THREAD const Vec3<T> &t1, SM_THREAD const Vec3<T> &t2,
@@ -338,7 +375,7 @@ __device__ bool point_triangle_interior_separation(
     Y height = difference<T, Y>(p, t0).dot(normal);
     if constexpr (sizeof(T) == sizeof(float) && sizeof(Y) == sizeof(float)) {
         float stable_height;
-        if (!vf_signed_height(p, t0, t1, t2, stable_height)) {
+        if (!vf_signed_height<CudaSweep>(p, t0, t1, t2, stable_height)) {
             const Y invalid = Y(SM_INFINITY) - Y(SM_INFINITY);
             separation = Vec3<Y>(invalid, invalid, invalid);
             return true;
@@ -491,10 +528,14 @@ edge_edge_distance_coeff(SM_THREAD const Vec3<T> &ea0,
 // contact it never saw. The error is proportional to the true distance, with a
 // worst case governed by the widest interior angle, so a sliver triangle turns
 // a small mistake into a step that skips the collision entirely.
-template <class T, class Y>
-__device__ Vec3<Y> point_triangle_distance_coeff_unclassified(
+template <class T, class Y, bool RetainInterior>
+__device__ Vec3<Y> point_triangle_distance_choice(
     SM_THREAD const Vec3<T> &p, SM_THREAD const Vec3<T> &t0,
-    SM_THREAD const Vec3<T> &t1, SM_THREAD const Vec3<T> &t2) {
+    SM_THREAD const Vec3<T> &t1, SM_THREAD const Vec3<T> &t2,
+    SM_THREAD Vec3<Y> &selected_interior, SM_THREAD bool &interior_won) {
+    if constexpr (RetainInterior) {
+        interior_won = false;
+    }
 
     // Differences are taken in T and cast to Y afterwards, never a cast of an
     // endpoint itself: a closest-point pair is separated by far less than its
@@ -545,17 +586,34 @@ __device__ Vec3<Y> point_triangle_distance_coeff_unclassified(
         // p - (w0 t0 + w1 t1 + w2 t2) = d - w1 r0 - w2 r1, since the weights
         // sum to one.
         Vec3<Y> v = d - cand[i][1] * r0 - cand[i][2] * r1;
+        bool interior = false;
         if (i == 0) {
-            point_triangle_interior_separation<T, Y>(p, t0, t1, t2,
-                                                     cand[i], v);
+            interior = point_triangle_interior_separation<T, Y, RetainInterior>(
+                p, t0, t1, t2, cand[i], v);
         }
         Y dist = v.dot(v);
         if (dist < best_dist) {
             best_dist = dist;
             best = cand[i];
+            if constexpr (RetainInterior) {
+                interior_won = interior;
+                if (interior) {
+                    selected_interior = v;
+                }
+            }
         }
     }
     return best;
+}
+
+template <class T, class Y>
+__device__ Vec3<Y> point_triangle_distance_coeff_unclassified(
+    SM_THREAD const Vec3<T> &p, SM_THREAD const Vec3<T> &t0,
+    SM_THREAD const Vec3<T> &t1, SM_THREAD const Vec3<T> &t2) {
+    Vec3<Y> unused;
+    bool unused_winner;
+    return point_triangle_distance_choice<T, Y, false>(p, t0, t1, t2,
+                                                       unused, unused_winner);
 }
 
 template <class T, class Y>

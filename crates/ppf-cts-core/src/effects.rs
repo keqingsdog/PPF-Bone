@@ -10,13 +10,45 @@
 // The executor (in ppf-cts-server) is the only place they're actually
 // run.
 
+use crate::state::ServerState;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildContext {
+    pub generation: u64,
+    pub name: String,
+    pub root: String,
+    pub upload_id: String,
+    pub param_hash: String,
+    pub data_hash: String,
+}
+
+impl BuildContext {
+    pub(crate) fn capture(state: &ServerState) -> Self {
+        Self {
+            generation: state.project_generation,
+            name: state.name.clone(),
+            root: state.root.clone(),
+            upload_id: state.upload_id.clone(),
+            param_hash: state.param_hash.clone(),
+            data_hash: state.data_hash.clone(),
+        }
+    }
+
+    pub fn matches(&self, state: &ServerState) -> bool {
+        self.generation == state.project_generation
+            && self.name == state.name && self.root == state.root
+            && self.upload_id == state.upload_id
+            && self.param_hash == state.param_hash && self.data_hash == state.data_hash
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     // ---- Build effects ----
     /// Spawn the background build task. `preserve_output` flows to the
     /// build worker as `--preserve-output`, keeping `session/output/`
     /// checkpoints in place for a resume-rebuild.
-    DoSpawnBuild { preserve_output: bool },
+    DoSpawnBuild { preserve_output: bool, context: BuildContext },
     /// Signal the build task to stop (via CancellationToken).
     DoCancelBuild,
 

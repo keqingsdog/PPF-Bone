@@ -604,7 +604,7 @@ template <typename T, typename Y> struct PointPointSquaredDist {
     }
 };
 
-template <typename T, typename Y> struct PointTriangleSquaredDist {
+template <typename T, typename Y, bool RetainInterior> struct PointTriangleSquaredDist {
     __device__ float operator()(SM_THREAD const Mat3x4<T> &x) {
         Vec3<Y> dir;
         return (*this)(x, dir);
@@ -615,6 +615,24 @@ template <typename T, typename Y> struct PointTriangleSquaredDist {
         const Vec3<T> t0 = x.col(1);
         const Vec3<T> t1 = x.col(2);
         const Vec3<T> t2 = x.col(3);
+        if constexpr (RetainInterior) {
+            // The production point/triangle CCD instantiates T=Y=float, so
+            // its original coefficient casts do not change the winner.
+            Vec3<Y> interior_separation;
+            bool interior_won;
+            const Vec3<T> c =
+                proximity::point_triangle_distance_choice<T, Y, true>(
+                    p, t0, t1, t2, interior_separation, interior_won)
+                    .template cast<T>();
+            if (interior_won) {
+                // Scoring already evaluated this strict interior candidate.
+                dir = -interior_separation;
+            } else {
+                auto y = c(0) * (t0 - p) + c(1) * (t1 - p) + c(2) * (t2 - p);
+                dir = y.template cast<Y>();
+            }
+            return dir.dot(dir);
+        }
         Vec3<T> c = proximity::point_triangle_distance_coeff_unclassified<T, Y>(
                         p, t0, t1, t2)
                         .template cast<T>();
@@ -635,7 +653,8 @@ template <typename T, typename Y> struct PointTriangleSquaredDist {
     }
 };
 
-__device__ inline float point_triangle_ccd(
+template <bool RetainInterior>
+__device__ inline float point_triangle_ccd_impl(
     SM_THREAD const Vec3f &p0, SM_THREAD const Vec3f &p1,
     SM_THREAD const Vec3f &t00, SM_THREAD const Vec3f &t01,
     SM_THREAD const Vec3f &t02, SM_THREAD const Vec3f &t10,
@@ -661,15 +680,15 @@ __device__ inline float point_triangle_ccd(
     // point = col 0, triangle = cols 1..3 -> SPLIT = 1
     float u_max = max_relative_u<float, 3, 4, 1>(dx);
     if (u_max) {
-        PointTriangleSquaredDist<_coord_, float> dist_func;
-        return ccd_helper<PointTriangleSquaredDist<_coord_, float>, _coord_, 3,
+        PointTriangleSquaredDist<_coord_, float, RetainInterior> dist_func;
+        return ccd_helper<PointTriangleSquaredDist<_coord_, float, RetainInterior>, _coord_, 3,
                           4, 1>(x0.cast<_coord_>(), dx.cast<_coord_>(), u_max,
                                 dist_func, scale * offset, scale * ccd_eps,
                                 scale * park_floor(ghat), max_t, overlap);
     } else {
         // A stationary pair still has the original strict separated-start
         // requirement. Do not bypass it merely because u_max is zero.
-        PointTriangleSquaredDist<float, float> dist_func;
+        PointTriangleSquaredDist<float, float, RetainInterior> dist_func;
         const float d2 = dist_func(x0);
         const float scaled_offset = scale * offset;
         if (!(d2 > scaled_offset * scaled_offset)) {
@@ -680,6 +699,23 @@ __device__ inline float point_triangle_ccd(
         }
         return max_t;
     }
+}
+
+template <bool Sweep = false>
+__device__ inline float point_triangle_ccd(
+    SM_THREAD const Vec3f &p0, SM_THREAD const Vec3f &p1,
+    SM_THREAD const Vec3f &t00, SM_THREAD const Vec3f &t01,
+    SM_THREAD const Vec3f &t02, SM_THREAD const Vec3f &t10,
+    SM_THREAD const Vec3f &t11, SM_THREAD const Vec3f &t12, float offset,
+    float ghat, float max_t, float ccd_eps, SM_THREAD OverlapInfo *overlap) {
+// Restrict the specialized arithmetic to the three CUDA sweep queries.
+#if defined(__CUDA_ARCH__)
+    constexpr bool retain = Sweep;
+#else
+    constexpr bool retain = false;
+#endif
+    return point_triangle_ccd_impl<retain>(p0, p1, t00, t01, t02, t10, t11, t12,
+                                           offset, ghat, max_t, ccd_eps, overlap);
 }
 
 __device__ inline float point_edge_ccd(

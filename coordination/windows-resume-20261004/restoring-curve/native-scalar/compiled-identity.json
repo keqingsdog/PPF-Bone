@@ -2,9 +2,9 @@
   "status": "COMPILED_CAPABILITY_CANDIDATE_NOT_NATIVE_PASS",
   "contract_version": 1,
   "channel_mask": 15,
-  "ordered_entry_count": 397,
+  "ordered_entry_count": 398,
   "layout_sha256": "72ec8aaedb0e9107f94399d4b0f974dddd861c2211281e84d1377688877c874e",
-  "kernel_table_sha256": "00af0a7398d436de6d33639f7363e08aace25364bfa3df76a072421ee7799fcb",
+  "kernel_table_sha256": "fe9ba7ff2ed2af4bd0b6a0b35464f55f3cae948b58f908097713e6c4a0624b94",
   "source_stamp": "591fe28860d09be2c7a7c81c495618a577ce624b7b149eca0455b5cc53a6fea7",
   "serialization": "UTF8 frozen LAYOUT_SPEC newline then whitespace-normalized actual kernelgen Rust arg struct/assert source; ordered table stem newline whitespace-normalized Rust table source, newline joined, includes all legacy entries; comments omitted"
 }

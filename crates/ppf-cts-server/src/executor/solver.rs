@@ -242,6 +242,9 @@ async fn launch_solver_inner(engine: &ServerEngine, state: ppf_cts_core::state::
             }
         }
         let mut args=super::solver_args::arguments(resume_from.unwrap_or(0),target_frame).map_err(str::to_owned)?;
+        if resume_from.is_some_and(|frame| frame != 0) && super::retained_checkpoints(&root_path) {
+            return Err("CHECKPOINTS_FROM_PREVIOUS_BUILD: run a fresh simulation for updated parameters".into());
+        }
         if contract.is_some() {args.push("--twist-resume-mode=continuous_from_current".into());}
         std::fs::create_dir_all(&session_dir).map_err(|e|format!("session dir create failed: {e}"))?;
         #[cfg(windows)]
@@ -249,6 +252,10 @@ async fn launch_solver_inner(engine: &ServerEngine, state: ppf_cts_core::state::
         #[cfg(not(windows))]
         let (program,cmd_path)=("bash", session_dir.join(ppf_cts_formats::files::COMMAND_SH));
         if !cmd_path.exists() {return Err(format!("solver run script not found: {}",cmd_path.display()));}
+        #[cfg(windows)]
+        if engine.config().solver_mode_v1 && resume_from.is_some_and(|frame| frame != 0) {
+            crate::response::check_legacy_r14_animation_resume(&cmd_path, &session_dir.join(STDOUT_LOG))?;
+        }
         let stdout=std::fs::File::create(session_dir.join(STDOUT_LOG)).map_err(|e|format!("stdout open: {e}"))?;
         let stderr=std::fs::File::create(session_dir.join(ERROR_LOG)).map_err(|e|format!("stderr open: {e}"))?;
         let mut cmd=tokio::process::Command::new(program);

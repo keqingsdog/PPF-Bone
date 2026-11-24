@@ -13,7 +13,8 @@ struct PauseFirstLoad {
 #[async_trait::async_trait]
 impl EffectExecutor for PauseFirstLoad {
     async fn execute(&self, effect: Effect, engine: &ServerEngine) {
-        assert!(matches!(effect, Effect::DoLoadApp { .. } | Effect::DoLog { .. }), "test forbids all action effects");
+        assert!(matches!(effect, Effect::DoLoadApp { .. } | Effect::DoLog { .. }),
+                "unexpected action {effect:?} for {}", engine.state().name);
         if matches!(&effect, Effect::DoLoadApp { name, .. } if name == "schedule_a")
             && !self.paused.swap(true, Ordering::SeqCst) {
             self.arrived.notify_one();
@@ -23,7 +24,11 @@ impl EffectExecutor for PauseFirstLoad {
     }
 }
 async fn status(name: &str, engine: &ServerEngine, executor: &dyn EffectExecutor) -> Value {
-    let payload = format!("--name {name}").into_bytes();
+    tcmd(&format!("--name {name}"), engine, executor).await
+}
+
+async fn tcmd(request: &str, engine: &ServerEngine, executor: &dyn EffectExecutor) -> Value {
+    let payload = request.as_bytes();
     let mut bytes = (payload.len() as u32).to_be_bytes().to_vec();
     bytes.extend(payload);
     let mut reader = bytes.as_slice();
@@ -60,6 +65,147 @@ async fn isolated_context_schedule_late_load() {
         assert_eq!(first.as_object().unwrap().len(), 2);
         let state=engine.state();assert_eq!(state.name,"schedule_b");assert_eq!(state.data_hash,"data-b");assert_eq!(state.param_hash,"param-b");
     }).await.expect("controlled test deadlocked");
+}
+
+fn make_ready_for_action(name: &str, engine: &ServerEngine) {
+    let project = crate::upload::make_root(name, engine.config());
+    let output = ppf_cts_formats::files::session_output_dir(&project);
+    std::fs::create_dir_all(&output).unwrap();
+    for filename in [DATA_PICKLE, PARAM_PICKLE, "app_state.pickle"] {
+        std::fs::write(project.join(filename), []).unwrap();
+    }
+    std::fs::write(output.join("state_1.bin.gz"), []).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn isolated_context_schedule_stale_build_run_and_resume() {
+    use ppf_cts_core::state::{Build, Data};
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        for request in ["build", "start", "resume --resume_from 1"] {
+            for reselect_first in [false, true] {
+                let (_tmp, engine) = fixture();
+                make_ready_for_action("schedule_b", &engine);
+                let executor = Arc::new(PauseFirstLoad {
+                    arrived: Notify::new(),
+                    release: Notify::new(),
+                    paused: AtomicBool::new(false),
+                });
+                let first_request = format!("--name schedule_a --request {request}");
+                let first_engine = engine.clone();
+                let first_executor = executor.clone();
+                let first = tokio::spawn(async move {
+                    tcmd(&first_request, &first_engine, first_executor.as_ref()).await
+                });
+                executor.arrived.notified().await;
+                let original = engine.state();
+                assert_eq!(original.name, "schedule_a");
+
+                status("schedule_b", &engine, executor.as_ref()).await;
+                if reselect_first {
+                    make_ready_for_action("schedule_a", &engine);
+                    status("schedule_a", &engine, executor.as_ref()).await;
+                }
+                let selected = engine.state();
+                assert_eq!(selected.name, if reselect_first { "schedule_a" } else { "schedule_b" });
+                assert!(selected.project_generation > original.project_generation);
+                assert_eq!(selected.data, Data::Uploaded);
+                assert_eq!(selected.build, Build::Built);
+                assert!(selected.resumable);
+
+                // The fake executor rejects any build or launch effect. The
+                // target now selected is otherwise ready to accept each action.
+                executor.release.notify_one();
+                let response = first.await.unwrap();
+                assert_eq!(response["error"], "PROJECT_CONTEXT_CHANGED", "{request}: {response}");
+                assert_eq!(response.as_object().unwrap().len(), 2, "{request}: {response}");
+                assert_eq!(engine.state(), selected, "{request} modified the selected build");
+            }
+        }
+    })
+    .await
+    .expect("controlled action test deadlocked");
+}
+
+#[tokio::test]
+async fn isolated_context_schedule_late_build_effect_cannot_start_for_successor() {
+    for reselect_first in [false, true] {
+        let (_tmp, engine) = fixture();
+        let executor = DefaultExecutor::new();
+        make_ready_for_action("schedule_a", &engine);
+        make_ready_for_action("schedule_b", &engine);
+        status("schedule_a", &engine, &executor).await;
+        let stale_effects = engine.dispatch(Event::BuildRequested { preserve_output: false });
+        assert!(matches!(stale_effects.as_slice(), [Effect::DoSpawnBuild { .. }]));
+
+        status("schedule_b", &engine, &executor).await;
+        if reselect_first {
+            status("schedule_a", &engine, &executor).await;
+        }
+        let selected_effects = engine.dispatch(Event::BuildRequested { preserve_output: false });
+        assert!(matches!(selected_effects.as_slice(), [Effect::DoSpawnBuild { .. }]));
+        let active = engine.state();
+        let cancel = engine.install_cancel_handle();
+
+        for effect in stale_effects {
+            executor.execute(effect, &engine).await;
+        }
+        engine.cancel_active_build();
+        assert!(cancel.is_cancelled(), "stale effect replaced the successor's cancel token");
+        assert_eq!(engine.state(), active);
+    }
+}
+
+#[tokio::test]
+async fn isolated_context_schedule_new_upload_can_retry_after_stale_build() {
+    use ppf_cts_core::state::Build;
+
+    let (_tmp, engine) = fixture();
+    let executor = DefaultExecutor::new();
+    make_ready_for_action("schedule_a", &engine);
+    status("schedule_a", &engine, &executor).await;
+    let stale_effects = engine.dispatch(Event::BuildRequested { preserve_output: false });
+    assert!(matches!(stale_effects.as_slice(), [Effect::DoSpawnBuild { .. }]));
+
+    engine.dispatch(Event::upload_landed("new-upload"));
+    let uploaded = engine.state();
+    let sidecar = std::path::Path::new(&uploaded.root).join("build_violations.json");
+    std::fs::write(&sidecar, b"new upload marker").unwrap();
+    for effect in stale_effects {
+        executor.execute(effect, &engine).await;
+    }
+
+    let retired = engine.state();
+    assert_eq!(retired.build, Build::Failed);
+    assert_eq!(retired.upload_id, uploaded.upload_id);
+    assert!(retired.error.starts_with("BUILD_INPUTS_CHANGED:"));
+    assert_eq!(std::fs::read(sidecar).unwrap(), b"new upload marker");
+    let retry = engine.dispatch(Event::BuildRequested { preserve_output: false });
+    assert!(matches!(retry.as_slice(), [Effect::DoSpawnBuild { .. }]));
+}
+
+#[tokio::test]
+async fn isolated_context_schedule_new_upload_retires_pending_run_and_resume() {
+    use ppf_cts_core::state::Solver;
+
+    for request in [Event::StartRequested, Event::ResumeRequested { from_frame: Some(1) }] {
+        let (_tmp, engine) = fixture();
+        let executor = DefaultExecutor::new();
+        make_ready_for_action("schedule_a", &engine);
+        status("schedule_a", &engine, &executor).await;
+        let effects = engine.dispatch(request);
+        let generation = effects.iter().find_map(|effect| match effect {
+            Effect::DoLaunchSolver { generation, .. } => Some(*generation),
+            _ => None,
+        }).unwrap();
+        assert!(engine.pending_run(generation).is_some());
+
+        engine.dispatch(Event::upload_landed("new-upload"));
+        let uploaded = engine.state();
+        assert!(engine.pending_run(generation).is_none());
+        assert_eq!(uploaded.solver, Solver::Idle);
+        assert_eq!(uploaded.upload_id, "new-upload");
+    }
 }
 
 fn select(name: &str, root: &str) -> Event {

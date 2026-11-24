@@ -125,6 +125,22 @@ unsafe fn stage_static<D: Device, T: ppf_cts_compute::Pod + Default>(
     Ok(())
 }
 
+#[path = "covered_point_edge.rs"]
+pub(super) mod covered_point_edge;
+
+// The normal topology builder supplies the immutable leaf permutation and
+// validates a unique root and bounded levels. Unknown layouts keep the sweep
+// that would have checked the tree during traversal.
+fn generated_ccd_tree_layout(tree: &lbvh::Tree, primitives: usize) -> bool {
+    let Some(nodes) = primitives.checked_mul(2).and_then(|n| n.checked_sub(1)) else {
+        return false;
+    };
+    nodes == tree.node_count as usize
+        && tree.root < tree.node_count
+        && nodes.checked_mul(2) == Some(tree.node.len())
+        && tree.aabb.len() == nodes
+}
+
 /// The mesh topology, as handles the caller already owns.
 ///
 /// `SolverState` seeds `mesh_face` and `mesh_edge` once at `allocate`, and the
@@ -163,8 +179,182 @@ pub struct MeshRefs {
     pub edge_face_index: ppf_cts_compute::Handle,
     pub edge_face_offset: ppf_cts_compute::Handle,
     pub has_edge_face: u32,
+    /// Proof for the staged mesh's immutable edge/face topology and CSR.
+    pub(super) covered_point_edges: bool,
     /// Allow Existing Intersections' link table; see [`StartLinkRefs`].
     pub start_link: StartLinkRefs,
+}
+
+#[derive(Default)]
+struct ContactQueryProbe {
+    witness: ppf_cts_compute::Buffer<u32>,
+    query: ppf_cts_compute::Buffer<Aabb>,
+    host_witness: Vec<u32>,
+    host_query: Vec<Aabb>,
+}
+
+impl ContactQueryProbe {
+    unsafe fn prepare<D: Device>(
+        &mut self, device: &mut D, record: &ContactEdgeEdgeTraverseArgs,
+    ) -> Result<Option<ppf_cts_compute::Handle>, Fault> {
+        let count = record.count as usize;
+        let vertex_count = record.vertex_prop.size;
+        let param_count = record.edge_param.size;
+        if count == 0 || vertex_count == 0 || param_count == 0
+            || record.x.size < vertex_count.saturating_mul(3)
+            || !self.reserve(device, count)?
+        {
+            return Ok(None);
+        }
+        let _phase = crate::driver::phase::start("assembly.contact.ee_query_probe");
+        static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let trace = *TRACE.get_or_init(|| {
+            std::env::var_os("PPF_CPU_EE_QUERY_PROBE_TRACE").is_some_and(|v| v == "1")
+        });
+        let probe = ContactEdgeEdgeTraverseArgs {
+            // The production fused allocation uses 16 * count, so its
+            // u32 capacity cannot collide with this witness-only sentinel.
+            dyn_capacity: u32::MAX,
+            statistics_contact_count_size: record.count,
+            statistics_object_index_size: vertex_count,
+            row_count: param_count,
+            assembled: self.witness.handle(),
+            ..*record
+        };
+        unsafe { self.launch_and_mask(
+            device, "contact.edge_edge.witness", &probe, record.count, record.query,
+            trace.then_some("PPF_CPU_EE_QUERY_PROBE"),
+        ) }
+    }
+
+    #[cfg(feature = "cpu")]
+    unsafe fn prepare_point<D: Device, A: ppf_cts_compute::KernelArgs>(
+        &mut self, device: &mut D, phase: &'static str, region: &'static str,
+        count: u32, query: ppf_cts_compute::Handle,
+        record: impl FnOnce(ppf_cts_compute::Handle) -> A,
+    ) -> Result<Option<ppf_cts_compute::Handle>, Fault> {
+        let len = count as usize;
+        if (self.witness.len() != len || self.query.len() != len || self.host_witness.len() != len
+            || self.host_query.len() != len) && !self.reserve(device, len)?
+        {
+            return Ok(None);
+        }
+        let _phase = crate::driver::phase::start(phase);
+        static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let trace = *TRACE.get_or_init(|| {
+            std::env::var_os("PPF_CPU_POINT_QUERY_PROBE_TRACE").is_some_and(|v| v == "1")
+        });
+        unsafe { self.launch_and_mask(
+            device, region, &record(self.witness.handle()), count, query,
+            trace.then_some("PPF_CPU_POINT_QUERY_PROBE"),
+        ) }
+    }
+
+    unsafe fn launch_and_mask<D: Device, A: ppf_cts_compute::KernelArgs>(
+        &mut self, device: &mut D, region: &'static str, record: &A, count: u32,
+        query: ppf_cts_compute::Handle, trace: Option<&'static str>,
+    ) -> Result<Option<ppf_cts_compute::Handle>, Fault> {
+        let started = trace.map(|label| (label, std::time::Instant::now()));
+        // Each range writes only to its own private witness lanes. If the
+        // proof raises a device diagnostic, rerun the original ordered path.
+        match unsafe { device.launch_disjoint_probe(region, record, count) } {
+            Ok(Some(_)) => {}
+            Ok(None) | Err(Fault::Device { .. }) => {
+                if let Some(label) = trace { eprintln!("{label} fallback=true region={region}"); }
+                return Ok(None);
+            }
+            Err(fault) => return Err(fault),
+        }
+        let count = count as usize;
+        self.witness.read(device, 0, &mut self.host_witness)?;
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(self.host_query.as_mut_ptr().cast::<u8>(),
+                                            count * std::mem::size_of::<Aabb>())
+        };
+        device.read(query, 0, bytes)?;
+        let mut active = 0usize;
+        let mut kept = 0usize;
+        for (entry, &witness) in self.host_query.iter_mut().zip(&self.host_witness) {
+            active += usize::from(entry.active);
+            entry.active &= witness != 0;
+            kept += usize::from(entry.active);
+        }
+        let result = if active != kept {
+            self.query.write(device, 0, &self.host_query)?;
+            Some(self.query.handle())
+        } else {
+            None
+        };
+        if let Some((label, started)) = started {
+            eprintln!("{label} fallback=false active={active} kept={kept} elapsed_us={} region={region}",
+                      started.elapsed().as_micros());
+        }
+        Ok(result)
+    }
+
+    fn reserve<D: Device>(&mut self, device: &mut D, count: usize) -> Result<bool, Fault> {
+        // Bound optional memory independently of the contact staging budget.
+        const MAX_SCRATCH_BYTES: usize = 32 * 1024 * 1024;
+        if count.saturating_mul(2 * (std::mem::size_of::<Aabb>() + std::mem::size_of::<u32>()))
+            > MAX_SCRATCH_BYTES
+            || self.host_witness.try_reserve(count.saturating_sub(self.host_witness.len())).is_err()
+            || self.host_query.try_reserve(count.saturating_sub(self.host_query.len())).is_err()
+        {
+            return Ok(false);
+        }
+        self.host_witness.resize(count, 0);
+        self.host_query.resize(count, Aabb::default());
+        match self.witness.size(device, count, AllocLabel("contact.ee_witness")) {
+            Ok(()) => {}
+            Err(Fault::Alloc { .. }) => return Ok(false),
+            Err(fault) => return Err(fault),
+        }
+        match self.query.size(device, count, AllocLabel("contact.ee_probe_query")) {
+            Ok(()) => Ok(true),
+            Err(Fault::Alloc { .. }) => Ok(false),
+            Err(fault) => Err(fault),
+        }
+    }
+}
+
+#[cfg(feature = "cpu")]
+struct PointProbeBounds {
+    vertices: u32,
+    primitives: u32,
+    vertex_params: u32,
+    primitive_params: u32,
+}
+
+#[cfg(feature = "cpu")]
+impl PointProbeBounds {
+    fn new(
+        count: u32, position: ppf_cts_compute::Handle, vertex_prop: ppf_cts_compute::Handle,
+        element: ppf_cts_compute::Handle, element_width: u32, element_prop: ppf_cts_compute::Handle,
+        vertex_param: ppf_cts_compute::Handle, element_param: ppf_cts_compute::Handle,
+    ) -> Option<Self> {
+        let bounds = Self {
+            vertices: vertex_prop.size,
+            primitives: element_prop.size,
+            vertex_params: vertex_param.size,
+            primitive_params: element_param.size,
+        };
+        if count == 0 || count > bounds.vertices || bounds.primitives == 0
+            || bounds.vertex_params == 0 || bounds.primitive_params == 0
+            || bounds.vertices.checked_mul(3)? > position.size
+            || bounds.primitives.checked_mul(element_width)? != element.size
+        {
+            return None;
+        }
+        Some(bounds)
+    }
+}
+
+#[cfg(feature = "cpu")]
+fn cpu_point_query_probe_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("PPF_CPU_POINT_QUERY_PROBE").is_some_and(|value| value == "1")
+    })
 }
 
 pub struct Contact {
@@ -205,6 +395,11 @@ pub struct Contact {
     /// would be a download per pass with nothing to consume it.
     point_query: ppf_cts_compute::Buffer<Aabb>,
     edge_query: ppf_cts_compute::Buffer<Aabb>,
+    #[cfg(feature = "cpu")]
+    rigid_query_cull: super::rigid_query_cull::Scratch,
+    ee_query_probe: ContactQueryProbe,
+    #[cfg(feature = "cpu")]
+    point_query_probe: ContactQueryProbe,
     /// The intersection scan's own query boxes, which carry no ghat margin.
     /// Device-resident for the reason above: the scan walks them by handle.
     scan_edge_query: ppf_cts_compute::Buffer<Aabb>,
@@ -361,6 +556,11 @@ impl Contact {
             tree_build: super::lbvh::BuildScratch::default(),
             point_query: ppf_cts_compute::Buffer::none(),
             edge_query: ppf_cts_compute::Buffer::none(),
+            #[cfg(feature = "cpu")]
+            rigid_query_cull: super::rigid_query_cull::Scratch::default(),
+            ee_query_probe: ContactQueryProbe::default(),
+            #[cfg(feature = "cpu")]
+            point_query_probe: ContactQueryProbe::default(),
             scan_edge_query: ppf_cts_compute::Buffer::none(),
             scan_vertex_query: ppf_cts_compute::Buffer::none(),
             cx: ReadbackBuffer::default(),
@@ -757,6 +957,11 @@ impl Contact {
         extrapolate: f32,
         windows: Windows,
     ) -> FatalResult<()> {
+        static MERGE_REFIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let merge_refit = cfg!(cuda_backend)
+            && *MERGE_REFIT.get_or_init(|| std::env::var_os("PPF_CUDA_CONTACT_MERGE_REFIT")
+                .is_some_and(|value| value == "1"))
+            && !device.missing().contains(&super::kernels::id::AABB_REFIT_MERGE_THREE);
         let mut ops: Vec<lbvh::RefitOp> = Vec::new();
         let face = mesh.face;
         let edge = mesh.edge;
@@ -777,7 +982,9 @@ impl Contact {
                 mesh.face_param,
             );
             plan_leaf_active(&mut ops, &mut self.face_tree, windows.face);
-            lbvh::plan_propagate(&mut ops, &mut self.face_tree);
+            if !merge_refit {
+                lbvh::plan_propagate(&mut ops, &mut self.face_tree);
+            }
         }
         if self.edges > 0 {
             lbvh::plan_edge_leaves(
@@ -791,7 +998,9 @@ impl Contact {
                 mesh.edge_param,
             );
             plan_leaf_active(&mut ops, &mut self.edge_tree, windows.edge);
-            lbvh::plan_propagate(&mut ops, &mut self.edge_tree);
+            if !merge_refit {
+                lbvh::plan_propagate(&mut ops, &mut self.edge_tree);
+            }
         }
         if self.surface_vertices > 0 {
             lbvh::plan_vertex_leaves(
@@ -804,10 +1013,18 @@ impl Contact {
                 mesh.vertex_param,
             );
             plan_leaf_active(&mut ops, &mut self.vertex_tree, windows.vertex);
-            lbvh::plan_propagate(&mut ops, &mut self.vertex_tree);
+            if !merge_refit {
+                lbvh::plan_propagate(&mut ops, &mut self.vertex_tree);
+            }
+        }
+        if merge_refit {
+            lbvh::plan_refit_merge_siblings(&mut ops, [
+                &mut self.face_tree, &mut self.edge_tree, &mut self.vertex_tree,
+            ]);
         }
         if !ops.is_empty() {
-            device.run("contact.refit", |encoder| {
+            let label = if merge_refit { "contact.refit.merged" } else { "contact.refit" };
+            device.run(label, |encoder| {
                 for op in ops { op(encoder)?; }
                 Ok(())
             })?;
@@ -882,6 +1099,26 @@ impl Contact {
                 data, mesh, param, assembly_dt, x0, x, reference, grain_omega,
                 grain_torque, grain_stiffness, grain_normal, residual, statistics,
             );
+        let queries = (self.point_query.handle(), self.edge_query.handle());
+        #[cfg(feature = "cpu")]
+        let queries = if super::rigid_query_cull::enabled() {
+            let filtered = if mesh.start_link.present == 0 && self.grains == 0 {
+                unsafe {
+                    self.rigid_query_cull.prepare(
+                        device, data, mesh, [&mut self.vertex_tree, &mut self.edge_tree, &mut self.face_tree],
+                        &self.point_query, &self.edge_query,
+                    )?
+                }
+            } else {
+                None
+            };
+            filtered.unwrap_or_else(|| {
+                super::rigid_query_cull::trace_fallback();
+                queries
+            })
+        } else {
+            queries
+        };
         for kind in Kind::ORDER {
             // ALL FOUR TRAVERSE AND EMBED IN ONE PASS. Each invokes its
             // narrow phase as a per-hit device functor and builds no pair list,
@@ -889,19 +1126,19 @@ impl Contact {
             // list back to evaluate it in chunks.
             match kind {
                 Kind::PointFace => {
-                    self.traverse_and_embed_point_face(device, &inputs, fixed, force)?;
+                    self.traverse_and_embed_point_face(device, &inputs, fixed, force, queries.0)?;
                     continue;
                 }
                 Kind::PointEdge => {
-                    self.traverse_and_embed_point_edge(device, &inputs, fixed, force)?;
+                    self.traverse_and_embed_point_edge(device, &inputs, fixed, force, queries.0)?;
                     continue;
                 }
                 Kind::EdgeEdge => {
-                    self.traverse_and_embed_edge_edge(device, &inputs, fixed, force)?;
+                    self.traverse_and_embed_edge_edge(device, &inputs, fixed, force, queries.1)?;
                     continue;
                 }
                 Kind::PointPoint => {
-                    self.traverse_and_embed_point_point(device, &inputs, fixed, force)?;
+                    self.traverse_and_embed_point_point(device, &inputs, fixed, force, queries.0)?;
                     continue;
                 }
             }
@@ -1029,6 +1266,7 @@ impl Contact {
         inputs: &NarrowPhaseInputs,
         fixed: &mut FixedCsr<'_>,
         force: ppf_cts_compute::Handle,
+        query: ppf_cts_compute::Handle,
     ) -> FatalResult<()> {
         let queries = self.point_query.len();
         if queries == 0 || self.face_tree.node_count == 0 {
@@ -1093,14 +1331,50 @@ impl Contact {
             node_count: self.face_tree.node_count,
             tree_aabb: self.face_tree.aabb.span(0, self.face_tree.aabb.len()),
             root: self.face_tree.root,
-            query: self.point_query.handle(),
+            query,
             assembled: self.assembled_device.span(0, 1),
             out_overlap: self.overlap_vertex.handle(),
             count: queries as u32,
             seam_arena_count: 0,
         };
+        #[cfg(feature = "cpu")]
+        let args = {
+            let mut args = args;
+            // A dedicated query comes from the current pure-rigid cull.
+            if query != self.point_query.handle() && self.grains == 0
+                && self.rigid_query_cull.prepared_pure_rigid()
+                && device.supports_empty_claim_probe() && cpu_point_query_probe_enabled()
+            {
+                if let Some(bounds) = PointProbeBounds::new(
+                    args.count, args.x, args.vertex_prop,
+                    args.face, 3, args.face_prop,
+                    args.vertex_param, args.face_param,
+                ) {
+                    if let Some(masked) = unsafe { self.point_query_probe.prepare_point(
+                        device, "assembly.contact.point_face.query_probe", "contact.point_face.witness",
+                        args.count, query, |assembled| ContactPointFaceTraverseArgs {
+                            // The original fused capacity is 16 * count.
+                            // Only the scratch launch sets this sentinel.
+                            dyn_capacity: u32::MAX,
+                            statistics_contact_count_size: bounds.primitives,
+                            statistics_object_index_size: bounds.vertices,
+                            barrier_id: bounds.vertex_params,
+                            row_count: bounds.primitive_params,
+                            assembled,
+                            ..args
+                        },
+                    )? } {
+                        args.query = masked;
+                    }
+                }
+            }
+            args
+        };
         // Safety: every buffer the record names is borrowed for the whole call.
-        unsafe { device.launch("contact.point_face.traverse", &args, queries as u32) }?;
+        {
+            let _phase = crate::driver::phase::start("assembly.contact.point_face.traverse");
+            unsafe { device.launch("contact.point_face.traverse", &args, queries as u32) }?;
+        }
         self.matrix.take_device_staged(device, capacity).map_err(|fault| {
             let _ = &fault;
             Fatal::invariant(format!(
@@ -1125,6 +1399,7 @@ impl Contact {
         inputs: &NarrowPhaseInputs,
         fixed: &mut FixedCsr<'_>,
         force: ppf_cts_compute::Handle,
+        query: ppf_cts_compute::Handle,
     ) -> FatalResult<()> {
         let queries = self.point_query.len();
         if queries == 0 || self.edge_tree.node_count == 0 {
@@ -1187,14 +1462,50 @@ impl Contact {
             node_count: self.edge_tree.node_count,
             tree_aabb: self.edge_tree.aabb.span(0, self.edge_tree.aabb.len()),
             root: self.edge_tree.root,
-            query: self.point_query.handle(),
+            query,
             assembled: self.assembled_device.span(1, 1),
             out_overlap: self.overlap_vertex.handle(),
             count: queries as u32,
             seam_arena_count: 0,
         };
+        #[cfg(feature = "cpu")]
+        let record = {
+            let mut record = record;
+            // A dedicated query comes from the current pure-rigid cull.
+            if query != self.point_query.handle() && self.grains == 0
+                && self.rigid_query_cull.prepared_pure_rigid()
+                && device.supports_empty_claim_probe() && cpu_point_query_probe_enabled()
+            {
+                if let Some(bounds) = PointProbeBounds::new(
+                    record.count, record.x, record.vertex_prop,
+                    record.edge, 2, record.edge_prop,
+                    record.vertex_param, record.edge_param,
+                ) {
+                    if let Some(masked) = unsafe { self.point_query_probe.prepare_point(
+                        device, "assembly.contact.point_edge.query_probe", "contact.point_edge.witness",
+                        record.count, query, |assembled| ContactPointEdgeTraverseArgs {
+                            // The original fused capacity is 16 * count.
+                            // Only the scratch launch sets this sentinel.
+                            dyn_capacity: u32::MAX,
+                            statistics_contact_count_size: bounds.primitives,
+                            statistics_object_index_size: bounds.vertices,
+                            barrier_id: bounds.vertex_params,
+                            row_count: bounds.primitive_params,
+                            assembled,
+                            ..record
+                        },
+                    )? } {
+                        record.query = masked;
+                    }
+                }
+            }
+            record
+        };
         // Safety: every buffer the record names is borrowed for the whole call.
-        unsafe { device.launch("contact.point_edge.traverse", &record, queries as u32) }?;
+        {
+            let _phase = crate::driver::phase::start("assembly.contact.point_edge.traverse");
+            unsafe { device.launch("contact.point_edge.traverse", &record, queries as u32) }?;
+        }
         self.matrix.take_device_staged(device, capacity).map_err(|fault| {
             let _ = &fault;
             Fatal::invariant(format!(
@@ -1218,6 +1529,7 @@ impl Contact {
         inputs: &NarrowPhaseInputs,
         fixed: &mut FixedCsr<'_>,
         force: ppf_cts_compute::Handle,
+        query: ppf_cts_compute::Handle,
     ) -> FatalResult<()> {
         let queries = self.edge_query.len();
         if queries == 0 || self.edge_tree.node_count == 0 {
@@ -1241,7 +1553,7 @@ impl Contact {
         let capacity = 16 * queries;
         self.matrix.reserve_device_staging(device, capacity)?;
         let dyn_stage = self.matrix.device_staging(device, capacity)?;
-        let record = ContactEdgeEdgeTraverseArgs {
+        let mut record = ContactEdgeEdgeTraverseArgs {
             statistics_contact_count: a.statistics.contact_count,
             statistics_contact_count_size: a.statistics.contact_count_size,
             statistics_object_index: a.statistics.object_index,
@@ -1275,14 +1587,31 @@ impl Contact {
             node_count: self.edge_tree.node_count,
             tree_aabb: self.edge_tree.aabb.span(0, self.edge_tree.aabb.len()),
             root: self.edge_tree.root,
-            query: self.edge_query.handle(),
+            query,
             assembled: self.assembled_device.span(2, 1),
             out_overlap: self.overlap_edge.handle(),
             count: queries as u32,
             seam_arena_count: 0,
         };
         // Safety: every buffer the record names is borrowed for the whole call.
-        unsafe { device.launch("contact.edge_edge.traverse", &record, queries as u32) }?;
+        #[cfg(feature = "cpu")]
+        {
+            static EE_PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *EE_PROBE.get_or_init(|| std::env::var_os("PPF_CPU_EE_QUERY_PROBE").is_some_and(|v| v == "1"))
+                && query != self.edge_query.handle()
+                && self.grains == 0
+                && self.rigid_query_cull.prepared_pure_rigid()
+                && device.supports_empty_claim_probe()
+            {
+                if let Some(masked) = unsafe { self.ee_query_probe.prepare(device, &record)? } {
+                    record.query = masked;
+                }
+            }
+        }
+        {
+            let _phase = crate::driver::phase::start("assembly.contact.edge_edge.traverse");
+            unsafe { device.launch("contact.edge_edge.traverse", &record, queries as u32) }?;
+        }
         self.matrix.take_device_staged(device, capacity).map_err(|fault| {
             let _ = &fault;
             Fatal::invariant(format!(
@@ -1308,6 +1637,7 @@ impl Contact {
         inputs: &NarrowPhaseInputs,
         fixed: &mut FixedCsr<'_>,
         force: ppf_cts_compute::Handle,
+        query: ppf_cts_compute::Handle,
     ) -> FatalResult<()> {
         let queries = self.point_query.len();
         if queries == 0 || self.vertex_tree.node_count == 0 {
@@ -1364,14 +1694,17 @@ impl Contact {
             node_count: self.vertex_tree.node_count,
             tree_aabb: self.vertex_tree.aabb.span(0, self.vertex_tree.aabb.len()),
             root: self.vertex_tree.root,
-            query: self.point_query.handle(),
+            query,
             assembled: self.assembled_device.span(3, 1),
             out_overlap: self.overlap_vertex.handle(),
             count: queries as u32,
             seam_arena_count: 0,
         };
         // Safety: every buffer the record names is borrowed for the whole call.
-        unsafe { device.launch("contact.point_point.traverse", &record, queries as u32) }?;
+        {
+            let _phase = crate::driver::phase::start("assembly.contact.point_point.traverse");
+            unsafe { device.launch("contact.point_point.traverse", &record, queries as u32) }?;
+        }
         self.matrix.take_device_staged(device, capacity).map_err(|_| {
             Fatal::invariant(format!(
                 "solver driver: the fused point-point traversal staged more than the \
@@ -1386,19 +1719,9 @@ impl Contact {
 
     /// The ACCD filter over this step's candidate sweeps.
     ///
-    /// SIX DISPATCHES AND NOTHING BETWEEN THEM: one thread per QUERY
-    /// primitive, the query box built inside the kernel from that primitive's
-    /// own positions and contact margin, the BVH walked there, and the
-    /// conservative advance invoked as a per-hit device functor. No candidate
-    /// pair is ever held.
-    ///
-    /// WHAT CROSSES BACK is two float arrays, one slot per primitive, and two
-    /// record arrays the host reads only when a fold came out at exactly zero.
-    /// The two float arrays should be reduced on the device; no
-    /// `[[seam::group]]` entry exists in this tree yet, so the reduce is a
-    /// download plus `reduce::min`, which is what the analytic sweep beside
-    /// this already does. That is a difference in transport rather than in the
-    /// arithmetic.
+    /// Ordered vertex-space sweeps produce the ceiling for the edge sweeps.
+    /// The host reads each phase's minimum and only downloads overlap
+    /// records if the final time has reached zero.
     ///
     /// Returns the per-primitive times of impact folded to one minimum, and the
     /// first pair that began the step already inside its contact offset. THE
@@ -1452,192 +1775,85 @@ impl Contact {
             None => (no_mask, 0u32),
         };
 
-        // THE SEEDS, on the device. Every sweep MIN-FOLDS into its slot rather
-        // than writing it, so each slot has to open at the line-search ceiling,
-        // and every overlap slot has to open unflagged or a later read would
-        // decode whatever the arena handed out. Metal hands out allocations
-        // without zeroing and never faults on an uninitialized read.
-        if vertex_slots > 0 {
-            let seed = VecFillArgs {
-                array: self.toi_vertex.handle(),
-                value: max_t,
-                count: vertex_slots as u32,
-                seam_arena_count: 0,
-            };
-            device.launch("contact.line_search.toi_vertex", &seed, vertex_slots as u32)?;
-            let words = (ccd::OVERLAP_WORDS * vertex_slots) as u32;
-            let clear = VecFillU32Args {
-                array: self.overlap_vertex.handle(),
-                value: 0,
-                count: words,
-                seam_arena_count: 0,
-            };
-            device.launch("contact.line_search.overlap_vertex", &clear, words)?;
-        }
-        if self.edges > 0 {
-            let seed = VecFillArgs {
-                array: self.toi_edge.handle(),
-                value: max_t,
-                count: self.edges as u32,
-                seam_arena_count: 0,
-            };
-            device.launch("contact.line_search.toi_edge", &seed, self.edges as u32)?;
-            let words = (ccd::OVERLAP_WORDS * self.edges) as u32;
-            let clear = VecFillU32Args {
-                array: self.overlap_edge.handle(),
-                value: 0,
-                count: words,
-                seam_arena_count: 0,
-            };
-            device.launch("contact.line_search.overlap_edge", &clear, words)?;
+        let skip_covered_point_edge = mesh.covered_point_edges
+            && mesh.has_edge_face != 0
+            && max_t.is_finite()
+            && max_t > 0.0
+            && self.surface_vertices > 0
+            && self.surface_vertices <= self.vertices
+            && self.edges > 0
+            && mesh.edge.size as usize == 2 * self.edges
+            && mesh.edge_face_offset.size as usize == self.edges + 1
+            && generated_ccd_tree_layout(&self.vertex_tree, self.surface_vertices)
+            && generated_ccd_tree_layout(&self.edge_tree, self.edges)
+            && !device.missing().contains(&super::kernels::id::CCD_STANDALONE_POINT_EDGE);
+        if skip_covered_point_edge && covered_point_edge::trace() {
+            eprintln!("PPF_CCD_COVERED_POINT_EDGE skipped=true queries={} edges={}",
+                self.surface_vertices, self.edges);
         }
 
-        // THE FOUR VERTEX-SPACE SWEEPS, in a fixed order. The order reaches
-        // the answer only through the min-fold, which is order-free, so it is
-        // held steady for a reader rather than for the arithmetic.
-        //
-        // EACH IS GATED ON ITS TREE EXISTING, and the gate is a handle
-        // question rather than a node-count one. An unallocated buffer carries
-        // `Handle::NONE`, whose arena is `u32::MAX`, and a generated entry
-        // asserts every handle's arena BEFORE the body runs, so a sweep cannot
-        // be dispatched with the intention of returning early inside it.
-        // `rebuild_trees` builds a tree only for a
-        // primitive the scene actually has, so a faceless SAND cloud has no
-        // face tree at all and the point-face sweep must not be dispatched over
-        // it. The tree count is what decides, not the query count.
-        if self.surface_vertices > 0 && self.faces > 0 {
-            let count = self.surface_vertices as u32;
-            let args = CcdPointFaceArgs {
-                x0,
-                x1,
-                face: mesh.face,
-                face_count: self.faces as u32,
-                vertex_prop: mesh.vertex_prop,
-                start_link_index: mesh.start_link.index,
-                start_link_offset: mesh.start_link.offset,
-                has_start_link: mesh.start_link.present,
-                face_prop: mesh.face_prop,
-                vertex_param: mesh.vertex_param,
-                face_param: mesh.face_param,
-                // THE REMAP TREE IS THE VERTEX TREE AND THE TRAVERSAL TREE IS
-                // THE FACE TREE, which is why this record names two node
-                // arrays: the thread's own surface vertex is remapped through
-                // the vertex tree and the query walks the face tree.
-                vertex_node: self.vertex_tree.node.handle(),
-                node: self.face_tree.node.handle(),
-                node_count: self.face_tree.node_count,
-                aabb: self.face_tree.aabb.handle(),
-                root: self.face_tree.root,
-                active: vertex_mask,
-                has_active: has_vertex_mask,
-                max_t,
-                ccd_eps,
-                out_toi: self.toi_vertex.handle(),
-                out_overlap: self.overlap_vertex.handle(),
-                query_count: count,
-                count,
-                seam_arena_count: 0,
-            };
-            device.launch("contact.line_search.point_face", &args, count)?;
-        }
-
-        // Grain-grain, over the vertex tree. A faceless SAND cloud has no
-        // point-face candidate among the mesh primitives, so without this
-        // nothing bounds a step that drives two grains through each other, and
-        // it is exactly the scene class the guard above skips the face sweep
-        // for.
-        if self.surface_vertices > 0 {
-            let count = self.surface_vertices as u32;
-            let args = CcdPointPointArgs {
-                x0,
-                x1,
-                vertex_prop: mesh.vertex_prop,
-                start_link_index: mesh.start_link.index,
-                start_link_offset: mesh.start_link.offset,
-                has_start_link: mesh.start_link.present,
-                vertex_param: mesh.vertex_param,
-                node: self.vertex_tree.node.handle(),
-                node_count: self.vertex_tree.node_count,
-                aabb: self.vertex_tree.aabb.handle(),
-                root: self.vertex_tree.root,
-                active: vertex_mask,
-                has_active: has_vertex_mask,
-                max_t,
-                ccd_eps,
-                out_toi: self.toi_vertex.handle(),
-                out_overlap: self.overlap_vertex.handle(),
-                query_count: count,
-                count,
-                seam_arena_count: 0,
-            };
-            device.launch("contact.line_search.point_point", &args, count)?;
-        }
-
-        // Independent faceless point-edge coverage, before the vertex fold.
-        // All surface points query: no edge/face membership is required, so
-        // grains/isolated points cannot disappear from this missing domain.
-        if self.surface_vertices > 0 && self.edges > 0 {
-            let count=self.surface_vertices as u32;
-            let args=CcdStandalonePointEdgeArgs {
-                x0,x1,edge:mesh.edge,edge_count:self.edges as u32,
-                vertex_count:self.vertices as u32,vertex_prop:mesh.vertex_prop,
-                start_link_index:mesh.start_link.index,start_link_offset:mesh.start_link.offset,
-                has_start_link:mesh.start_link.present,edge_prop:mesh.edge_prop,
-                vertex_param:mesh.vertex_param,edge_param:mesh.edge_param,
-                edge_face_offset:mesh.edge_face_offset,has_edge_face:mesh.has_edge_face,
-                vertex_node:self.vertex_tree.node.handle(),node:self.edge_tree.node.handle(),
-                node_count:self.edge_tree.node_count,aabb:self.edge_tree.aabb.handle(),
-                root:self.edge_tree.root,active:vertex_mask,has_active:has_vertex_mask,
-                max_t,ccd_eps,out_toi:self.toi_vertex.handle(),out_overlap:self.overlap_vertex.handle(),
-                query_count:count,count,seam_arena_count:0,
-            };
-            device.launch("contact.line_search.standalone_point_edge",&args,count)?;
-        }
-
-        // THE COLLISION-MESH SWEEPS, after the self-contact ones, as
-        // `contact::line_search` runs them. The collider has one pose, so its
-        // two trees were built at `initialize()` and never refreshed. Each is
-        // gated on BOTH sides' trees for the reason the self-contact ones are:
-        // `build_collider` builds a tree only for a primitive the collider
-        // actually has.
-        if self.has_collision_mesh() {
-            if self.surface_vertices > 0 && self.collider_faces > 0 {
-                let count = self.surface_vertices as u32;
-                let args = CcdCollisionPointFaceM2cArgs {
-                    x0,
-                    x1,
-                    collider_vertex_prop: self.collider_prop.handle(),
-                    collider_vertex: self.collider_vertex.handle(),
-                    collider_face: self.collider_face.handle(),
-                    collider_face_count: self.collider_faces as u32,
-                    vertex_prop: mesh.vertex_prop,
-                    start_link_index: mesh.start_link.index,
-                    start_link_offset: mesh.start_link.offset,
-                    has_start_link: mesh.start_link.present,
-                    collider_face_prop: self.collider_face_prop.handle(),
-                    vertex_param: mesh.vertex_param,
-                    collider_face_param: self.collider_face_param.handle(),
-                    node: self.collider_face_tree.node.handle(),
-                    node_count: self.collider_face_tree.node_count,
-                    aabb: self.collider_face_tree.aabb.handle(),
-                    root: self.collider_face_tree.root,
-                    active: vertex_mask,
-                    has_active: has_vertex_mask,
-                    max_t,
-                    ccd_eps,
-                    out_toi: self.toi_vertex.handle(),
-                    out_overlap: self.overlap_vertex.handle(),
-                    count,
+        // All these writes target CCD scratch. Keep the sweep order, since
+        // the overlap record at a slot is first-writer-wins.
+        self.fold.prepare(device, vertex_slots as u32)?;
+        device.run("contact.line_search.vertex", |encoder| {
+            // THE SEEDS, on the device. Every sweep MIN-FOLDS into its slot rather
+            // than writing it, so each slot has to open at the line-search ceiling,
+            // and every overlap slot has to open unflagged or a later read would
+            // decode whatever the arena handed out. Metal hands out allocations
+            // without zeroing and never faults on an uninitialized read.
+            if vertex_slots > 0 {
+                let seed = VecFillArgs {
+                    array: self.toi_vertex.handle(),
+                    value: max_t,
+                    count: vertex_slots as u32,
                     seam_arena_count: 0,
                 };
-                device.launch("contact.line_search.collision_m2c", &args, count)?;
+                encoder.elements(&seed, vertex_slots as u32)?;
+                let words = (ccd::OVERLAP_WORDS * vertex_slots) as u32;
+                let clear = VecFillU32Args {
+                    array: self.overlap_vertex.handle(),
+                    value: 0,
+                    count: words,
+                    seam_arena_count: 0,
+                };
+                encoder.elements(&clear, words)?;
             }
-            if self.collider_vertices > 0 && self.faces > 0 {
-                let count = self.collider_vertices as u32;
-                let args = CcdCollisionPointFaceC2mArgs {
+            if self.edges > 0 {
+                let seed = VecFillArgs {
+                    array: self.toi_edge.handle(),
+                    value: max_t,
+                    count: self.edges as u32,
+                    seam_arena_count: 0,
+                };
+                encoder.elements(&seed, self.edges as u32)?;
+                let words = (ccd::OVERLAP_WORDS * self.edges) as u32;
+                let clear = VecFillU32Args {
+                    array: self.overlap_edge.handle(),
+                    value: 0,
+                    count: words,
+                    seam_arena_count: 0,
+                };
+                encoder.elements(&clear, words)?;
+            }
+
+            // THE FOUR VERTEX-SPACE SWEEPS, in a fixed order. The order reaches
+            // the answer only through the min-fold, which is order-free, so it is
+            // held steady for a reader rather than for the arithmetic.
+            //
+            // EACH IS GATED ON ITS TREE EXISTING, and the gate is a handle
+            // question rather than a node-count one. An unallocated buffer carries
+            // `Handle::NONE`, whose arena is `u32::MAX`, and a generated entry
+            // asserts every handle's arena BEFORE the body runs, so a sweep cannot
+            // be dispatched with the intention of returning early inside it.
+            // `rebuild_trees` builds a tree only for a
+            // primitive the scene actually has, so a faceless SAND cloud has no
+            // face tree at all and the point-face sweep must not be dispatched over
+            // it. The tree count is what decides, not the query count.
+            if self.surface_vertices > 0 && self.faces > 0 {
+                let count = self.surface_vertices as u32;
+                let args = CcdPointFaceArgs {
                     x0,
                     x1,
-                    collider_vertex: self.collider_vertex.handle(),
                     face: mesh.face,
                     face_count: self.faces as u32,
                     vertex_prop: mesh.vertex_prop,
@@ -1645,95 +1861,180 @@ impl Contact {
                     start_link_offset: mesh.start_link.offset,
                     has_start_link: mesh.start_link.present,
                     face_prop: mesh.face_prop,
-                    collider_vertex_prop: self.collider_prop.handle(),
+                    vertex_param: mesh.vertex_param,
                     face_param: mesh.face_param,
-                    collider_vertex_param: self.collider_vertex_param.handle(),
+                    // THE REMAP TREE IS THE VERTEX TREE AND THE TRAVERSAL TREE IS
+                    // THE FACE TREE, which is why this record names two node
+                    // arrays: the thread's own surface vertex is remapped through
+                    // the vertex tree and the query walks the face tree.
+                    vertex_node: self.vertex_tree.node.handle(),
                     node: self.face_tree.node.handle(),
                     node_count: self.face_tree.node_count,
                     aabb: self.face_tree.aabb.handle(),
                     root: self.face_tree.root,
+                    active: vertex_mask,
+                    has_active: has_vertex_mask,
                     max_t,
                     ccd_eps,
                     out_toi: self.toi_vertex.handle(),
                     out_overlap: self.overlap_vertex.handle(),
+                    query_count: count,
                     count,
                     seam_arena_count: 0,
                 };
-                device.launch("contact.line_search.collision_c2m", &args, count)?;
+                encoder.elements(&args, count)?;
             }
-        }
 
-        // THE VERTEX-SPACE FOLD, taken BEFORE the two edge sweeps because they
-        // are seeded from it: an edge
-        // collision later than `T_vf` cannot beat an already-found earlier
-        // point-face hit, so bounding the edge sweep to `[0, T_vf]` prunes far
-        // BVH nodes while leaving the final min bit-identical. The spatial
-        // margin is untouched, so coverage of `[0, T_vf]` stays conservative.
-        //
-        // ONE DOWNLOAD SERVES BOTH READINGS. Nothing writes this array after
-        // the four sweeps above, so the value folded here is also the value
-        // folded into the filter below.
-        let t_vf_seed = if vertex_slots > 0 {
-            let values = self.toi_vertex.handle();
-            // Safety: the buffer outlives the call and names `vertex_slots`.
-            unsafe {
-                self.fold
-                    .min(device, "contact.toi_vertex", values, vertex_slots as u32, max_t)
-            }?
-        } else {
-            max_t
-        };
+            // Grain-grain, over the vertex tree. A faceless SAND cloud has no
+            // point-face candidate among the mesh primitives, so without this
+            // nothing bounds a step that drives two grains through each other, and
+            // it is exactly the scene class the guard above skips the face sweep
+            // for.
+            if self.surface_vertices > 0 {
+                let count = self.surface_vertices as u32;
+                let args = CcdPointPointArgs {
+                    x0,
+                    x1,
+                    vertex_prop: mesh.vertex_prop,
+                    start_link_index: mesh.start_link.index,
+                    start_link_offset: mesh.start_link.offset,
+                    has_start_link: mesh.start_link.present,
+                    vertex_param: mesh.vertex_param,
+                    node: self.vertex_tree.node.handle(),
+                    node_count: self.vertex_tree.node_count,
+                    aabb: self.vertex_tree.aabb.handle(),
+                    root: self.vertex_tree.root,
+                    active: vertex_mask,
+                    has_active: has_vertex_mask,
+                    max_t,
+                    ccd_eps,
+                    out_toi: self.toi_vertex.handle(),
+                    out_overlap: self.overlap_vertex.handle(),
+                    query_count: count,
+                    count,
+                    seam_arena_count: 0,
+                };
+                encoder.elements(&args, count)?;
+            }
+
+            // Independent faceless point-edge coverage, before the vertex fold.
+            // All surface points query: no edge/face membership is required, so
+            // grains/isolated points cannot disappear from this missing domain.
+            // Every visited edge in a certified CSR takes the visitor's
+            // face-adjacency rejection. The omitted commit would MIN-fold
+            // max_t into the already seeded/PF/PP-folded value and write no
+            // overlap record.
+            if self.surface_vertices > 0 && self.edges > 0 && !skip_covered_point_edge {
+                let count=self.surface_vertices as u32;
+                let args=CcdStandalonePointEdgeArgs {
+                    x0,x1,edge:mesh.edge,edge_count:self.edges as u32,
+                    vertex_count:self.vertices as u32,vertex_prop:mesh.vertex_prop,
+                    start_link_index:mesh.start_link.index,start_link_offset:mesh.start_link.offset,
+                    has_start_link:mesh.start_link.present,edge_prop:mesh.edge_prop,
+                    vertex_param:mesh.vertex_param,edge_param:mesh.edge_param,
+                    edge_face_offset:mesh.edge_face_offset,has_edge_face:mesh.has_edge_face,
+                    vertex_node:self.vertex_tree.node.handle(),node:self.edge_tree.node.handle(),
+                    node_count:self.edge_tree.node_count,aabb:self.edge_tree.aabb.handle(),
+                    root:self.edge_tree.root,active:vertex_mask,has_active:has_vertex_mask,
+                    max_t,ccd_eps,out_toi:self.toi_vertex.handle(),out_overlap:self.overlap_vertex.handle(),
+                    query_count:count,count,seam_arena_count:0,
+                };
+                encoder.elements(&args, count)?;
+            }
+
+            // THE COLLISION-MESH SWEEPS, after the self-contact ones, as
+            // `contact::line_search` runs them. The collider has one pose, so its
+            // two trees were built at `initialize()` and never refreshed. Each is
+            // gated on BOTH sides' trees for the reason the self-contact ones are:
+            // `build_collider` builds a tree only for a primitive the collider
+            // actually has.
+            if self.has_collision_mesh() {
+                if self.surface_vertices > 0 && self.collider_faces > 0 {
+                    let count = self.surface_vertices as u32;
+                    let args = CcdCollisionPointFaceM2cArgs {
+                        x0,
+                        x1,
+                        collider_vertex_prop: self.collider_prop.handle(),
+                        collider_vertex: self.collider_vertex.handle(),
+                        collider_face: self.collider_face.handle(),
+                        collider_face_count: self.collider_faces as u32,
+                        vertex_prop: mesh.vertex_prop,
+                        start_link_index: mesh.start_link.index,
+                        start_link_offset: mesh.start_link.offset,
+                        has_start_link: mesh.start_link.present,
+                        collider_face_prop: self.collider_face_prop.handle(),
+                        vertex_param: mesh.vertex_param,
+                        collider_face_param: self.collider_face_param.handle(),
+                        node: self.collider_face_tree.node.handle(),
+                        node_count: self.collider_face_tree.node_count,
+                        aabb: self.collider_face_tree.aabb.handle(),
+                        root: self.collider_face_tree.root,
+                        active: vertex_mask,
+                        has_active: has_vertex_mask,
+                        max_t,
+                        ccd_eps,
+                        out_toi: self.toi_vertex.handle(),
+                        out_overlap: self.overlap_vertex.handle(),
+                        count,
+                        seam_arena_count: 0,
+                    };
+                    encoder.elements(&args, count)?;
+                }
+                if self.collider_vertices > 0 && self.faces > 0 {
+                    let count = self.collider_vertices as u32;
+                    let args = CcdCollisionPointFaceC2mArgs {
+                        x0,
+                        x1,
+                        collider_vertex: self.collider_vertex.handle(),
+                        face: mesh.face,
+                        face_count: self.faces as u32,
+                        vertex_prop: mesh.vertex_prop,
+                        start_link_index: mesh.start_link.index,
+                        start_link_offset: mesh.start_link.offset,
+                        has_start_link: mesh.start_link.present,
+                        face_prop: mesh.face_prop,
+                        collider_vertex_prop: self.collider_prop.handle(),
+                        face_param: mesh.face_param,
+                        collider_vertex_param: self.collider_vertex_param.handle(),
+                        node: self.face_tree.node.handle(),
+                        node_count: self.face_tree.node_count,
+                        aabb: self.face_tree.aabb.handle(),
+                        root: self.face_tree.root,
+                        max_t,
+                        ccd_eps,
+                        out_toi: self.toi_vertex.handle(),
+                        out_overlap: self.overlap_vertex.handle(),
+                        count,
+                        seam_arena_count: 0,
+                    };
+                    encoder.elements(&args, count)?;
+                }
+            }
+            self.fold.encode_min(encoder, self.toi_vertex.handle(), vertex_slots as u32)
+        })?;
+
+        // Edges only need to search up to the earliest vertex impact. The
+        // host retains that same minimum for the final filter.
+        let t_vf_seed = self.fold.read_min(device, vertex_slots as u32, max_t)?;
 
         if self.edges > 0 {
             let count = self.edges as u32;
-            let args = CcdEdgeEdgeArgs {
-                x0,
-                x1,
-                edge: mesh.edge,
-                vertex_prop: mesh.vertex_prop,
-                start_link_index: mesh.start_link.index,
-                start_link_offset: mesh.start_link.offset,
-                has_start_link: mesh.start_link.present,
-                edge_prop: mesh.edge_prop,
-                edge_param: mesh.edge_param,
-                node: self.edge_tree.node.handle(),
-                node_count: self.edge_tree.node_count,
-                aabb: self.edge_tree.aabb.handle(),
-                root: self.edge_tree.root,
-                active: edge_mask,
-                has_active: has_edge_mask,
-                t_vf_seed,
-                max_t,
-                ccd_eps,
-                out_toi_ee: self.toi_edge.handle(),
-                out_overlap_ee: self.overlap_edge.handle(),
-                query_count: count,
-                count,
-                seam_arena_count: 0,
-            };
-            device.launch("contact.line_search.edge_edge", &args, count)?;
-
-            if self.has_collision_mesh() && self.collider_edges > 0 {
-                let args = CcdCollisionEdgeEdgeArgs {
+            self.fold.prepare(device, count)?;
+            device.run("contact.line_search.edge", |encoder| {
+                let args = CcdEdgeEdgeArgs {
                     x0,
                     x1,
                     edge: mesh.edge,
-                    collider_vertex_prop: self.collider_prop.handle(),
-                    collider_vertex: self.collider_vertex.handle(),
-                    collider_edge: self.collider_edge.handle(),
-                    collider_edge_count: self.collider_edges as u32,
                     vertex_prop: mesh.vertex_prop,
                     start_link_index: mesh.start_link.index,
                     start_link_offset: mesh.start_link.offset,
                     has_start_link: mesh.start_link.present,
                     edge_prop: mesh.edge_prop,
-                    collider_edge_prop: self.collider_edge_prop.handle(),
                     edge_param: mesh.edge_param,
-                    collider_edge_param: self.collider_edge_param.handle(),
-                    node: self.collider_edge_tree.node.handle(),
-                    node_count: self.collider_edge_tree.node_count,
-                    aabb: self.collider_edge_tree.aabb.handle(),
-                    root: self.collider_edge_tree.root,
+                    node: self.edge_tree.node.handle(),
+                    node_count: self.edge_tree.node_count,
+                    aabb: self.edge_tree.aabb.handle(),
+                    root: self.edge_tree.root,
                     active: edge_mask,
                     has_active: has_edge_mask,
                     t_vf_seed,
@@ -1741,21 +2042,51 @@ impl Contact {
                     ccd_eps,
                     out_toi_ee: self.toi_edge.handle(),
                     out_overlap_ee: self.overlap_edge.handle(),
+                    query_count: count,
                     count,
                     seam_arena_count: 0,
                 };
-                device.launch("contact.line_search.collision_edge_edge", &args, count)?;
-            }
+                encoder.elements(&args, count)?;
+
+                if self.has_collision_mesh() && self.collider_edges > 0 {
+                    let args = CcdCollisionEdgeEdgeArgs {
+                        x0,
+                        x1,
+                        edge: mesh.edge,
+                        collider_vertex_prop: self.collider_prop.handle(),
+                        collider_vertex: self.collider_vertex.handle(),
+                        collider_edge: self.collider_edge.handle(),
+                        collider_edge_count: self.collider_edges as u32,
+                        vertex_prop: mesh.vertex_prop,
+                        start_link_index: mesh.start_link.index,
+                        start_link_offset: mesh.start_link.offset,
+                        has_start_link: mesh.start_link.present,
+                        edge_prop: mesh.edge_prop,
+                        collider_edge_prop: self.collider_edge_prop.handle(),
+                        edge_param: mesh.edge_param,
+                        collider_edge_param: self.collider_edge_param.handle(),
+                        node: self.collider_edge_tree.node.handle(),
+                        node_count: self.collider_edge_tree.node_count,
+                        aabb: self.collider_edge_tree.aabb.handle(),
+                        root: self.collider_edge_tree.root,
+                        active: edge_mask,
+                        has_active: has_edge_mask,
+                        t_vf_seed,
+                        max_t,
+                        ccd_eps,
+                        out_toi_ee: self.toi_edge.handle(),
+                        out_overlap_ee: self.overlap_edge.handle(),
+                        count,
+                        seam_arena_count: 0,
+                    };
+                    encoder.elements(&args, count)?;
+                }
+                self.fold.encode_min(encoder, self.toi_edge.handle(), count)
+            })?;
         }
 
         filter.fold_time(t_vf_seed);
-        let edge_toi = if self.edges > 0 {
-            let values = self.toi_edge.handle();
-            // Safety: as above.
-            unsafe { self.fold.min(device, "contact.toi_edge", values, self.edges as u32, max_t) }?
-        } else {
-            max_t
-        };
+        let edge_toi = self.fold.read_min(device, self.edges as u32, max_t)?;
         filter.fold_time(edge_toi);
 
         // THE OVERLAP REPORT IS READ ONLY WHEN THE FOLD CAME OUT AT ZERO, which

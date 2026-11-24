@@ -42,7 +42,7 @@ use rayon::prelude::*;
 use crate::sched;
 use crate::{
     AllocLabel, Counters, Device, DeviceInfo, Diag, DiagFailure, Encoder, Extent, Fault, Handle,
-    HostRef, KernelDecl, KernelId, Scatter,
+    HostRef, KernelArgs, KernelDecl, KernelId, Scatter,
 };
 use crate::mem::Pool;
 
@@ -800,6 +800,12 @@ impl HostDevice {
     /// `args` addresses the record `decl` declares and every buffer it names is
     /// live for the duration of the call.
     unsafe fn execute(&mut self, decl: &'static KernelDecl, extent: Extent, args: *const u8) -> Diag {
+        unsafe { self.execute_mode(decl, extent, args, false) }
+    }
+
+    unsafe fn execute_mode(
+        &mut self, decl: &'static KernelDecl, extent: Extent, args: *const u8, disjoint_probe: bool,
+    ) -> Diag {
         self.counters.dispatches += 1;
         // THE GROUP SHAPE RUNS ITS LANES ONE AFTER ANOTHER, one whole group
         // per step, which is what `device.rs` states and what makes it exact
@@ -844,7 +850,7 @@ impl HostDevice {
 
         // A serial pass, either because the scatter forbids a cut or because the
         // job is smaller than the region that would carry it.
-        let serial = !matches!(decl.scatter, Scatter::Disjoint)
+        let serial = (!disjoint_probe && !matches!(decl.scatter, Scatter::Disjoint))
             || sched::should_run_serially(decl.nanos_per_item, total);
         if serial {
             let mut raw = DiagRecord::default();
@@ -857,7 +863,11 @@ impl HostDevice {
             return merge(std::slice::from_ref(&raw), decl.diag);
         }
 
-        let chunk = sched::chunk_for(decl.nanos_per_item, total) as u32;
+        let mut chunk = sched::chunk_for(decl.nanos_per_item, total);
+        if disjoint_probe {
+            chunk = chunk.max(total.div_ceil(rayon::current_num_threads().saturating_mul(4)));
+        }
+        let chunk = chunk as u32;
         let starts: Vec<u32> = (0..count).step_by(chunk as usize).collect();
         let mut raws = vec![DiagRecord::default(); starts.len()];
         let address = args as usize;
@@ -1085,6 +1095,100 @@ impl HostDevice {
 
 impl Device for HostDevice {
     type Region = HostRegion;
+
+    unsafe fn launch_disjoint_probe<A: KernelArgs>(
+        &mut self, region: &'static str, args: &A, count: u32,
+    ) -> Result<Option<Diag>, Fault> {
+        if rayon::current_num_threads() < 2 {
+            return Ok(None);
+        }
+        let decl = self.decl(A::KERNEL)?;
+        if !decl.generated || !decl.diag
+            || A::guard_count(args).is_some_and(|n| n != count)
+        {
+            return Ok(None);
+        }
+        crate::device::validate_handles(args)?;
+        let extent = Extent::Elements { count };
+        let raw = (args as *const A).cast::<u8>();
+        unsafe { check_shape(decl, extent, raw, std::mem::size_of::<A>())?; }
+        self.counters.syncs += 1;
+        // Only the caller-certified scratch path bypasses the shared scatter
+        // declaration. The normal device launch always respects it.
+        let diag = unsafe { self.execute_mode(decl, extent, raw, true) };
+        if diag.is_clean() {
+            Ok(Some(diag))
+        } else {
+            Err(Fault::Device { region, diag })
+        }
+    }
+
+    fn supports_empty_claim_probe(&self) -> bool {
+        rayon::current_num_threads() > 1
+    }
+
+    unsafe fn probe_empty_claim<A: KernelArgs>(
+        &mut self,
+        args: &A,
+        count: u32,
+        counter_offset: usize,
+        max_increments: u64,
+    ) -> bool {
+        let threads = rayon::current_num_threads();
+        if threads < 2 || count == 0 || max_increments > u64::from(u32::MAX) {
+            return false;
+        }
+        let Ok(decl) = self.decl(A::KERNEL) else { return false; };
+        if !decl.generated || !decl.diag || !matches!(decl.scatter, Scatter::Claim)
+            || sched::should_run_serially(decl.nanos_per_item, count as usize)
+            || !A::handle_offsets().iter().any(|&offset| usize::from(offset) == counter_offset)
+            || A::guard_count(args).is_some_and(|guard| guard != count)
+            || crate::device::validate_handles(args).is_err()
+        {
+            return false;
+        }
+        let raw = (args as *const A).cast::<u8>();
+        if check_shape(decl, Extent::Elements { count }, raw, std::mem::size_of::<A>()).is_err() {
+            return false;
+        }
+        let (bases, live) = self.arena_bases();
+        let scratch_slot = live + decl.host_refs.len();
+        if scratch_slot >= MAX_ARENA_SLOTS {
+            return false;
+        }
+        let bound = bind_generated(decl, raw, &bases[..live]);
+        let address = &bound as *const BoundArgs as usize;
+        let width = usize::from(decl.args_bytes);
+        let chunk = sched::chunk_for(decl.nanos_per_item, count as usize)
+            .max((count as usize).div_ceil(threads.saturating_mul(4))) as u32;
+        let ranges = count.div_ceil(chunk);
+        if ranges <= 1 {
+            return false;
+        }
+        let launch = self.launch[decl.id.0 as usize];
+        self.counters.dispatches += 1;
+        self.counters.syncs += 1;
+        (0..ranges).into_par_iter().all(|range| {
+            let begin = range * chunk;
+            let end = begin.saturating_add(chunk).min(count);
+            let mut counter = [0u32; 2];
+            let mut diag = DiagRecord::default();
+            // The bound record and original arenas are read-only. This copy
+            // redirects only the private counter; the caller's probe flag
+            // writes are disjoint by query, even across a failing traversal.
+            unsafe {
+                let shared = &*(address as *const BoundArgs);
+                let mut private = BoundArgs { bytes: shared.bytes, bases: shared.bases };
+                private.bases[scratch_slot] = counter.as_mut_ptr().cast();
+                let handle = Handle { arena: scratch_slot as u32, off: 0, size: 2, allocated: 2 };
+                private.bytes.as_mut_ptr().add(counter_offset).cast::<Handle>().write_unaligned(handle);
+                private.bytes.as_mut_ptr().add(width - 4).cast::<u32>()
+                    .write_unaligned((scratch_slot + 1) as u32);
+                launch((&private as *const BoundArgs).cast(), begin, end, 0, &mut diag);
+            }
+            counter == [0, 0] && diag.fail_count == 0 && diag.claimed == 0
+        })
+    }
 
     fn info(&self) -> &DeviceInfo {
         &self.info

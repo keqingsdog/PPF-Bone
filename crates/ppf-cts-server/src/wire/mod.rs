@@ -223,16 +223,10 @@ where
     // would report `data="NO_DATA"` even with `data.pickle` and
     // `app_state.pickle` on disk.
     let project = reconcile_project_from_disk(&name, &root, &engine.state().name);
-    let delete_selection = if delete_request {
-        let (selected, effects) = engine.dispatch_with_snapshot(project);
-        for effect in effects {
-            executor.execute(effect, engine).await;
-        }
-        Some(selected)
-    } else {
-        dispatch_with_executor(engine, executor, project).await;
-        None
-    };
+    let (selected, effects) = engine.dispatch_with_snapshot(project);
+    for effect in effects {
+        executor.execute(effect, engine).await;
+    }
 
     if get_arg(&args,"request") == Some("resume_generation_baseline") {
         let words: Vec<_> = line.split_whitespace().collect();
@@ -290,7 +284,6 @@ where
         // Bind the command to the exact project selection observed here.
         // A concurrent client may have selected another project after the
         // reconciliation above, including the same name in a new generation.
-        let selected = delete_selection.expect("delete selection captured");
         if selected.name != name || selected.root != root {
             return write_response(writer, &serde_json::json!({
                 "protocol_version": crate::PROTOCOL_VERSION,
@@ -326,11 +319,12 @@ where
     }
 
     let mut request_event_dispatched = false;
+    let bind_request_context = matches!(get_arg(&args, "request"), Some("build" | "start" | "resume"));
     if let Some(req) = get_arg(&args, "request") {
         log::debug!(target: "ppf::wire", "{peer}: TCMD request name={name} request={req}");
         if req == "resume" && crate::executor::retained_checkpoints(std::path::Path::new(&root)) {
             let state = engine.state();
-            if state.name != name || state.root != root {
+            if !ServerEngine::same_project_context(&state, &selected) {
                 return write_response(writer, &serde_json::json!({
                     "protocol_version": crate::PROTOCOL_VERSION,
                     "error": "PROJECT_CONTEXT_CHANGED",
@@ -360,7 +354,19 @@ where
         } else { tcmd_request_to_event(req,resume_from,preserve_output) };
         if let Some(event) = event {
             request_event_dispatched = true;
-            dispatch_with_executor(engine, executor, event).await;
+            if bind_request_context {
+                let Some(effects) = engine.dispatch_matching_context(&selected, event) else {
+                    return write_response(writer, &serde_json::json!({
+                        "protocol_version": crate::PROTOCOL_VERSION,
+                        "error": "PROJECT_CONTEXT_CHANGED",
+                    })).await;
+                };
+                for effect in effects {
+                    executor.execute(effect, engine).await;
+                }
+            } else {
+                dispatch_with_executor(engine, executor, event).await;
+            }
         } else {
             log::warn!(target: "ppf::wire", "{peer}: unknown TCMD request {req}");
         }
@@ -369,12 +375,12 @@ where
     }
 
     let response_state = engine.state();
-    // A probe that dispatched no request event must not expose another project,
-    // including an unrecognized request that only produced a warning above.
-    // Dispatched requests retain their existing response semantics: an action may
-    // already have run, so a context error must not imply that retrying is safe.
-    // This is a fail-closed response check, not multi-project transaction isolation.
-    if !request_event_dispatched && response_state.name != name {
+    // Build, Run and Resume replies belong to the original selection. A
+    // context change after dispatch can also happen after the effect began.
+    // Ordinary polls and unrecognized requests must never expose another project.
+    if (bind_request_context && !ServerEngine::same_project_context(&response_state, &selected))
+        || (!request_event_dispatched && response_state.name != name)
+    {
         return write_response(writer, &serde_json::json!({
             "protocol_version": crate::PROTOCOL_VERSION,
             "error": "PROJECT_CONTEXT_CHANGED",

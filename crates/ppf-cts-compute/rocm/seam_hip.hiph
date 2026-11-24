@@ -272,6 +272,8 @@ __device__ inline unsigned popcount(unsigned long long value) {
 
 namespace compute {
 
+constexpr bool has_contact_query_witness = false;
+
 // AN AMD WAVEFRONT IS NOT ONE WIDTH, AND THE WIDTH IS READ FROM THE FAMILY
 // MACRO RATHER THAN FROM A WAVEFRONT MACRO, because the obvious one does not
 // exist here.

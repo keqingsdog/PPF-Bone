@@ -79,6 +79,10 @@ mod no_progress;
 
 #[path = "runtime_auto_policy.rs"]
 pub(super) mod runtime_auto_policy;
+#[path = "full_body_factor.rs"]
+mod full_body_factor;
+#[path = "full_body_native.rs"]
+mod full_body_native;
 use ppf_cts_compute::{AllocLabel, Buffer, Device, Encoder, EncoderExt, Fault, ReadbackBuffer};
 use super::kernels::{
     Mat3MulArgs, PcgAlphaTermsArgs, PcgBetaResidentArgs,
@@ -2030,6 +2034,33 @@ impl DotTerms<'_> {
     }
 
     /// `a . b` under the fixed fold shape.
+
+    /// Same root projector, products and fold as the classic tail, encoded
+    /// together after the original host observation of the factor fault word.
+    unsafe fn ordered_root_dot<D: Device>(
+        &mut self,
+        device: &mut D,
+        root: super::roots::View,
+        residual: ppf_cts_compute::Handle,
+        preconditioned: ppf_cts_compute::Handle,
+        dim: usize,
+        fold: &Buffer<f32>,
+        scalars: &mut ReadbackBuffer<f32>,
+    ) -> Result<f32, Fault> {
+        let rows = self.rows();
+        debug_assert!(rows != 0);
+        let out = scalars.span(slot::FOLD_SCRATCH, 1);
+        let source = self.product_handle();
+        let _phase = super::phase::start("pcg.classic_tail.rz_packet");
+        device.run("pcg.rigid.classic_tail.rz_packet", |encoder| unsafe {
+            root.encode_project(encoder, preconditioned)?;
+            self.encode_fill(encoder, residual, preconditioned, dim)?;
+            encode_fold(encoder, source, rows, fold, out, false)
+        })?;
+        scalars.download(device)?;
+        Ok(scalars.host()[slot::FOLD_SCRATCH])
+    }
+
     /// `a . b`, REDUCED ON THE DEVICE.
     ///
     /// The fold lands in one scalar slot and only that slot is read back, so
@@ -2124,6 +2155,68 @@ mod tests {
     use super::*;
     use crate::driver::launch::host_device;
     use crate::driver::spmv;
+
+
+    #[test]
+    fn ordered_tail_root_dot_keeps_native_projection_and_fold_bits() {
+        use crate::driver::roots::{ConstraintDomain, View};
+        use crate::joint_root_motion_gpu::RootTargetGpu;
+
+        let mut device = host_device();
+        let mut targets = Buffer::none();
+        targets.size(&mut device, 1, AllocLabel("ordered_tail.test.root")).unwrap();
+        targets.write(&mut device, 0, &[RootTargetGpu {
+            body: 0, enabled: 1, ..Default::default()
+        }]).unwrap();
+
+        for dim in [7usize, 257, 1025] {
+            let root = View {
+                targets: targets.handle(), count: 1, bodies: 1, base: (dim - 6) as u32,
+                dim: dim as u32, constraint_domain: ConstraintDomain::default(),
+            };
+            let mut residual = Buffer::<f32>::none();
+            let mut original = Buffer::<f32>::none();
+            let mut packet = Buffer::<f32>::none();
+            let mut fold = Buffer::<f32>::none();
+            for buffer in [&mut residual, &mut original, &mut packet] {
+                buffer.size(&mut device, dim, AllocLabel("ordered_tail.test.vector")).unwrap();
+            }
+            fold.size(&mut device, fold_scratch_len(dim), AllocLabel("ordered_tail.test.fold")).unwrap();
+            let x: Vec<_> = (0..dim).map(|i| ((i % 17) as f32 - 5.0) / 11.0).collect();
+            let z: Vec<_> = (0..dim).map(|i| ((i % 23) as f32 - 8.0) / 7.0).collect();
+            residual.write(&mut device, 0, &x).unwrap();
+            original.write(&mut device, 0, &z).unwrap();
+            packet.write(&mut device, 0, &z).unwrap();
+
+            let mut product = ReadbackBuffer::default();
+            let mut magnitude = ReadbackBuffer::default();
+            let mut scalar = ReadbackBuffer::default();
+            product.size(&mut device, dim, AllocLabel("ordered_tail.test.product")).unwrap();
+            magnitude.size(&mut device, dim, AllocLabel("ordered_tail.test.magnitude")).unwrap();
+            scalar.size(&mut device, slot::COUNT, AllocLabel("ordered_tail.test.scalar")).unwrap();
+            let mut terms = DotTerms { product: &mut product, magnitude: &mut magnitude };
+            unsafe { root.project(&mut device, original.handle()).unwrap(); }
+            let expected = terms.dot(&mut device, residual.handle(), original.handle(),
+                dim, &fold, &mut scalar).unwrap();
+            let actual = unsafe { terms.ordered_root_dot(&mut device, root, residual.handle(),
+                packet.handle(), dim, &fold, &mut scalar) }.unwrap();
+            assert_eq!(actual.to_bits(), expected.to_bits(), "size {dim}");
+
+            let mut actual_z = vec![0.0f32; dim];
+            let mut expected_z = vec![0.0f32; dim];
+            packet.read(&mut device, 0, &mut actual_z).unwrap();
+            original.read(&mut device, 0, &mut expected_z).unwrap();
+            assert!(actual_z.iter().zip(expected_z).all(|(a, b)| a.to_bits() == b.to_bits()));
+            assert!(actual_z[dim - 6..].iter().all(|x| x.to_bits() == 0));
+            for buffer in [&mut residual, &mut original, &mut packet, &mut fold] {
+                buffer.free(&mut device).unwrap();
+            }
+            for buffer in [&mut product, &mut magnitude, &mut scalar] {
+                buffer.free(&mut device).unwrap();
+            }
+        }
+        targets.free(&mut device).unwrap();
+    }
 
     #[test]
     fn rigid_iterate_export_copies_affine_rotation_not_old_output_or_zero() {
@@ -4588,7 +4681,32 @@ pub unsafe fn solve_locked<D: Device>(
 mod warm_start_policy;
 #[path="lanczos_trace.rs"]
 mod lanczos_trace;
+#[path = "factor_refresh_policy.rs"]
+mod factor_refresh_policy;
 use warm_start_policy::{WarmKey, ColdCost};
+
+/// A prefix needs warm-up and enough remaining interior iterations to amortize
+/// graph setup. A borrowed factor keeps its existing wall-time refresh policy.
+fn stride_graph_capture_candidate(iteration: u32, cap: u32, borrowed_ms: Option<(f64, f64)>) -> bool {
+    iteration == 5 && cap.saturating_sub(iteration) >= 4
+        && borrowed_ms.is_none_or(|(spent, allowed)| 2.0 * spent < allowed)
+}
+
+#[cfg(test)]
+mod stride_graph_capture_tests {
+    use super::stride_graph_capture_candidate as candidate;
+
+    #[test]
+    fn only_captures_a_warm_interior_iteration_with_headroom() {
+        assert!(!candidate(1, 100, None));
+        assert!(!candidate(5, 8, None));
+        assert!(candidate(5, 9, None));
+        assert!(!candidate(9, 9, None));
+        assert!(candidate(5, 50, Some((0.25, 1.0))));
+        assert!(!candidate(5, 50, Some((0.5, 1.0))));
+        assert!(!candidate(5, 50, Some((f64::NAN, 1.0))));
+    }
+}
 
 /// The vectors the PDRD reduced solve needs beside [`Workspace`].
 ///
@@ -4611,10 +4729,37 @@ struct CachedBodyFactor {
     owner: super::body_factor_device::BodyFactorDevice,
     key: FactorDomainKey,
     prepare_ms: f64,
+    iteration_debt: Option<FactorIterationDebt>,
+}
+
+/// Opt-in cache replacement heuristic. Charge only completed same-dt
+/// verified solves. One fresh segment's iteration count is the allowance for
+/// extra iterations, independent of the first factor's wall-clock setup.
+#[derive(Clone, Copy)]
+struct FactorIterationDebt {
+    dt_bits: u32,
+    fresh_iterations: u32,
+    excess_iterations: u32,
+}
+
+impl FactorIterationDebt {
+    fn charge(mut self, borrowed_iterations: u32) -> Self {
+        self.excess_iterations = self.excess_iterations.saturating_add(
+            borrowed_iterations.saturating_sub(self.fresh_iterations),
+        );
+        self
+    }
+
+    fn expired(self) -> bool {
+        self.excess_iterations >= self.fresh_iterations
+    }
 }
 
 #[derive(Default)]
 pub struct RigidWorkspace {
+    full_body_reuse: full_body_native::Reuse,
+    full_body_symbolic: full_body_factor::SymbolicCache,
+    full_body_binding_generation: u64,
     body_inverse: Option<super::body_inverse_device::BodyInverseDevice>,
     body_factor: Option<super::body_factor_device::BodyFactorDevice>,
     body_factor_cache: Option<CachedBodyFactor>,
@@ -4622,6 +4767,8 @@ pub struct RigidWorkspace {
     active_factor_key: Option<FactorDomainKey>,
     active_factor_prepare_ms: f64,
     active_factor_borrowed: bool,
+    active_factor_iteration_debt: Option<FactorIterationDebt>,
+    active_factor_fresh_prefix: Option<u32>,
     body_host_tree: Option<HostBodyTree>,
     body_inverse_debug: Option<BodyTreeDebug>,
     body_group_reference: Option<BodyGroupReference>,
@@ -4673,6 +4820,7 @@ pub struct RigidWorkspace {
 impl RigidWorkspace {
     /// Release before replacing the workspace or its device-owned arena.
     pub(crate) fn release_factor_cache<D: Device>(&mut self, device: &mut D) -> Result<(), Fault> {
+        self.full_body_symbolic = full_body_factor::SymbolicCache::default();
         if let Some(mut cached) = self.body_factor_cache.take() {
             cached.owner.free(device)?;
         }
@@ -4693,6 +4841,13 @@ impl RigidWorkspace {
         }
         Ok((prior,count))
     }
+    pub(crate) fn invalidate_full_body_binding(&mut self) {
+        self.full_body_reuse = full_body_native::Reuse::default();
+        self.full_body_symbolic = full_body_factor::SymbolicCache::default();
+        // The old entry is dropped before replacing its binding.
+        self.full_body_binding_generation = self.full_body_binding_generation.saturating_add(1);
+    }
+
     pub fn allocate<D: Device>(
         &mut self,
         device: &mut D,
@@ -4701,6 +4856,7 @@ impl RigidWorkspace {
         bodies: usize,
     ) -> Result<(), Fault> {
         use ppf_cts_compute::AllocLabel;
+        self.full_body_reuse = full_body_native::Reuse::default();
         self.release_factor_cache(device)?;
         self.factor_workspace_generation = self.factor_workspace_generation.checked_add(1)
             .ok_or_else(|| Fault::Platform { call: "factor cache", detail: "workspace generation exhausted".into() })?;
@@ -4783,9 +4939,25 @@ unsafe fn group_l1_device<D: Device>(
     bodies: usize,
     out: &mut [f32],
 ) -> Result<(), Fault> {
+    group_l1_after(device, reduced, norms, fold, body_base, bodies, out, |_| Ok(()))
+}
+
+/// Append work that produces `reduced` before measuring its DOF groups in
+/// the same ordered region. The group measurement and readback stay the same.
+unsafe fn group_l1_after<D: Device>(
+    device: &mut D,
+    reduced: ppf_cts_compute::Handle,
+    norms: &mut ReadbackBuffer<f32>,
+    fold: &Buffer<f32>,
+    body_base: usize,
+    bodies: usize,
+    out: &mut [f32],
+    produce: impl FnOnce(&mut dyn Encoder) -> Result<(), Fault>,
+) -> Result<(), Fault> {
     debug_assert_eq!(out.len(), 1 + bodies);
     let cloth_slot = norms.span(0, 1);
     device.run("pcg.rigid.group_l1", |encoder| {
+        produce(encoder)?;
         if body_base > 0 {
             // Safety: `reduced` and the scratch outlive the call.
             unsafe { encode_fold(encoder, reduced, body_base, fold, cloth_slot, true) }?;
@@ -4816,6 +4988,9 @@ unsafe fn group_l1_device<D: Device>(
 #[derive(Clone, Copy)]
 pub struct InertialGuessContext { pub eval_x: ppf_cts_compute::Handle, pub target: ppf_cts_compute::Handle, pub prop: ppf_cts_compute::Handle, pub pull: ppf_cts_compute::Handle, pub pull_count: usize }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum FullBodyAdmission { Unqualified, ExistingContact, AnchoredFreeFlight }
+
 pub unsafe fn solve_rigid<D: Device>(
     device: &mut D, op: &Operator, reduction: &mut super::pdrd::Reduction<'_>,
     factor: ppf_cts_compute::Handle, inverse_diagonal: ppf_cts_compute::Handle,
@@ -4827,10 +5002,11 @@ pub unsafe fn solve_rigid<D: Device>(
     locks: ppf_cts_compute::Handle, tolerance: f32, max_iterations: u32,
     arithmetic_eligible: bool, resident_without_hard: bool, dof_mask: ppf_cts_compute::Handle,
     inertial_context: Option<InertialGuessContext>,
+    full_body_admission: FullBodyAdmission,
 ) -> super::scene::FatalResult<Report> {
     solve_rigid_impl(device, op, reduction, factor, inverse_diagonal, b, x,
                      work, rigid, rotation_out, lock, joints, roots, locks,
-                     tolerance, max_iterations, RigidSolveInput::NewtonForce, arithmetic_eligible, resident_without_hard, Some(dof_mask), inertial_context)
+                     tolerance, max_iterations, RigidSolveInput::NewtonForce, arithmetic_eligible, resident_without_hard, Some(dof_mask), inertial_context, full_body_admission)
 }
 
 /// Pure inverse action for a hard-constraint Schur column on the SAME frozen
@@ -4857,7 +5033,7 @@ pub unsafe fn solve_rigid_reduced_rhs_with_roots<D: Device>(
 ) -> super::scene::FatalResult<Report> {
     solve_rigid_impl(device, op, reduction, factor, inverse_diagonal, rhs, output,
                      work, rigid, None, lock, joints, roots, ppf_cts_compute::Handle::NONE,
-                     tolerance, max_iterations, RigidSolveInput::ReducedRhs, false, false, None, None)
+                     tolerance, max_iterations, RigidSolveInput::ReducedRhs, false, false, None, None, FullBodyAdmission::Unqualified)
 }
 
 pub unsafe fn solve_rigid_reduced_rhs<D: Device>(
@@ -4870,7 +5046,7 @@ pub unsafe fn solve_rigid_reduced_rhs<D: Device>(
 ) -> super::scene::FatalResult<Report> {
     solve_rigid_impl(device, op, reduction, factor, inverse_diagonal, rhs, output,
                      work, rigid, None, lock, joints, None, ppf_cts_compute::Handle::NONE,
-                     tolerance, max_iterations, RigidSolveInput::ReducedRhs, false, false, None, None)
+                     tolerance, max_iterations, RigidSolveInput::ReducedRhs, false, false, None, None, FullBodyAdmission::Unqualified)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -4945,16 +5121,19 @@ unsafe fn solve_rigid_impl<D: Device>(
     input: RigidSolveInput,
     arithmetic_eligible: bool, resident_without_hard: bool, warm_mask: Option<ppf_cts_compute::Handle>,
     inertial_context: Option<InertialGuessContext>,
+    full_body_admission: FullBodyAdmission,
 ) -> super::scene::FatalResult<Report> {
     rigid.body_host_tree=None;
     rigid.active_factor_key=None;
     rigid.active_factor_borrowed=false;
     rigid.active_factor_prepare_ms=0.0;
+    rigid.active_factor_iteration_debt = None;
+    rigid.active_factor_fresh_prefix = None;
     let old=if let Some(mut owner)=rigid.body_inverse.take(){owner.free(device)}else{Ok(())};
     let old_factor=if let Some(mut owner)=rigid.body_factor.take(){owner.free(device)}else{Ok(())};
     let old_x=rigid.body_seed_x.free(device);let old_r=rigid.body_seed_r.free(device);
     old?;old_factor?;old_x?;old_r?;
-    let result=solve_rigid_inner(device,op,reduction,factor,inverse_diagonal,b,x,work,rigid,rotation_out,lock,joints,roots,locks,tolerance,max_iterations,input,arithmetic_eligible,resident_without_hard,warm_mask,inertial_context);
+    let result=solve_rigid_inner(device,op,reduction,factor,inverse_diagonal,b,x,work,rigid,rotation_out,lock,joints,roots,locks,tolerance,max_iterations,input,arithmetic_eligible,resident_without_hard,warm_mask,inertial_context,full_body_admission);
     rigid.body_inverse_debug=None;rigid.body_group_reference=None;
     if let Some(host)=rigid.body_host_tree.take(){host.receipt();}
     let mut cleanup_error = None;
@@ -4980,7 +5159,20 @@ unsafe fn solve_rigid_impl<D: Device>(
         if let Some(mut owner) = pending.take() { collect_cleanup!(owner.free(device)); }
     }
     if publish && cleanup_error.is_none() && result.is_ok() {
-        rigid.body_factor_cache=Some(CachedBodyFactor{owner:pending.take().unwrap(),key:rigid.active_factor_key.take().unwrap(),prepare_ms:rigid.active_factor_prepare_ms});
+        let iteration_debt = match &result {
+            Ok(Report { outcome: Outcome::Converged, iterations, .. }) => {
+                match rigid.active_factor_fresh_prefix {
+                    Some(prefix) => Some(FactorIterationDebt {
+                        dt_bits: joints.dt.to_bits(),
+                        fresh_iterations: iterations.saturating_sub(prefix).max(1),
+                        excess_iterations: 0,
+                    }),
+                    None => rigid.active_factor_iteration_debt.map(|debt| debt.charge(*iterations)),
+                }
+            }
+            _ => None,
+        };
+        rigid.body_factor_cache=Some(CachedBodyFactor{owner:pending.take().unwrap(),key:rigid.active_factor_key.take().unwrap(),prepare_ms:rigid.active_factor_prepare_ms,iteration_debt});
     }
     match result { Err(error)=>Err(error), Ok(value)=>{if let Some(error)=cleanup_error{return Err(error.into());} Ok(value)} }
 
@@ -5016,6 +5208,7 @@ unsafe fn solve_rigid_inner<D: Device>(
     input: RigidSolveInput,
     arithmetic_eligible: bool, resident_without_hard: bool, warm_mask: Option<ppf_cts_compute::Handle>,
     inertial_context: Option<InertialGuessContext>,
+    full_body_admission: FullBodyAdmission,
 ) -> super::scene::FatalResult<Report> {
     let lanczos_solve_id = lanczos_trace::solve_id();
     let dim = reduction.map.dim;
@@ -5056,13 +5249,19 @@ unsafe fn solve_rigid_inner<D: Device>(
         && lock.is_none() && roots.is_none() && !reduction.map.needs_projection();
     // Optional search-product optimizations share these safety gates. The
     // original affine and true-residual operators below remain unchanged.
-    let safe_hot = input == RigidSolveInput::NewtonForce && resident_without_hard
+    let safe_krylov = input == RigidSolveInput::NewtonForce && resident_without_hard
         && reduction.staged.pcg_precision == crate::args::PcgPrecision::Fp32
-        && lock.is_none() && roots.is_none() && !reduction.map.needs_projection()
+        && lock.is_none() && !reduction.map.needs_projection()
         && std::env::var_os("PPF_RIGID_PCG_FAILURE_CAPTURE_DIR").is_none()
         && std::env::var_os("PPF_PCG_TRUE_RESIDUAL_CAPTURE_DIR").is_none()
         && std::env::var_os("PPF_PCG_TRUE_RESIDUAL_DIAGNOSTICS").is_none()
         && std::env::var_os("PPF_PCG_TRUE_RESIDUAL_CAPTURE_STOP").is_none();
+    let safe_hot = safe_krylov && roots.is_none();
+    let host_tet_operator = device.info().backend == "host" && op.has_tet_factor();
+    let cpu_force_only = safe_krylov && host_tet_operator
+        && std::env::var_os("PPF_CPU_KRYLOV_TET_FORCE_ONLY").is_some_and(|value| value == "1");
+    let mut cpu_force_only_receipt = cpu_force_only
+        && std::env::var_os("PPF_TET_FORCE_ONLY_RECEIPT").is_some_and(|value| value == "1");
     let timing_receipt = if std::env::var_os("PPF_PCG_TIMING_RECEIPT").as_deref()
         == Some(std::ffi::OsStr::new("1")) {
         Some((std::time::Instant::now(), device.counters()))
@@ -5162,6 +5361,17 @@ unsafe fn solve_rigid_inner<D: Device>(
     let mut failure_cap_before = serde_json::Value::Null;
     let mut failure_previous_beta: Option<f32> = None;
 
+    let auto_tree = runtime_auto_policy::candidate(runtime_auto_policy::Domain {
+        cuda: cfg!(cuda_backend), fp32: reduction.staged.pcg_precision == crate::args::PcgPrecision::Fp32,
+        newton: input == RigidSolveInput::NewtonForce, bodies: bodies > 0,
+        joints: joints.count != 0 && joints.can_encode_krylov(),
+        compatible: resident_without_hard && lock.is_none() && !reduction.map.needs_projection()
+            && !reduction.staged.reduced_schwarz.active(),
+        explicit: runtime_auto_policy::explicit_controls(),
+    });
+    let iteration_debt_policy = auto_tree
+        && std::env::var_os("PPF_BODY_TREE_REFRESH_POLICY").is_some_and(|value| value == "iteration-debt");
+
     // THE TANGENT PROJECTION. It is the projector every Krylov vector in a
     // LOCKED solve passes through, and it is not the same thing as
     // `project_bodies`.
@@ -5195,18 +5405,54 @@ unsafe fn solve_rigid_inner<D: Device>(
     // its inhomogeneous components. Only the Krylov product uses the cache.
     macro_rules! apply_reduced {
         ($input:expr, $output:expr, $krylov:literal) => {{
-            reduction.prolong(device, $input, rigid.xv.handle())?;
-            op.apply(device, rigid.xv.handle(), rigid.mxv.handle(),
-                     work.row_absolute.handle(), work.row_curvature.handle())?;
-            // THE LOCK PROJECTS THE FULL-SPACE PRODUCT, before the restriction
-            // takes it back to the reduced vector. The order is not
-            // interchangeable: the lock's rows are built over VERTICES, so
-            // projecting the reduced vector instead would apply it in a basis it
-            // was not built in.
-            if let Some(projector) = lock.as_deref_mut() {
-                projector.project(device, rigid.mxv.handle(), 1)?;
+            apply_reduced!($input, $output, $krylov, false);
+        }};
+        ($input:expr, $output:expr, $krylov:literal, $force_only:expr) => {{
+            if auto_tree && !$krylov {
+                // Retain the full native operator, including the tet factor.
+                // Only eliminate command boundaries between its ordered stages.
+                device.run("pcg.rigid.reference_native", |encoder| {
+                    reduction.encode_prolong(encoder, $input, rigid.xv.handle())?;
+                    op.encode_apply(encoder, rigid.xv.handle(), rigid.mxv.handle(),
+                        work.row_absolute.handle(), work.row_curvature.handle())?;
+                    reduction.encode_restrict(encoder, rigid.mxv.handle(), $output, true)
+                })?;
+            } else {
+                reduction.prolong(device, $input, rigid.xv.handle())?;
+                {
+                    let _phase = if host_tet_operator {
+                        super::phase::start(if $krylov {
+                            "pcg.cpu.krylov_native_product"
+                        } else {
+                            "pcg.cpu.affine_native_product"
+                        })
+                    } else {
+                        None
+                    };
+                    if $krylov && $force_only {
+                        // The ordinary reduced recurrence computes p.Ap after
+                        // restriction, joints and Q. It never uses the tet
+                        // gather's per-row curvature or magnitude arrays.
+                        device.run("operator.apply", |encoder| {
+                            op.encode_apply_force_only(encoder, rigid.xv.handle(), rigid.mxv.handle(),
+                                work.row_absolute.handle(), work.row_curvature.handle())
+                        })?;
+                        if cpu_force_only_receipt {
+                            eprintln!("CPU_TET_FORCE_ONLY_RECEIPT active=true roots={}", roots.is_some());
+                            cpu_force_only_receipt = false;
+                        }
+                    } else {
+                        op.apply(device, rigid.xv.handle(), rigid.mxv.handle(),
+                                 work.row_absolute.handle(), work.row_curvature.handle())?;
+                    }
+                }
+                // The lock projects the product before restriction because its
+                // rows are expressed in the full vertex space.
+                if let Some(projector) = lock.as_deref_mut() {
+                    projector.project(device, rigid.mxv.handle(), 1)?;
+                }
+                reduction.restrict(device, rigid.mxv.handle(), $output, &rigid.zero)?;
             }
-            reduction.restrict(device, rigid.mxv.handle(), $output, &rigid.zero)?;
             if $krylov {
                 joints.add_krylov(device, $input, $output)?;
             } else {
@@ -5214,6 +5460,27 @@ unsafe fn solve_rigid_inner<D: Device>(
             }
             reduction.project_bodies(device, $output)?;
             if let Some(root)=roots { root.project(device, $output)?; }
+        }};
+    }
+
+    macro_rules! measure_reference_residual {
+        ($group:ident) => {{
+            let rhs = rigid.f.handle();
+            let product = rigid.rp.handle();
+            let residual = rigid.r.handle();
+            if auto_tree {
+                group_l1_after(device, residual, &mut rigid.group_norm, &work.fold,
+                    body_base, bodies, &mut rigid.$group, |encoder| {
+                        encode_combine_raw(encoder, rhs, product, residual, 1.0, -1.0, dim)?;
+                        if let Some(root) = roots { root.encode_project(encoder, residual)?; }
+                        Ok(())
+                    })?;
+            } else {
+                combine(device, rhs, product, residual, 1.0, -1.0, dim)?;
+                project_tangent!(residual);
+                group_l1_device(device, residual, &mut rigid.group_norm,
+                    &work.fold, body_base, bodies, &mut rigid.$group)?;
+            }
         }};
     }
 
@@ -5229,7 +5496,7 @@ unsafe fn solve_rigid_inner<D: Device>(
     macro_rules! apply_reduced_tangent {
         ($input:expr, $output:expr) => {{
             project_tangent!($input);
-            apply_reduced!($input, $output, true);
+            apply_reduced!($input, $output, true, cpu_force_only);
         }};
     }
 
@@ -5268,25 +5535,12 @@ unsafe fn solve_rigid_inner<D: Device>(
     // built to remove, so projecting the input here would discard exactly the
     // part the residual has to see.
     apply_reduced!(rigid.xr.handle(), rigid.rp.handle(), false);
-    combine(device, rigid.f.handle(), rigid.rp.handle(), rigid.r.handle(), 1.0, -1.0, dim)?;
     // The seed residual is projected before `err0` is taken from it, for the
     // reason the per-iteration projection below states.
-    project_tangent!(rigid.r.handle());
-
-    // Safety: every handle names a live allocation for the whole call.
-    unsafe {
-        group_l1_device(
-            device,
-            rigid.r.handle(),
-            &mut rigid.group_norm,
-            &work.fold,
-            body_base,
-            bodies,
-            &mut rigid.group_initial,
-        )
-    }?;
+    measure_reference_residual!(group_initial);
     let err0: f32 = rigid.group_initial.iter().sum();
     if err0 == 0.0 {
+        rigid.full_body_reuse = full_body_native::Reuse::default();
         if warm_requested { eprintln!("PPF_PCG_WARM_START cold reason=zero_residual"); }
         // Already exact. The seed is prolonged back out rather than `x` being
         // zeroed, which would discard the prescribed rows the caller loaded.
@@ -5308,18 +5562,257 @@ unsafe fn solve_rigid_inner<D: Device>(
         });
     }
 
-    let auto_tree = runtime_auto_policy::candidate(runtime_auto_policy::Domain {
-        cuda: cfg!(cuda_backend), fp32: reduction.staged.pcg_precision == crate::args::PcgPrecision::Fp32,
-        newton: input == RigidSolveInput::NewtonForce, bodies: bodies > 0,
-        joints: joints.count != 0 && joints.can_encode_krylov(),
-        compatible: resident_without_hard && lock.is_none() && !reduction.map.needs_projection()
-            && !reduction.staged.reduced_schwarz.active(),
-        explicit: runtime_auto_policy::explicit_controls(),
-    });
+    if let Some(selected) = std::env::var("PPF_BODY_FULL_FACTOR_PROBE")
+        .ok().and_then(|value| value.parse::<usize>().ok())
+    {
+        static SOLVES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let solve = SOLVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if solve == selected {
+            if input != RigidSolveInput::NewtonForce || !resident_without_hard
+                || lock.is_some() || reduction.map.needs_projection()
+                || reduction.staged.reduced_schwarz.active()
+                || reduction.staged.pcg_precision != crate::args::PcgPrecision::Fp32
+                || body_base != 0 || bodies == 0 || bodies.checked_mul(6) != Some(dim)
+                || op.has_tet_factor() || joints.soft.is_some()
+            {
+                return Err(super::scene::Fatal::invariant("full-body factor probe unsupported; no commit"));
+            }
+            let before = super::shadow_tree::fault_snapshot(device, op, joints)
+                .map_err(super::scene::Fatal::invariant)?;
+            if before.iter().flatten().any(|&fault| fault != 0) {
+                return Err(super::scene::Fatal::invariant("full-body factor probe found native fault; no commit"));
+            }
+            let mut fixed = vec![false; bodies];
+            if let Some(root) = roots {
+                let mut targets = vec![crate::joint_root_motion_gpu::RootTargetGpu::default(); root.count as usize];
+                let byte_count = std::mem::size_of_val(targets.as_slice());
+                let bytes = std::slice::from_raw_parts_mut(targets.as_mut_ptr().cast::<u8>(), byte_count);
+                if !bytes.is_empty() { device.read(root.targets, 0, bytes)?; }
+                for t in targets.into_iter().filter(|t| t.enabled != 0) {
+                    *fixed.get_mut(t.body as usize)
+                        .ok_or_else(|| super::scene::Fatal::invariant("root outside body layout"))? = true;
+                }
+            }
+            let free: Vec<_> = (0..bodies).filter(|&b| !fixed[b]).collect();
+            let slots: Vec<_> = free.iter().flat_map(|&body| (0..6).map(move |lane| 6*body+lane)).collect();
+            let started = std::time::Instant::now();
+            let plan = super::body_block_capture::host_sparse_plan(op, joints, bodies, free.len(), roots.map_or(0, |root| root.count as usize)).ok_or_else(|| super::scene::Fatal::invariant("full factor capture budget; no commit"))?; let matrix = super::body_block_capture::capture_sparse(device, op, reduction, joints, &slots, Some(plan))?;
+            let capture_ms = 1000.0 * started.elapsed().as_secs_f64();
+            let x0 = rigid_failure_read_f32(device, rigid.xr.handle(), dim)?;
+            let r0 = rigid_failure_read_f32(device, rigid.r.handle(), dim)?;
+            if let Some(destination) = std::env::var_os("PPF_BODY_FULL_FACTOR_MATRIX") {
+                use std::io::Write;
+                let mut file = std::fs::OpenOptions::new().write(true).create_new(true)
+                    .open(destination).map_err(|error| super::scene::Fatal::invariant(error.to_string()))?;
+                let blocks: Vec<_> = matrix.blocks.iter().map(|(&(a,b), block)| (a,b,block)).collect();
+                writeln!(file, "{}", serde_json::json!({
+                    "solve": solve, "bodies": bodies, "free": free, "blocks": blocks,
+                    "x0": x0, "r0": r0, "initial_groups": rigid.group_initial,
+                    "err0": err0, "tolerance": tolerance, "capture_ms": capture_ms,
+                    "original_operator": "native_fp32_projected_affine",
+                })).map_err(|error| super::scene::Fatal::invariant(error.to_string()))?;
+            }
+            let started = std::time::Instant::now();
+            let full = full_body_factor::Factor::build(free.len(), &matrix.blocks,
+                full_body_factor::Budget { bytes: 64 << 20, fill_blocks: 16384 });
+            let full_ms = 1000.0 * started.elapsed().as_secs_f64();
+            eprintln!("PPF_BODY_FULL_FACTOR_CAPTURE solve={solve} bodies={bodies} free={} directed={} capture_ms={capture_ms:.6}",
+                free.len(), matrix.blocks.len());
+            match &full {
+                Ok(factor) => eprintln!("PPF_BODY_FULL_FACTOR_SETUP mode=full factor_ms={full_ms:.6} stats={:?}", factor.stats),
+                Err(reason) => eprintln!("PPF_BODY_FULL_FACTOR_REFUSED mode=full factor_ms={full_ms:.6} reason={reason}"),
+            }
+            let started = std::time::Instant::now();
+            let forest = super::shadow_tree::FreeForest::from_sparse_weighted(&matrix, free.len());
+            let forest_ms = 1000.0 * started.elapsed().as_secs_f64();
+            match &forest {
+                Ok(factor) => eprintln!("PPF_BODY_FULL_FACTOR_SETUP mode=forest factor_ms={forest_ms:.6} omitted={}", factor.omitted_cycles),
+                Err(reason) => eprintln!("PPF_BODY_FULL_FACTOR_REFUSED mode=forest factor_ms={forest_ms:.6} reason={:?}", reason.0),
+            }
+            let mut trial = Buffer::<f32>::none();
+            let mut product = Buffer::<f32>::none();
+            let mut residual = Buffer::<f32>::none();
+            let attempted = (|| -> super::scene::FatalResult<()> {
+                for buffer in [&mut trial, &mut product, &mut residual] {
+                    buffer.size(device, dim, ppf_cts_compute::AllocLabel("body.full_factor_probe"))?;
+                }
+                for mode in ["full", "forest"] {
+                    if (mode == "full" && full.is_err()) || (mode == "forest" && forest.is_err()) { continue; }
+                    let mut x = x0.clone();
+                    let mut r = r0.clone();
+                    for pass in 1..=3 {
+                        let started = std::time::Instant::now();
+                        let correction = if mode == "full" {
+                            let rhs: Vec<_> = free.iter().map(|&b| std::array::from_fn(|i| f64::from(r[6*b+i]))).collect();
+                            full.as_ref().unwrap().solve(&rhs).map(|delta| {
+                                let mut result = vec![0.0f64; dim];
+                                for (&body, block) in free.iter().zip(delta) {
+                                    result[6*body..6*body+6].copy_from_slice(&block);
+                                }
+                                result
+                            }).map_err(str::to_owned)
+                        } else {
+                            let rhs: Vec<_> = r.iter().map(|&value| f64::from(value)).collect();
+                            forest.as_ref().ok().unwrap().apply(&rhs).map_err(|error| error.0)
+                        };
+                        let solve_ms = 1000.0 * started.elapsed().as_secs_f64();
+                        let delta = match correction {
+                            Ok(delta) => delta,
+                            Err(reason) => {
+                                eprintln!("PPF_BODY_FULL_FACTOR_REFUSED mode={mode} pass={pass} reason={reason}");
+                                break;
+                            }
+                        };
+                        for (value, correction) in x.iter_mut().zip(delta) {
+                            *value = (f64::from(*value) + correction) as f32;
+                        }
+                        if x.iter().any(|value| !value.is_finite()) {
+                            eprintln!("PPF_BODY_FULL_FACTOR_REFUSED mode={mode} pass={pass} reason=nonfinite_trial");
+                            break;
+                        }
+                        let started = std::time::Instant::now();
+                        trial.write(device, 0, &x)?;
+                        project_tangent!(trial.handle());
+                        if let Some(root) = roots { root.particular(device, joints.state, trial.handle())?; }
+                        apply_reduced!(trial.handle(), product.handle(), false);
+                        combine(device, rigid.f.handle(), product.handle(), residual.handle(), 1.0, -1.0, dim)?;
+                        project_tangent!(residual.handle());
+                        group_l1_device(device, residual.handle(), &mut rigid.group_norm, &work.fold,
+                            0, bodies, &mut rigid.group_current)?;
+                        let score = super::pdrd::worst_relative_residual(&rigid.group_current, &rigid.group_initial, err0);
+                        r = rigid_failure_read_f32(device, residual.handle(), dim)?;
+                        x = rigid_failure_read_f32(device, trial.handle(), dim)?;
+                        let check_ms = 1000.0 * started.elapsed().as_secs_f64();
+                        let accepted = score < tolerance;
+                        eprintln!("PPF_BODY_FULL_FACTOR_CHECK mode={mode} pass={pass} solve_ms={solve_ms:.6} check_ms={check_ms:.6} true_relative={score:.9e} tolerance={tolerance:.9e} passes={accepted}");
+                        if accepted || !score.is_finite() { break; }
+                    }
+                }
+                Ok(())
+            })();
+            let free_trial = trial.free(device);
+            let free_product = product.free(device);
+            let free_residual = residual.free(device);
+            attempted?;
+            free_trial?;
+            free_product?;
+            free_residual?;
+            let after = super::shadow_tree::fault_snapshot(device, op, joints)
+                .map_err(super::scene::Fatal::invariant)?;
+            if before != after {
+                return Err(super::scene::Fatal::invariant("full-body factor probe changed native faults; no commit"));
+            }
+            return Err(super::scene::Fatal::invariant("full-body factor probe completed; intentional no commit"));
+        }
+    }
+
+
+    if std::env::var_os("PPF_BODY_FULL_NATIVE").is_some_and(|value| value == "1")
+        && !runtime_auto_policy::explicit_controls()
+        && std::env::var_os("PPF_LEGACY_ROWS_SELF_CHECK").is_none()
+        && std::env::var_os("PPF_FACTOR_BATCH8_PACKET_SELF_CHECK").is_none()
+        && std::env::var_os("PPF_BODY_FACTOR_PACKET_SELF_CHECK").is_none()
+        && failure_capture_dir.is_none()
+    {
+        let trace = std::env::var_os("PPF_BODY_FULL_NATIVE_TRACE").is_some_and(|value| value == "1");
+        let contact_only = std::env::var_os("PPF_BODY_FULL_NATIVE_CONTACT_ONLY")
+            .is_some_and(|value| value == "1");
+        let compatible = input == RigidSolveInput::NewtonForce && resident_without_hard
+            && lock.is_none() && !reduction.map.needs_projection()
+            && !reduction.staged.reduced_schwarz.active()
+            && reduction.staged.pcg_precision == crate::args::PcgPrecision::Fp32
+            && body_base == 0 && bodies != 0 && bodies.checked_mul(6) == Some(dim)
+            && !op.has_tet_factor() && max_iterations > 0 && !warm_enabled
+            && (joints.count != 0 || joints.soft.is_some_and(|soft| soft.count != 0));
+        if contact_only && full_body_admission == FullBodyAdmission::Unqualified {
+            if trace {
+                eprintln!("PPF_BODY_FULL_NATIVE active=false reason=no_dynamic_contact");
+            }
+        } else if compatible {
+            if trace && full_body_admission == FullBodyAdmission::AnchoredFreeFlight {
+                eprintln!("PPF_BODY_FULL_ANCHORED_FREE_FLIGHT trial=true");
+            }
+            let _phase = super::phase::start("pcg.full_body.trial");
+            let audit = std::env::var_os("PPF_BODY_FULL_NATIVE_AUDIT_REJECT")
+                .is_some_and(|value| value == "1");
+            // Read only in the rejection test. "p" also has to survive unchanged
+            // for later preconditioner preparation and the ordinary recurrence.
+            // The seed residual handle already names the live vector produced above.
+            let seed_residual = failure_handles.r;
+            let audit_handles = [rigid.xr.handle(), seed_residual, rigid.p.handle(),
+                rigid.rp.handle(), rigid.f.handle()];
+            let prior = if audit {
+                let mut bits = Vec::new();
+                for handle in audit_handles {
+                    bits.push(rigid_failure_read_f32(device, handle, dim)?);
+                }
+                Some(bits)
+            } else { None };
+            let reuse_domain = if !audit
+                && std::env::var_os("PPF_BODY_FULL_REUSE").is_some_and(|value| value == "1")
+            {
+                full_body_native::ReuseDomain::new(rigid.factor_workspace_generation,
+                    rigid.full_body_binding_generation, joints.dt, roots)
+            } else { None };
+            let mut reuse = if reuse_domain.is_some() {
+                std::mem::take(&mut rigid.full_body_reuse)
+            } else {
+                rigid.full_body_reuse = full_body_native::Reuse::default();
+                full_body_native::Reuse::default()
+            };
+            let compact = std::env::var_os("PPF_BODY_FULL_FACTOR_COMPACT")
+                .is_some_and(|value| value == "1");
+            let keep_symbolic = compact && std::env::var_os("PPF_BODY_FULL_FACTOR_SYMBOLIC_REUSE")
+                .is_some_and(|value| value == "1");
+            let mut symbolic = if keep_symbolic {
+                std::mem::take(&mut rigid.full_body_symbolic)
+            } else {
+                full_body_factor::SymbolicCache::default()
+            };
+            let result = full_body_native::try_solve(
+                device, op, reduction, joints, roots, rigid, seed_residual, work, err0, tolerance,
+                auto_tree, trace, reuse_domain.map(|domain| (&mut reuse, domain)),
+                compact.then_some(&mut symbolic),
+            );
+            if keep_symbolic {
+                rigid.full_body_symbolic = symbolic;
+            }
+            let result = result?;
+            if let Some(prior) = prior {
+                for (handle, before) in audit_handles.into_iter().zip(prior) {
+                    let after = rigid_failure_read_f32(device, handle, dim)?;
+                    if !before.iter().zip(after).all(|(a, b)| a.to_bits() == b.to_bits()) {
+                        return Err(super::scene::Fatal::invariant("full-body rejected trial altered live Krylov state"));
+                    }
+                }
+                eprintln!("PPF_BODY_FULL_NATIVE_AUDIT original_seed_unchanged=true forced_reject=true verified={}", result.is_some());
+            } else if let Some(result) = result {
+                // Everything before this write is private. Export only the canonical
+                // affine vector that passed the actual native residual check.
+                rigid.xr.write(device, 0, &result.x)?;
+                export_rigid_solve_iterate(device, reduction, rigid.xr.handle(), x, rotation_out, input)?;
+                rigid.full_body_reuse = reuse;
+                if let Some((started, before)) = timing_receipt {
+                    let after = device.counters();
+                    eprintln!("PPF_PCG_TIMING_RECEIPT input=newton coalesce_eligible={coalesce_mixed} coalesced_iterations=0 grouped_soft=false bodies={bodies} body_projection=false roots={} lock=false schwarz=false outcome=Converged iterations=0 true_residual_checks={} residual={:.9e} elapsed_ms={:.3} syncs={} dispatches={} readback_requests=unavailable readback_bytes=unavailable",
+                        roots.is_some(), result.checks, result.score, started.elapsed().as_secs_f64()*1000.0,
+                        after.syncs.saturating_sub(before.syncs), after.dispatches.saturating_sub(before.dispatches));
+                }
+                return Ok(Report { outcome: Outcome::Converged, iterations: 0, relative_residual: result.score });
+            }
+        } else if trace {
+            eprintln!("PPF_BODY_FULL_NATIVE active=false reason=incompatible");
+        }
+    }
+
+    // The direct route was declined or bypassed. Never carry an unverified
+    // factor through a different solve domain or through an ordinary PCG exit.
+    rigid.full_body_reuse = full_body_native::Reuse::default();
     let mut auto_resident_active = false;
     let mut lazy_tree_mode: Option<bool> = None;
     if auto_tree || std::env::var_os("PPF_BODY_TREE_PCG").as_deref()==Some(std::ffi::OsStr::new("1")) {
         let mode=std::env::var("PPF_BODY_TREE_APPLY").unwrap_or_else(|_|if auto_tree {"factor"} else {"device"}.into());
+        let sparse_host = sparse_host_body_tree(device, mode == "host");
         let resident_requested=auto_tree || std::env::var_os("PPF_JOINT_RESIDENT_PCG").is_some_and(|x|x=="1");
         let factor_resident=mode=="factor" && resident_requested && joints.count!=0 && joints.can_encode_krylov()
             && (roots.is_none() || auto_tree || std::env::var_os("PPF_JOINT_RESIDENT_ROOT").is_some_and(|x|x=="1"))
@@ -5328,7 +5821,7 @@ unsafe fn solve_rigid_inner<D: Device>(
             else if lock.is_some() || reduction.map.needs_projection() || reduction.staged.reduced_schwarz.active(){Some("constraint_or_schwarz")}
             else if reduction.staged.pcg_precision != crate::args::PcgPrecision::Fp32 {Some("precision")}
             else if (resident_requested && !factor_resident) || (fused_joint_product && mode!="factor") || (coalesce_mixed && !auto_tree) || requested_mode!=0 || arithmetic_active {Some("unsupported_pcg_mode")}
-            else if bodies==0 || bodies.checked_mul(6).map_or(true,|v|v>u32::MAX as usize || (mode!="factor" && v>1024)){Some("body_extent")}
+            else if body_tree_scalar_extent(bodies, mode == "factor", sparse_host).is_none() {Some("body_extent")}
             else {None};
         if let Some(reason)=reason {eprintln!("PPF_BODY_TREE_PCG active=false reason={}",reason);}
         else {
@@ -5343,18 +5836,31 @@ unsafe fn solve_rigid_inner<D: Device>(
                     device.instance_id().map(|instance|FactorDomainKey {device_instance:instance,workspace_generation:rigid.factor_workspace_generation,nrow:reduction.map.nrow,bodies,body_base,dim,roots:domain})
                 } else {None};
                 if let Some(mut cached)=rigid.body_factor_cache.take() {
-                    if key==Some(cached.key) {
+                    let debt = cached.iteration_debt.filter(|debt| {
+                        iteration_debt_policy && key == Some(cached.key) && debt.dt_bits == joints.dt.to_bits()
+                    });
+                    if key==Some(cached.key) && !debt.is_some_and(FactorIterationDebt::expired) {
                         rigid.active_factor_prepare_ms=cached.prepare_ms;
                         rigid.active_factor_borrowed=true;
+                        rigid.active_factor_iteration_debt = debt;
                         rigid.body_factor=Some(cached.owner);
                         eprintln!("PPF_BODY_TREE_FACTOR_REUSE hit=true");
-                    } else {cached.owner.free(device)?;}
+                    } else {
+                        if let Some(debt) = debt.filter(|_| timing_receipt.is_some()) {
+                            eprintln!("PPF_BODY_TREE_FACTOR_REUSE hit=false reason=iteration_debt fresh_iterations={} excess_iterations={}",
+                                debt.fresh_iterations, debt.excess_iterations);
+                        }
+                        cached.owner.free(device)?;
+                    }
                 }
                 if rigid.body_factor.is_none() {
                     let started=std::time::Instant::now();
                     if let Some((engine,debug,reference))=prepare_body_tree(device,op,reduction,joints,roots,mode=="host",mode=="factor")? {
                         rigid.active_factor_prepare_ms=started.elapsed().as_secs_f64()*1000.0;
                         match engine {PreparedBodyTree::Factor(owner)=>rigid.body_factor=Some(owner),PreparedBodyTree::Device(inv)=>rigid.body_inverse=Some(inv),PreparedBodyTree::Host(host)=>rigid.body_host_tree=Some(host)}
+                        if iteration_debt_policy && key.is_some() && rigid.body_factor.is_some() {
+                            rigid.active_factor_fresh_prefix = Some(0);
+                        }
                         rigid.body_inverse_debug=debug;rigid.body_group_reference=reference;
                     }
                 }
@@ -5700,7 +6206,8 @@ unsafe fn solve_rigid_inner<D: Device>(
     }else{None};
     let mut factor_restarted=false;
     macro_rules! precondition_current {
-        () => {{
+        () => {{ precondition_current!(true); }};
+        ($project_after:expr) => {{
             if let Some(ref body)=rigid.body_factor {
                 device.run("pcg.rigid.precond_factor", |encoder| {
                     reduction.encode_precond_cloth_fp32(encoder,inverse_diagonal,rigid.r.handle(),rigid.z.handle())?;
@@ -5737,8 +6244,11 @@ unsafe fn solve_rigid_inner<D: Device>(
             if let Some(ref mut host)=rigid.body_host_tree {
                 host.apply(device,rigid.r.handle(),rigid.z.handle(),body_base,bodies)?;
             }
-            // The result of the preconditioner must re-enter the tangent space.
-            project_tangent!(rigid.z.handle());
+            // Packet callers project after this original fault observation.
+            // The cold restart always retains the original projection.
+            if $project_after || factor_restarted {
+                project_tangent!(rigid.z.handle());
+            }
         }};
     }
 
@@ -5806,10 +6316,7 @@ unsafe fn solve_rigid_inner<D: Device>(
                     &work.fold, body_base, bodies, &mut rigid.group_current)?;
                 Some(rigid.group_current.clone())
             } else { None };
-            combine(device, rigid.f.handle(), rigid.rp.handle(), rigid.r.handle(), 1.0, -1.0, dim)?;
-            project_tangent!(rigid.r.handle());
-            group_l1_device(device, rigid.r.handle(), &mut rigid.group_norm,
-                &work.fold, body_base, bodies, &mut rigid.group_current)?;
+            measure_reference_residual!(group_current);
             let verified = super::pdrd::worst_relative_residual(
                 &rigid.group_current, &rigid.group_initial, err0);
             if let Some((s0,free_rows,cold_r0))=inertial_probe3_data.as_ref() {
@@ -6246,6 +6753,13 @@ let mut product=Buffer::<f32>::default();let mut residual=Buffer::<f32>::default
             && joints.soft.map_or(true, |soft| soft.batch8_ready())
             && max_iterations >= 16;
         let prefix_end = if batch_admitted { 8 } else { max_iterations };
+        let mut factor_refresh_trial = if auto_resident_active && !batch_admitted
+            && rigid.active_factor_borrowed && rigid.body_factor.is_some()
+        {
+            factor_refresh_policy::Trial::configured()
+        } else {
+            None
+        };
         let mut prefix_continues = true;
         ::log::info!("pcg.joint.resident_stride1 active roots={}", roots.is_some());
         if resident_root { eprintln!("PPF_JOINT_RESIDENT_ROOT active=true batch8=false"); }
@@ -6278,7 +6792,27 @@ let mut product=Buffer::<f32>::default();let mut residual=Buffer::<f32>::default
                 return Err(super::scene::Fatal::invariant("body factor packet self check complete; no commit"));
             }
         }
+        let stride_graph_enabled = auto_resident_active && !batch_admitted
+            && lanczos_solve_id.is_none() && device.info().supports_deferred_regions
+            && std::env::var_os("PPF_JOINT_STRIDE_GRAPH").is_some_and(|value| value == "1");
+        let stride_graph_receipt = stride_graph_enabled
+            && std::env::var_os("PPF_JOINT_STRIDE_GRAPH_RECEIPT").is_some_and(|value| value == "1");
+        let mut stride_graph = None::<D::Region>;
+        let mut stride_graph_replays = 0u32;
+        macro_rules! release_stride_graph {
+            () => {
+                if let Some(graph) = stride_graph.take() {
+                    device.release(graph);
+                    if stride_graph_receipt {
+                        eprintln!("PPF_JOINT_STRIDE_GRAPH released=true replays={stride_graph_replays} roots={}", roots.is_some());
+                    }
+                }
+            };
+        }
         for iteration in 1..=prefix_end {
+            if iteration == max_iterations {
+                release_stride_graph!();
+            }
             let direction = rigid.p.handle();
             let applied = rigid.rp.handle();
             let residual_h = rigid.r.handle();
@@ -6292,7 +6826,7 @@ let mut product=Buffer::<f32>::default();let mut residual=Buffer::<f32>::default
             let status = work.scalar.span(slot::BETA_NOISE, 1);
             let factor_fault = work.scalar.span(slot::FACTOR_FAULT, 1);
             let products = terms.product_handle();
-            device.run("pcg.joint.resident_stride1", |encoder| unsafe {
+            let mut encode_stride = |encoder: &mut dyn Encoder| unsafe {
                 // The affine iterate carries prescribed root values. Only the
                 // homogeneous direction and output are projected here.
                 if let Some(root) = roots { root.encode_project(encoder, direction)?; }
@@ -6410,10 +6944,57 @@ let mut product=Buffer::<f32>::default();let mut residual=Buffer::<f32>::default
                     },
                     dim as u32,
                 )
-            })?;
-            work.scalar.download(device)?;
+            };
+            // Only record warm interior iterations. The captured iteration
+            // index only serves the cap comparison. The true cap is handled
+            // above by the original uncaptured path with its real index.
+            if stride_graph_enabled && iteration == 5 && stride_graph_capture_candidate(
+                iteration, max_iterations, rigid.active_factor_borrowed.then(|| (
+                    factor_iteration_started.elapsed().as_secs_f64() * 1000.0,
+                    rigid.active_factor_prepare_ms,
+                )),
+            )
+            {
+                let before = device.counters().regions_deferred;
+                let graph = device.record("pcg.joint.resident_stride_graph", &mut encode_stride)?;
+                if device.counters().regions_deferred > before {
+                    stride_graph = Some(graph);
+                } else {
+                    device.release(graph);
+                    if stride_graph_receipt {
+                        eprintln!("PPF_JOINT_STRIDE_GRAPH fallback=no_deferred_capture");
+                    }
+                }
+            }
+            let submitted = if let Some(graph) = stride_graph.as_ref() {
+                match device.replay(graph, 1) {
+                    Ok(diag) => {
+                        stride_graph_replays += 1;
+                        Ok(diag)
+                    }
+                    // CUDA rejects an allocator-generation mismatch before
+                    // any graph launch. Other errors may have modified the
+                    // recurrence and must not rerun the iteration.
+                    Err(Fault::StaleRegion { .. }) => {
+                        release_stride_graph!();
+                        device.run("pcg.joint.resident_stride1", &mut encode_stride)
+                    }
+                    Err(error) => Err(error),
+                }
+            } else {
+                device.run("pcg.joint.resident_stride1", &mut encode_stride)
+            };
+            if let Err(error) = submitted {
+                release_stride_graph!();
+                return Err(error.into());
+            }
+            if let Err(error) = work.scalar.download(device) {
+                release_stride_graph!();
+                return Err(error.into());
+            }
             if rigid.body_factor.is_some() {
                 if work.scalar.host()[slot::FACTOR_FAULT].to_bits()!=0 {
+                        release_stride_graph!();
                         let mut owner=rigid.body_factor.take().expect("factor owner");
                         owner.free(device)?;
                         device.copy(rigid.xr.handle(),0,rigid.body_seed_x.handle(),0,dim*4)?;
@@ -6437,6 +7018,7 @@ let mut product=Buffer::<f32>::default();let mut residual=Buffer::<f32>::default
                 }
             }
             if status == 1.0 {
+                release_stride_graph!();
                 let verified = verify_true_residual!(iteration, residual);
                 if let Some(trace)=lanczos.as_mut() {
                     trace.finish(if verified < tolerance {"converged"}
@@ -6458,10 +7040,12 @@ let mut product=Buffer::<f32>::default();let mut residual=Buffer::<f32>::default
                 break;
             }
             if status == 2.0 {
+                release_stride_graph!();
                 if let Some(trace)=lanczos.as_mut() {trace.finish("cap_or_nonfinite");}
                 finish!(Outcome::MaxIterations, iteration, residual);
             }
             if status != 0.0 {
+                release_stride_graph!();
                 if let Some(trace)=lanczos.as_mut() {trace.finish("invalid_status");}
                 return Err(Fault::Platform {
                     call: "pcg.joint.resident_stride1",
@@ -6472,8 +7056,13 @@ let mut product=Buffer::<f32>::default();let mut residual=Buffer::<f32>::default
             if iteration == max_iterations {
                 finish!(Outcome::MaxIterations, iteration, residual);
             }
-            if rigid.active_factor_borrowed && rigid.body_factor.is_some() &&
-                factor_iteration_started.elapsed().as_secs_f64()*1000.0 >= rigid.active_factor_prepare_ms {
+            let refresh_due = rigid.active_factor_borrowed && rigid.body_factor.is_some()
+                && factor_iteration_started.elapsed().as_secs_f64() * 1000.0 >= rigid.active_factor_prepare_ms;
+            let keep_borrowed = factor_refresh_trial.as_mut().is_some_and(|trial| {
+                trial.defer(iteration, residual, tolerance, max_iterations, refresh_due)
+            });
+            if refresh_due && !keep_borrowed {
+                release_stride_graph!();
                 if let Some(trace)=lanczos.as_mut(){trace.finish("factor_refresh");}
                 factor_refresh_pending=Some((iteration,residual));
                 completed_iterations=iteration;
@@ -6482,6 +7071,7 @@ let mut product=Buffer::<f32>::default();let mut residual=Buffer::<f32>::default
                 break;
             }
         }
+        release_stride_graph!();
         if batch_admitted && prefix_continues {
             let batch_row_active = row_parallel && joints.soft.is_some_and(|soft| soft.row_parallel_available());
             // Preserve the freshly downloaded eighth iteration, including RZ0.
@@ -6720,6 +7310,10 @@ let mut product=Buffer::<f32>::default();let mut residual=Buffer::<f32>::default
         }
     }
 
+    // A refreshed solve continues through the classical recurrence below.
+    // Batch its uninterrupted device work while retaining every host check.
+    let coalesce_refreshed = auto_resident_active && factor_refresh_pending.is_some()
+        && joints.soft.map_or(true, |soft| soft.frozen_restoring.is_some());
     if let Some((iteration,recursive))=factor_refresh_pending {
         let verified=verify_true_residual!(iteration,recursive);
         if verified<tolerance {finish!(Outcome::Converged,iteration,verified);}
@@ -6729,6 +7323,7 @@ let mut product=Buffer::<f32>::default();let mut residual=Buffer::<f32>::default
         device.copy(rigid.body_seed_r.handle(),0,rigid.r.handle(),0,dim*4)?;
         if let Some(mut owner)=rigid.body_factor.take(){owner.free(device)?;}
         rigid.active_factor_borrowed=false;
+        rigid.active_factor_iteration_debt = None;
         let started=std::time::Instant::now();
         if let Some((engine,debug,reference))=prepare_body_tree(device,op,reduction,joints,roots,false,true)? {
             match engine {
@@ -6739,6 +7334,9 @@ let mut product=Buffer::<f32>::default();let mut residual=Buffer::<f32>::default
                     }
                     rigid.body_factor=Some(owner);
                     rigid.active_factor_prepare_ms=started.elapsed().as_secs_f64()*1000.0;
+                    if iteration_debt_policy && rigid.active_factor_key.is_some() {
+                        rigid.active_factor_fresh_prefix = Some(iteration);
+                    }
                 },
                 PreparedBodyTree::Device(mut owner)=>{owner.free(device)?;return Err(Fault::Platform{call:"factor cache refresh",detail:"unexpected device inverse".into()}.into());},
                 PreparedBodyTree::Host(_)=>return Err(Fault::Platform{call:"factor cache refresh",detail:"unexpected host tree".into()}.into()),
@@ -6749,6 +7347,9 @@ let mut product=Buffer::<f32>::default();let mut residual=Buffer::<f32>::default
             rigid.active_factor_prepare_ms=0.0;
         }
         rz=seed_direction!();
+        if coalesce_refreshed && timing_receipt.is_some() {
+            eprintln!("PPF_PCG_CLASSIC_TAIL coalesced=true completed_iterations={iteration} factor={}", rigid.body_factor.is_some());
+        }
     }
 
     // Stage9: record fixed batch8 once; replay only observes the device counter.
@@ -6951,276 +7552,381 @@ let mut product=Buffer::<f32>::default();let mut residual=Buffer::<f32>::default
     let lazy_budget = max_iterations.saturating_sub(1).min(4);
     let mut lazy_attempted = false;
     let mut fused_factor_receipt_pending = timing_receipt.is_some();
-    for iteration in completed_iterations.saturating_add(1)..=max_iterations {
-        let no_progress_eligible = input == RigidSolveInput::NewtonForce && reduction.staged.pcg_precision == crate::args::PcgPrecision::Fp32 && lock.is_none() && roots.is_none() && !reduction.map.needs_projection() && !reduction.staged.reduced_schwarz.active() && grouped_soft.is_none() && !coalesce_mixed && lazy_tree_mode.is_none() && !warm_eligible && !arithmetic_active && rigid.body_host_tree.is_none() && rigid.body_inverse.is_none() && rigid.body_factor.is_none();
-        if !no_progress_eligible { no_progress.clear(); }
-        if let Some(host_mode) = lazy_tree_mode {
-            if !lazy_attempted && lazy_budget > 0 && iteration == lazy_budget + 1 {
-                no_progress.clear();
-                lazy_attempted = true;
-                let recursive = super::pdrd::worst_relative_residual(&rigid.group_current, &rigid.group_initial, err0);
-                let verified = verify_true_residual!(lazy_budget, recursive);
-                if verified < tolerance { finish!(Outcome::Converged, lazy_budget, verified); }
-                if recursive < tolerance && animation_decision!() { finish!(Outcome::AcceptedAnimation, lazy_budget, verified); }
-                if !verified.is_finite() { finish!(Outcome::MaxIterations, lazy_budget, verified); }
-                if let Some((engine,debug,reference)) = prepare_body_tree(device,op,reduction,joints,roots,host_mode,false)? {
-                    match engine { PreparedBodyTree::Factor(owner)=>rigid.body_factor=Some(owner), PreparedBodyTree::Device(inv)=>rigid.body_inverse=Some(inv), PreparedBodyTree::Host(host)=>rigid.body_host_tree=Some(host) }
-                    rigid.body_seed_x.size(device,dim,ppf_cts_compute::AllocLabel("body_tree.seed_x"))?;
-                    rigid.body_seed_r.size(device,dim,ppf_cts_compute::AllocLabel("body_tree.seed_r"))?;
-                    device.copy(rigid.body_seed_x.handle(),0,rigid.xr.handle(),0,dim*4)?;
-                    device.copy(rigid.body_seed_r.handle(),0,rigid.r.handle(),0,dim*4)?;
-                    rigid.body_inverse_debug=debug;
-                    rigid.body_group_reference=reference;
-                    eprintln!("PPF_BODY_TREE_PCG active=true apply={} schedule=lazy", if host_mode { "host" } else { "device" });
+    let graph_enabled = coalesce_refreshed && device.info().supports_deferred_regions
+        && std::env::var_os("PPF_JOINT_CLASSIC_PRODUCT_GRAPH").is_some_and(|value| value == "1");
+    let graph_receipt = graph_enabled
+        && std::env::var_os("PPF_JOINT_CLASSIC_PRODUCT_GRAPH_RECEIPT").is_some_and(|value| value == "1");
+    let graph_start = completed_iterations.saturating_add(5);
+    let ordered_tail = cfg!(cuda_backend) && safe_krylov && coalesce_refreshed
+        && roots.is_some() && grouped_soft.is_none() && !coalesce_mixed && !arithmetic_active
+        && !reduction.staged.reduced_schwarz.active() && scalar_debug.is_none()
+        && std::env::var_os("PPF_CUDA_CLASSIC_RZ_PACKET").is_some_and(|value| value == "1");
+    let ordered_tail_trace = ordered_tail
+        && std::env::var_os("PPF_CUDA_CLASSIC_RZ_PACKET_TRACE").is_some_and(|value| value == "1");
+    let mut ordered_tail_packets = 0u32;
+    let mut ordered_tail_skipped = 0u32;
+    let mut ordered_tail_factor_restarts = 0u32;
+    let mut product_graph = None::<D::Region>;
+    let mut graph_replays = 0u32;
+    // The packet names A and the product workspaces only. It must not be
+    // applied to the cold BJ continuation after the fresh factor falls back.
+    macro_rules! release_product_graph {
+        () => {
+            if let Some(region) = product_graph.take() {
+                device.release(region);
+                if graph_receipt {
+                    eprintln!("PPF_JOINT_CLASSIC_PRODUCT_GRAPH released=true replays={graph_replays} roots={}", roots.is_some());
                 }
-                // Verification replaces r and canonicalizes x, even on refusal.
-                rz = seed_direction!();
             }
-        }
-        let prp = if let Some(soft)=grouped_soft {
-            let direction=rigid.p.handle();
-            let applied=rigid.rp.handle();
-            let pap=work.scalar.span(slot::FOLD_SCRATCH,1);
-            let products=terms.product_handle();
-            device.run("pcg.fem.stage1.apply_dot",|encoder| {
-                // Ordered barriers separate all entries. Fold follows COMPLETE
-                // A+FEM Ap, including extension/restoring terms and native faults.
-                unsafe {
-                    op.encode_apply(encoder,direction,applied,
-                        work.row_absolute.handle(),work.row_curvature.handle())?;
-                    soft.encode_krylov(encoder,direction,applied)?;
-                    terms.encode_fill(encoder,direction,applied,dim)?;
-                    encode_fold(encoder,products,terms.rows(),&work.fold,pap,false)
-                }
-            })?;
-            work.scalar.download(device)?;
-            work.scalar.host()[slot::FOLD_SCRATCH]
-        } else if fused_joint_product {
-            let direction = rigid.p.handle();
-            let applied = rigid.rp.handle();
-            let pap = work.scalar.span(slot::FOLD_SCRATCH, 1);
-            device.run("pcg.joint.apply_dot", |encoder| {
-                reduction.encode_prolong(encoder, direction, rigid.xv.handle())?;
-                if tet_force_only {
-                    op.encode_apply_force_only(encoder, rigid.xv.handle(), rigid.mxv.handle(),
-                        work.row_absolute.handle(), work.row_curvature.handle())?;
-                } else {
-                    op.encode_apply(encoder, rigid.xv.handle(), rigid.mxv.handle(),
-                        work.row_absolute.handle(), work.row_curvature.handle())?;
-                }
-                reduction.encode_restrict(encoder, rigid.mxv.handle(), applied, allow_gather)?;
-                joints.encode_krylov(encoder, direction, applied, row_parallel)?;
-                terms.encode_fill(encoder, direction, applied, dim)?;
-                encode_fold(encoder, terms.product_handle(), terms.rows(), &work.fold, pap, false)
-            })?;
-            if fused_factor_receipt_pending { eprintln!("PPF_FUSED_PRODUCT_EXECUTED factor_owner={}", rigid.body_factor.is_some()); fused_factor_receipt_pending=false; }
-            if tet_receipt_pending { eprintln!("TET_FORCE_ONLY_RECEIPT active=true"); tet_receipt_pending=false; }
-            if gather_receipt_pending { eprintln!("RESTRICT_GATHER_APPLY_RECEIPT active=true"); gather_receipt_pending=false; }
-            if row_receipt_pending { eprintln!("JOINT_ROW_PARALLEL_RECEIPT active=true"); row_receipt_pending=false; }
-            work.scalar.download(device)?;
-            work.scalar.host()[slot::FOLD_SCRATCH]
-        } else {
-            apply_reduced_tangent!(rigid.p.handle(), rigid.rp.handle());
-            terms.dot(device, rigid.p.handle(), rigid.rp.handle(), dim, &work.fold, &mut work.scalar)?
         };
-        // A ZERO CURVATURE DIVIDES BY 1 RATHER THAN BY ZERO, which keeps the
-        // step finite and lets the residual test below decide. It is NOT treated
-        // as a breakdown here: the reduced operator is projected on both sides,
-        // so an exactly zero `p^T R p` is a direction the constraints have
-        // removed rather than an indefinite matrix.
-        let alpha = if let Some(debug)=scalar_debug.as_mut(){let p=debug.dot(device,rigid.p.handle(),rigid.rp.handle(),dim)?;(debug.rz / if p!=0. {p}else{1.}) as f32}else{rz / if prp != 0.0 { prp } else { 1.0 }};
-        if arithmetic_active && (!prp.is_finite() || prp <= 0.0 || !alpha.is_finite() || alpha <= 0.0) {
-            downgrade_and_restart!("search_curvature", iteration, f32::INFINITY);
-            continue;
-        }
-        // Read-only samples are kept in memory; no file is written on success.
-        if failure_capture_dir.is_some() && (iteration == 1 || iteration == max_iterations) {
-            let sample = match rigid_failure_vectors(device, failure_handles, dim, iteration, rz, prp, alpha) {
-                Ok(value) => value,
-                Err(error) => serde_json::json!({"capture_error":error.to_string()}),
-            };
-            if iteration == 1 { failure_first = sample.clone(); }
-            if iteration == max_iterations { failure_cap_before = sample; }
-        }
-        device.run("pdrd.cg.update", |encoder| {
-            // Safety: the four buffers are borrowed for the whole call and the
-            // two updates touch disjoint destinations.
-            unsafe {
-                encode_add_scaled(encoder, rigid.p.handle(), rigid.xr.handle(), alpha, dim)?;
-                encode_add_scaled(encoder, rigid.rp.handle(), rigid.r.handle(), -alpha, dim)?;
-                if grouped_soft.is_some() {
-                    encode_fold(encoder,rigid.r.handle(),body_base,&work.fold,
-                        rigid.group_norm.span(0,1),true)?;
-                }
-                Ok(())
-            }
-        })?;
-
-        // Before the residual is measured: the norm has to be taken over the
-        // PROJECTED residual, or a component the constraint removes is counted
-        // against the tolerance and the solve never reaches it.
-        project_tangent!(rigid.r.handle());
-        // Safety: every handle names a live allocation for the whole call.
-        if grouped_soft.is_some() {
-            rigid.group_norm.download(device)?;
-            rigid.group_current[0]=rigid.group_norm.host()[0];
-        } else if coalesce_mixed {
-            if timing_receipt.is_some() { coalesced_iterations += 1; }
-            let residual_h = rigid.r.handle();
-            let preconditioned = rigid.z.handle();
-            let norm_cloth = rigid.group_norm.span(0, 1);
-            let norm_bodies = rigid.group_norm.span(1, bodies);
-            let dot_slot = rigid.group_norm.span(1 + bodies, 1);
-            let cross_slot = rigid.group_norm.span(2 + bodies, 1);
-            let products = terms.product_handle();
-            let arithmetic = arithmetic_active.then_some(record_arithmetic);
-            if arithmetic_active {
-                arithmetic_applies += 1;
-            }
-            device.run("pcg.rigid.group_l1_precond_dot", |encoder| {
-                unsafe {
-                    if body_base > 0 {
-                        encode_fold(encoder, residual_h, body_base, &work.fold, norm_cloth, true)?;
+    }
+    let classic_result = (|| -> super::scene::FatalResult<Report> {
+        for iteration in completed_iterations.saturating_add(1)..=max_iterations {
+            let no_progress_eligible = input == RigidSolveInput::NewtonForce && reduction.staged.pcg_precision == crate::args::PcgPrecision::Fp32 && lock.is_none() && roots.is_none() && !reduction.map.needs_projection() && !reduction.staged.reduced_schwarz.active() && grouped_soft.is_none() && !coalesce_mixed && lazy_tree_mode.is_none() && !warm_eligible && !arithmetic_active && rigid.body_host_tree.is_none() && rigid.body_inverse.is_none() && rigid.body_factor.is_none();
+            if !no_progress_eligible { no_progress.clear(); }
+            if let Some(host_mode) = lazy_tree_mode {
+                if !lazy_attempted && lazy_budget > 0 && iteration == lazy_budget + 1 {
+                    no_progress.clear();
+                    lazy_attempted = true;
+                    let recursive = super::pdrd::worst_relative_residual(&rigid.group_current, &rigid.group_initial, err0);
+                    let verified = verify_true_residual!(lazy_budget, recursive);
+                    if verified < tolerance { finish!(Outcome::Converged, lazy_budget, verified); }
+                    if recursive < tolerance && animation_decision!() { finish!(Outcome::AcceptedAnimation, lazy_budget, verified); }
+                    if !verified.is_finite() { finish!(Outcome::MaxIterations, lazy_budget, verified); }
+                    if let Some((engine,debug,reference)) = prepare_body_tree(device,op,reduction,joints,roots,host_mode,false)? {
+                        match engine { PreparedBodyTree::Factor(owner)=>rigid.body_factor=Some(owner), PreparedBodyTree::Device(inv)=>rigid.body_inverse=Some(inv), PreparedBodyTree::Host(host)=>rigid.body_host_tree=Some(host) }
+                        rigid.body_seed_x.size(device,dim,ppf_cts_compute::AllocLabel("body_tree.seed_x"))?;
+                        rigid.body_seed_r.size(device,dim,ppf_cts_compute::AllocLabel("body_tree.seed_r"))?;
+                        device.copy(rigid.body_seed_x.handle(),0,rigid.xr.handle(),0,dim*4)?;
+                        device.copy(rigid.body_seed_r.handle(),0,rigid.r.handle(),0,dim*4)?;
+                        rigid.body_inverse_debug=debug;
+                        rigid.body_group_reference=reference;
+                        eprintln!("PPF_BODY_TREE_PCG active=true apply={} schedule=lazy", if host_mode { "host" } else { "device" });
                     }
-                    encoder.elements(&PcgRigidGroupL1Args {
-                        reduced: residual_h, body_base: body_base as u32,
-                        norm: norm_bodies, count: bodies as u32, seam_arena_count: 0,
-                    }, bodies as u32)?;
-                    reduction.encode_precond_selected(encoder, factor, inverse_diagonal,
-                        residual_h, preconditioned, arithmetic)?;
-                    terms.encode_fill(encoder, residual_h, preconditioned, dim)?;
-                    encode_fold(encoder, products, terms.rows(), &work.fold, dot_slot, false)?;
-                    if arithmetic_active {
-                        terms.encode_fill(encoder, preconditioned, rigid.rp.handle(), dim)?;
-                        encode_fold(encoder, products, terms.rows(), &work.fold, cross_slot, false)?;
-                    }
-                    Ok(())
+                    // Verification replaces r and canonicalizes x, even on refusal.
+                    rz = seed_direction!();
                 }
-            })?;
-            rigid.group_norm.download(device)?;
-            let host = rigid.group_norm.host();
-            rigid.group_current[0] = if body_base > 0 { host[0] } else { 0.0 };
-            rigid.group_current[1..].copy_from_slice(&host[1..1 + bodies]);
-        } else {
-            unsafe {
-                group_l1_device(device,rigid.r.handle(),&mut rigid.group_norm,
-                    &work.fold,body_base,bodies,&mut rigid.group_current)
-            }?;
-        }
-        let mut residual = super::pdrd::worst_relative_residual(
-            &rigid.group_current,
-            &rigid.group_initial,
-            err0,
-        );
-        if residual < tolerance {
-            let recursive_residual = residual;
-            residual = verify_true_residual!(iteration,recursive_residual);
-            if residual < tolerance {
-                finish!(Outcome::Converged, iteration, residual);
             }
-            if iteration >= 1 && animation_decision!() {finish!(Outcome::AcceptedAnimation,iteration,residual);}
-            if iteration < max_iterations && residual.is_finite() {
-                ::log::info!("pcg true-residual restart after scalar iteration {}: recursive={:.9} true={:.9}",
-                    iteration,recursive_residual,residual);
-                if arithmetic_active && (true_residual_checks >= 2 || iteration >= arithmetic_limit) {
-                    arithmetic_active = false;
-                    arithmetic_downgrade = Some(if iteration >= arithmetic_limit {
-                        "reserved_fp32_budget"
+            let prp = if let Some(soft)=grouped_soft {
+                let direction=rigid.p.handle();
+                let applied=rigid.rp.handle();
+                let pap=work.scalar.span(slot::FOLD_SCRATCH,1);
+                let products=terms.product_handle();
+                device.run("pcg.fem.stage1.apply_dot",|encoder| {
+                    // Ordered barriers separate all entries. Fold follows COMPLETE
+                    // A+FEM Ap, including extension/restoring terms and native faults.
+                    unsafe {
+                        op.encode_apply(encoder,direction,applied,
+                            work.row_absolute.handle(),work.row_curvature.handle())?;
+                        soft.encode_krylov(encoder,direction,applied)?;
+                        terms.encode_fill(encoder,direction,applied,dim)?;
+                        encode_fold(encoder,products,terms.rows(),&work.fold,pap,false)
+                    }
+                })?;
+                work.scalar.download(device)?;
+                work.scalar.host()[slot::FOLD_SCRATCH]
+            } else if fused_joint_product || coalesce_refreshed {
+                let direction = rigid.p.handle();
+                let applied = rigid.rp.handle();
+                let pap = work.scalar.span(slot::FOLD_SCRATCH, 1);
+                let mut encode_product = |encoder: &mut dyn Encoder| {
+                    if let Some(root) = roots { root.encode_project(encoder, direction)?; }
+                    reduction.encode_prolong(encoder, direction, rigid.xv.handle())?;
+                    if tet_force_only {
+                        op.encode_apply_force_only(encoder, rigid.xv.handle(), rigid.mxv.handle(),
+                            work.row_absolute.handle(), work.row_curvature.handle())?;
                     } else {
-                        "repeated_false_convergence"
-                    });
-                }
-                restart_from_true_residual!();
-                if no_progress_eligible && !arithmetic_active && rigid.body_host_tree.is_none() && rigid.body_inverse.is_none() && rigid.body_factor.is_none() {
-                    if let Some(best) = no_progress.observe(residual) {
-                        ::log::info!("pcg NoProgress reason=failed_true_restart_budget patience=16 best_verified={:.9e} last_verified={:.9e}", best, residual);
-                        finish!(Outcome::NoProgress, iteration, residual);
+                        op.encode_apply(encoder, rigid.xv.handle(), rigid.mxv.handle(),
+                            work.row_absolute.handle(), work.row_curvature.handle())?;
+                    }
+                    reduction.encode_restrict(encoder, rigid.mxv.handle(), applied, allow_gather || coalesce_refreshed)?;
+                    joints.encode_krylov(encoder, direction, applied, row_parallel)?;
+                    if let Some(root) = roots { root.encode_project(encoder, applied)?; }
+                    terms.encode_fill(encoder, direction, applied, dim)?;
+                    encode_fold(encoder, terms.product_handle(), terms.rows(), &work.fold, pap, false)
+                };
+                // Only the fixed A -> pAp packet is captured. Alpha and all
+                // convergence, preconditioner, and retry decisions stay on the host.
+                if graph_enabled && rigid.body_factor.is_some() && iteration == graph_start
+                    && max_iterations.saturating_sub(iteration) >= 4
+                {
+                    let before = device.counters().regions_deferred;
+                    let region = device.record("pcg.joint.classic_product_graph", &mut encode_product)?;
+                    if device.counters().regions_deferred > before {
+                        product_graph = Some(region);
+                    } else {
+                        device.release(region);
+                        if graph_receipt {
+                            eprintln!("PPF_JOINT_CLASSIC_PRODUCT_GRAPH fallback=no_deferred_capture");
+                        }
                     }
                 }
+                if let Some(region) = product_graph.as_ref() {
+                    match device.replay(region, 1) {
+                        Ok(_) => graph_replays += 1,
+                        // The stale-generation check precedes all dispatches.
+                        Err(Fault::StaleRegion { .. }) => {
+                            release_product_graph!();
+                            device.run("pcg.joint.apply_dot", &mut encode_product)?;
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                } else {
+                    device.run("pcg.joint.apply_dot", &mut encode_product)?;
+                }
+                if fused_factor_receipt_pending { eprintln!("PPF_FUSED_PRODUCT_EXECUTED factor_owner={}", rigid.body_factor.is_some()); fused_factor_receipt_pending=false; }
+                if tet_receipt_pending { eprintln!("TET_FORCE_ONLY_RECEIPT active=true"); tet_receipt_pending=false; }
+                if gather_receipt_pending { eprintln!("RESTRICT_GATHER_APPLY_RECEIPT active=true"); gather_receipt_pending=false; }
+                if row_receipt_pending { eprintln!("JOINT_ROW_PARALLEL_RECEIPT active=true"); row_receipt_pending=false; }
+                work.scalar.download(device)?;
+                work.scalar.host()[slot::FOLD_SCRATCH]
+            } else {
+                apply_reduced_tangent!(rigid.p.handle(), rigid.rp.handle());
+                terms.dot(device, rigid.p.handle(), rigid.rp.handle(), dim, &work.fold, &mut work.scalar)?
+            };
+            // A ZERO CURVATURE DIVIDES BY 1 RATHER THAN BY ZERO, which keeps the
+            // step finite and lets the residual test below decide. It is NOT treated
+            // as a breakdown here: the reduced operator is projected on both sides,
+            // so an exactly zero `p^T R p` is a direction the constraints have
+            // removed rather than an indefinite matrix.
+            let alpha = if let Some(debug)=scalar_debug.as_mut(){let p=debug.dot(device,rigid.p.handle(),rigid.rp.handle(),dim)?;(debug.rz / if p!=0. {p}else{1.}) as f32}else{rz / if prp != 0.0 { prp } else { 1.0 }};
+            if arithmetic_active && (!prp.is_finite() || prp <= 0.0 || !alpha.is_finite() || alpha <= 0.0) {
+                downgrade_and_restart!("search_curvature", iteration, f32::INFINITY);
                 continue;
             }
-        } else if arithmetic_active && !residual.is_finite() {
-            downgrade_and_restart!("recursive_residual", iteration, residual);
-            continue;
-        } else if arithmetic_active && iteration >= arithmetic_limit && iteration < max_iterations {
-            downgrade_and_restart!("reserved_fp32_budget", iteration, residual);
-            continue;
-        }
-        if iteration >= max_iterations || !residual.is_finite() {
-            if group_debug {eprintln!("PPF_BODY_GROUP_CAP solve={} iteration={} residual={:.9e}",scalar_debug_id.unwrap(),iteration,residual);return Err(Fault::Platform{call:"body group diagnostic",detail:"cap; intentional no-commit".into()}.into());}
-            if let Some(debug)=scalar_debug.as_ref(){debug.receipt(iteration,residual,f32::NAN,"cap");return Err(Fault::Platform{call:"scalar64 diagnostic",detail:"cap; intentional no-commit".into()}.into());}
-            if let Some(dir) = failure_capture_dir.as_deref() {
-                let frozen = match rigid_failure_frozen_system(device, op, reduction, factor,
-                    inverse_diagonal, failure_handles, &rigid.zero, b, joints, roots) {
+            // Read-only samples are kept in memory; no file is written on success.
+            if failure_capture_dir.is_some() && (iteration == 1 || iteration == max_iterations) {
+                let sample = match rigid_failure_vectors(device, failure_handles, dim, iteration, rz, prp, alpha) {
                     Ok(value) => value,
                     Err(error) => serde_json::json!({"capture_error":error.to_string()}),
                 };
-                let capture = serde_json::json!({
-                    "schema":"ppf.rigid-pcg-failure.v1",
-                    "scope":"failed uncommitted Newton solve; original MaxIterations refusal retained",
-                    "outcome":"MaxIterations","iteration":iteration,"max_iterations":max_iterations,
-                    "relative_residual_f32":residual,"relative_residual_bits":residual.to_bits(),
-                    "tolerance_f32":tolerance,"err0_f32":err0,"err0_bits":err0.to_bits(),
-                    "group_initial_f32":rigid_failure_values(&rigid.group_initial),
-                    "group_current_f32":rigid_failure_values(&rigid.group_current),
-                    "previous_beta_f32":failure_previous_beta,
-                    "previous_beta_bits":failure_previous_beta.map(f32::to_bits),
-                    "physical_start_s":joints.start_time_s,"sample_time_s":joints.sample_time_s,"dt_s":joints.dt,
-                    "dim":dim,"bodies":bodies,"body_base":body_base,"rows":op.rows(),
-                    "first_iteration_before_update":failure_first,
-                    "cap_iteration_before_update":failure_cap_before,
-                    "frozen_after_failed_update":frozen,
-                });
-                if let Err(error) = rigid_failure_write(dir, &capture) {
-                    eprintln!("RIGID_PCG_FAILURE_CAPTURE_ERROR {error}");
+                if iteration == 1 { failure_first = sample.clone(); }
+                if iteration == max_iterations { failure_cap_before = sample; }
+            }
+            if coalesce_refreshed {
+                let direction = rigid.p.handle();
+                let iterate = rigid.xr.handle();
+                let applied = rigid.rp.handle();
+                let residual = rigid.r.handle();
+                group_l1_after(device, residual, &mut rigid.group_norm, &work.fold,
+                    body_base, bodies, &mut rigid.group_current, |encoder| {
+                        encode_add_scaled(encoder, direction, iterate, alpha, dim)?;
+                        encode_add_scaled(encoder, applied, residual, -alpha, dim)?;
+                        if let Some(root) = roots { root.encode_project(encoder, residual)?; }
+                        Ok(())
+                    })?;
+            } else {
+                device.run("pdrd.cg.update", |encoder| {
+                    // Safety: the four buffers are borrowed for the whole call and the
+                    // two updates touch disjoint destinations.
+                    unsafe {
+                        encode_add_scaled(encoder, rigid.p.handle(), rigid.xr.handle(), alpha, dim)?;
+                        encode_add_scaled(encoder, rigid.rp.handle(), rigid.r.handle(), -alpha, dim)?;
+                        if grouped_soft.is_some() {
+                            encode_fold(encoder,rigid.r.handle(),body_base,&work.fold,
+                                rigid.group_norm.span(0,1),true)?;
+                        }
+                        Ok(())
+                    }
+                })?;
+
+                // Before the residual is measured: the norm has to be taken over the
+                // PROJECTED residual, or a component the constraint removes is counted
+                // against the tolerance and the solve never reaches it.
+                project_tangent!(rigid.r.handle());
+                // Safety: every handle names a live allocation for the whole call.
+                if grouped_soft.is_some() {
+                    rigid.group_norm.download(device)?;
+                    rigid.group_current[0]=rigid.group_norm.host()[0];
+                } else if coalesce_mixed {
+                    if timing_receipt.is_some() { coalesced_iterations += 1; }
+                    let residual_h = rigid.r.handle();
+                    let preconditioned = rigid.z.handle();
+                    let norm_cloth = rigid.group_norm.span(0, 1);
+                    let norm_bodies = rigid.group_norm.span(1, bodies);
+                    let dot_slot = rigid.group_norm.span(1 + bodies, 1);
+                    let cross_slot = rigid.group_norm.span(2 + bodies, 1);
+                    let products = terms.product_handle();
+                    let arithmetic = arithmetic_active.then_some(record_arithmetic);
+                    if arithmetic_active {
+                        arithmetic_applies += 1;
+                    }
+                    device.run("pcg.rigid.group_l1_precond_dot", |encoder| {
+                        unsafe {
+                            if body_base > 0 {
+                                encode_fold(encoder, residual_h, body_base, &work.fold, norm_cloth, true)?;
+                            }
+                            encoder.elements(&PcgRigidGroupL1Args {
+                                reduced: residual_h, body_base: body_base as u32,
+                                norm: norm_bodies, count: bodies as u32, seam_arena_count: 0,
+                            }, bodies as u32)?;
+                            reduction.encode_precond_selected(encoder, factor, inverse_diagonal,
+                                residual_h, preconditioned, arithmetic)?;
+                            terms.encode_fill(encoder, residual_h, preconditioned, dim)?;
+                            encode_fold(encoder, products, terms.rows(), &work.fold, dot_slot, false)?;
+                            if arithmetic_active {
+                                terms.encode_fill(encoder, preconditioned, rigid.rp.handle(), dim)?;
+                                encode_fold(encoder, products, terms.rows(), &work.fold, cross_slot, false)?;
+                            }
+                            Ok(())
+                        }
+                    })?;
+                    rigid.group_norm.download(device)?;
+                    let host = rigid.group_norm.host();
+                    rigid.group_current[0] = if body_base > 0 { host[0] } else { 0.0 };
+                    rigid.group_current[1..].copy_from_slice(&host[1..1 + bodies]);
+                } else {
+                    unsafe {
+                        group_l1_device(device,rigid.r.handle(),&mut rigid.group_norm,
+                            &work.fold,body_base,bodies,&mut rigid.group_current)
+                    }?;
                 }
             }
-            finish!(Outcome::MaxIterations, iteration, residual);
-        }
-
-        let (rz_next, cross) = if coalesce_mixed && grouped_soft.is_none() {
-            let host = rigid.group_norm.host();
-            (host[1 + bodies], arithmetic_active.then(|| host[2 + bodies]))
-        } else {
-            precondition_current!();
-            if factor_restarted {
-                no_progress.clear();
-                factor_restarted=false;
-                rz=seed_direction!();
+            let mut residual = super::pdrd::worst_relative_residual(
+                &rigid.group_current,
+                &rigid.group_initial,
+                err0,
+            );
+            if residual < tolerance {
+                release_product_graph!();
+                let recursive_residual = residual;
+                residual = verify_true_residual!(iteration,recursive_residual);
+                if residual < tolerance {
+                    finish!(Outcome::Converged, iteration, residual);
+                }
+                if iteration >= 1 && animation_decision!() {finish!(Outcome::AcceptedAnimation,iteration,residual);}
+                if iteration < max_iterations && residual.is_finite() {
+                    ::log::info!("pcg true-residual restart after scalar iteration {}: recursive={:.9} true={:.9}",
+                        iteration,recursive_residual,residual);
+                    if arithmetic_active && (true_residual_checks >= 2 || iteration >= arithmetic_limit) {
+                        arithmetic_active = false;
+                        arithmetic_downgrade = Some(if iteration >= arithmetic_limit {
+                            "reserved_fp32_budget"
+                        } else {
+                            "repeated_false_convergence"
+                        });
+                    }
+                    restart_from_true_residual!();
+                    if no_progress_eligible && !arithmetic_active && rigid.body_host_tree.is_none() && rigid.body_inverse.is_none() && rigid.body_factor.is_none() {
+                        if let Some(best) = no_progress.observe(residual) {
+                            ::log::info!("pcg NoProgress reason=failed_true_restart_budget patience=16 best_verified={:.9e} last_verified={:.9e}", best, residual);
+                            finish!(Outcome::NoProgress, iteration, residual);
+                        }
+                    }
+                    continue;
+                }
+            } else if arithmetic_active && !residual.is_finite() {
+                downgrade_and_restart!("recursive_residual", iteration, residual);
+                continue;
+            } else if arithmetic_active && iteration >= arithmetic_limit && iteration < max_iterations {
+                downgrade_and_restart!("reserved_fp32_budget", iteration, residual);
                 continue;
             }
-            let rz_next = terms.dot(device, rigid.r.handle(), rigid.z.handle(), dim, &work.fold, &mut work.scalar)?;
-            let cross = if arithmetic_active {
-                Some(terms.dot(device, rigid.z.handle(), rigid.rp.handle(), dim, &work.fold, &mut work.scalar)?)
-            } else {
-                None
-            };
-            (rz_next, cross)
-        };
-        // One flexible-CG orthogonalization against the previous direction:
-        // choose beta so (z_new + beta*p_old) is A-conjugate to p_old.
-        let beta = if let Some(debug)=scalar_debug.as_mut(){let next=debug.dot(device,rigid.r.handle(),rigid.z.handle(),dim)?;let beta=(next/debug.rz) as f32;debug.rz=next;beta}else if let Some(cross) = cross { -cross / prp } else { rz_next / rz };
-        if arithmetic_active && (!rz_next.is_finite() || rz_next <= 0.0 || !beta.is_finite()) {
-            downgrade_and_restart!("flexible_direction", iteration, residual);
-            continue;
-        }
-        if failure_capture_dir.is_some() { failure_previous_beta = Some(beta); }
-        combine(
-            device,
-            rigid.z.handle(),
-            rigid.p.handle(),
-            rigid.p.handle(),
-            1.0,
-            beta,
-            dim,
-        )?;
-        // The new search direction in its own right, as at the seed.
-        project_tangent!(rigid.p.handle());
-        rz = rz_next;
-    }
+            if iteration >= max_iterations || !residual.is_finite() {
+                if group_debug {eprintln!("PPF_BODY_GROUP_CAP solve={} iteration={} residual={:.9e}",scalar_debug_id.unwrap(),iteration,residual);return Err(Fault::Platform{call:"body group diagnostic",detail:"cap; intentional no-commit".into()}.into());}
+                if let Some(debug)=scalar_debug.as_ref(){debug.receipt(iteration,residual,f32::NAN,"cap");return Err(Fault::Platform{call:"scalar64 diagnostic",detail:"cap; intentional no-commit".into()}.into());}
+                if let Some(dir) = failure_capture_dir.as_deref() {
+                    let frozen = match rigid_failure_frozen_system(device, op, reduction, factor,
+                        inverse_diagonal, failure_handles, &rigid.zero, b, joints, roots) {
+                        Ok(value) => value,
+                        Err(error) => serde_json::json!({"capture_error":error.to_string()}),
+                    };
+                    let capture = serde_json::json!({
+                        "schema":"ppf.rigid-pcg-failure.v1",
+                        "scope":"failed uncommitted Newton solve; original MaxIterations refusal retained",
+                        "outcome":"MaxIterations","iteration":iteration,"max_iterations":max_iterations,
+                        "relative_residual_f32":residual,"relative_residual_bits":residual.to_bits(),
+                        "tolerance_f32":tolerance,"err0_f32":err0,"err0_bits":err0.to_bits(),
+                        "group_initial_f32":rigid_failure_values(&rigid.group_initial),
+                        "group_current_f32":rigid_failure_values(&rigid.group_current),
+                        "previous_beta_f32":failure_previous_beta,
+                        "previous_beta_bits":failure_previous_beta.map(f32::to_bits),
+                        "physical_start_s":joints.start_time_s,"sample_time_s":joints.sample_time_s,"dt_s":joints.dt,
+                        "dim":dim,"bodies":bodies,"body_base":body_base,"rows":op.rows(),
+                        "first_iteration_before_update":failure_first,
+                        "cap_iteration_before_update":failure_cap_before,
+                        "frozen_after_failed_update":frozen,
+                    });
+                    if let Err(error) = rigid_failure_write(dir, &capture) {
+                        eprintln!("RIGID_PCG_FAILURE_CAPTURE_ERROR {error}");
+                    }
+                }
+                finish!(Outcome::MaxIterations, iteration, residual);
+            }
 
-    let _ = work;
-    finish!(Outcome::MaxIterations, max_iterations, 1.0);
+            let (rz_next, cross) = if coalesce_mixed && grouped_soft.is_none() {
+                let host = rigid.group_norm.host();
+                (host[1 + bodies], arithmetic_active.then(|| host[2 + bodies]))
+            } else {
+                let packet_root = roots.filter(|root| root.count != 0 && ordered_tail && terms.rows() != 0
+                    && rigid.body_factor.is_some() && rigid.body_inverse.is_none()
+                    && rigid.body_host_tree.is_none());
+                // The original factor fault check runs before any speculative
+                // packet work. Failed factors go to the same cold Jacobi seed.
+                precondition_current!(packet_root.is_none());
+                if factor_restarted {
+                    if ordered_tail_trace { ordered_tail_factor_restarts += 1; }
+                    release_product_graph!();
+                    no_progress.clear();
+                    factor_restarted=false;
+                    rz=seed_direction!();
+                    continue;
+                }
+                let rz_next = if let Some(root) = packet_root {
+                    let value = terms.ordered_root_dot(device, root, rigid.r.handle(),
+                        rigid.z.handle(), dim, &work.fold, &mut work.scalar)?;
+                    if ordered_tail_trace { ordered_tail_packets += 1; }
+                    value
+                } else {
+                    if ordered_tail_trace { ordered_tail_skipped += 1; }
+                    terms.dot(device, rigid.r.handle(), rigid.z.handle(), dim, &work.fold, &mut work.scalar)?
+                };
+                let cross = if arithmetic_active {
+                    Some(terms.dot(device, rigid.z.handle(), rigid.rp.handle(), dim, &work.fold, &mut work.scalar)?)
+                } else {
+                    None
+                };
+                (rz_next, cross)
+            };
+            // One flexible-CG orthogonalization against the previous direction:
+            // choose beta so (z_new + beta*p_old) is A-conjugate to p_old.
+            let beta = if let Some(debug)=scalar_debug.as_mut(){let next=debug.dot(device,rigid.r.handle(),rigid.z.handle(),dim)?;let beta=(next/debug.rz) as f32;debug.rz=next;beta}else if let Some(cross) = cross { -cross / prp } else { rz_next / rz };
+            if arithmetic_active && (!rz_next.is_finite() || rz_next <= 0.0 || !beta.is_finite()) {
+                downgrade_and_restart!("flexible_direction", iteration, residual);
+                continue;
+            }
+            if failure_capture_dir.is_some() { failure_previous_beta = Some(beta); }
+            if let Some(root) = roots.filter(|_| coalesce_refreshed) {
+                let z = rigid.z.handle();
+                let p = rigid.p.handle();
+                device.run("pdrd.cg.direction", |encoder| {
+                    encode_combine_raw(encoder, z, p, p, 1.0, beta, dim)?;
+                    root.encode_project(encoder, p)
+                })?;
+            } else {
+                combine(
+                    device,
+                    rigid.z.handle(),
+                    rigid.p.handle(),
+                    rigid.p.handle(),
+                    1.0,
+                    beta,
+                    dim,
+                )?;
+                // The new search direction in its own right, as at the seed.
+                project_tangent!(rigid.p.handle());
+            }
+            rz = rz_next;
+        }
+
+        let _ = work;
+        finish!(Outcome::MaxIterations, max_iterations, 1.0);
+    })();
+    release_product_graph!();
+    if ordered_tail_trace {
+        eprintln!("PPF_CUDA_CLASSIC_RZ_PACKET packets={ordered_tail_packets} skipped={ordered_tail_skipped} factor_restarts={ordered_tail_factor_restarts} typed_fault={}", classic_result.is_err());
+    }
+    classic_result
 }
 
 // Optional failure-only diagnostics for the actual two-body fixture. No
@@ -7671,14 +8377,136 @@ mod warm_alloc_fault_test;
 #[cfg(all(test, feature="cpu"))]
 #[path="zero_solve_export_test.rs"]
 mod zero_solve_export_test;
+fn sparse_host_body_tree(device: &impl Device, host_mode: bool) -> bool {
+    host_mode && device.info().backend == "host"
+        && std::env::var_os("PPF_BODY_TREE_HOST_SPARSE").is_some_and(|value| value == "1")
+}
+
+fn body_tree_scalar_extent(bodies: usize, factor_mode: bool, sparse_host: bool) -> Option<usize> {
+    let dofs = bodies.checked_mul(6)?;
+    if dofs == 0 || dofs > u32::MAX as usize {
+        return None;
+    }
+    if sparse_host {
+        // A host forest stores 6x6 factors per body, not a dense DOF square.
+        let factor_bytes = bodies.checked_mul(std::mem::size_of::<[[f64; 6]; 6]>())?;
+        if factor_bytes > isize::MAX as usize {
+            return None;
+        }
+    } else if !factor_mode && dofs > 1024 {
+        return None;
+    }
+    Some(dofs)
+}
+
+#[cfg(test)]
+mod sparse_host_extent_tests {
+    #[test]
+    fn a_sparse_chain_solves_above_the_dense_dof_limit() {
+        use super::super::{body_block_projection::SparseBodyMatrix, shadow_tree::FreeForest};
+
+        // Just above the old dense limit, with no split of the component.
+        let bodies = 1024 / 6 + 1;
+        assert_eq!(super::body_tree_scalar_extent(bodies, false, false), None);
+        assert_eq!(super::body_tree_scalar_extent(bodies, false, true), Some(6 * bodies));
+        assert_eq!(super::body_tree_scalar_extent(usize::MAX, false, true), None);
+        let diagonal = |value| {
+            let mut block = [[0.0f32; 6]; 6];
+            for (i, row) in block.iter_mut().enumerate() {
+                row[i] = value;
+            }
+            block
+        };
+        let mut blocks = std::collections::BTreeMap::new();
+        for body in 0..bodies {
+            blocks.insert((body, body), diagonal(4.0));
+            if body > 0 {
+                blocks.insert((body - 1, body), diagonal(-1.0));
+                blocks.insert((body, body - 1), diagonal(-1.0));
+            }
+        }
+        let matrix = SparseBodyMatrix { body_count: bodies, free: (0..bodies).collect(), blocks };
+        let forest = FreeForest::from_sparse_weighted(&matrix, bodies).expect("sparse SPD chain");
+        assert_eq!(forest.omitted_cycles, 0);
+        let rhs: Vec<_> = (0..6 * bodies).map(|lane| (lane % 13) as f64 - 6.0).collect();
+        let solution = forest.apply(&rhs).expect("finite sparse solve");
+        for (lane, &expected) in rhs.iter().enumerate() {
+            let mut applied = 4.0 * solution[lane];
+            if lane >= 6 { applied -= solution[lane - 6]; }
+            if lane + 6 < solution.len() { applied -= solution[lane + 6]; }
+            assert!((applied - expected).abs() < 1e-11, "lane {lane}");
+        }
+    }
+}
+
 unsafe fn prepare_body_tree<D:Device>(device:&mut D,op:&Operator,reduction:&mut super::pdrd::Reduction<'_>,joints:super::joints::View,roots:Option<super::roots::View>,host_mode:bool,factor_mode:bool)->super::scene::FatalResult<Option<(PreparedBodyTree,Option<BodyTreeDebug>,Option<BodyGroupReference>)>> {
-    let bodies=reduction.map.n_bodies;let mut fixed=vec![false;bodies];
+    let bodies=reduction.map.n_bodies;
+    let sparse_host = sparse_host_body_tree(device, host_mode);
+    let root_count = roots.map_or(0, |root| root.count as usize);
+    if sparse_host && super::body_block_capture::host_sparse_plan(op, joints, bodies, 0, root_count).is_none() {
+        eprintln!("PPF_BODY_TREE_PCG active=false reason=host_sparse_memory_budget");
+        return Ok(None);
+    }
+    let mut fixed=Vec::new();
+    if fixed.try_reserve_exact(bodies).is_err() {
+        eprintln!("PPF_BODY_TREE_PCG active=false reason=host_sparse_workspace");
+        return Ok(None);
+    }
+    fixed.resize(bodies, false);
     if let Some(root)=roots {let mut targets=vec![crate::joint_root_motion_gpu::RootTargetGpu::default();root.count as usize];let bytes=std::slice::from_raw_parts_mut(targets.as_mut_ptr().cast::<u8>(),targets.len()*std::mem::size_of::<crate::joint_root_motion_gpu::RootTargetGpu>());if !bytes.is_empty(){device.read(root.targets,0,bytes)?;}for r in targets{if r.enabled!=0{let b=r.body as usize;if b>=bodies{eprintln!("PPF_BODY_TREE_PCG active=false reason=root_mapping");return Ok(None)}fixed[b]=true;}}}
-    let free:Vec<usize>=(0..bodies).filter(|&b|!fixed[b]).collect();let roots:Vec<usize>=(0..bodies).filter(|&b|fixed[b]).collect();let Some(m)=free.len().checked_mul(6) else {return Ok(None)};if m==0||m>u32::MAX as usize||(!factor_mode && m>1024) {eprintln!("PPF_BODY_TREE_PCG active=false reason=free_extent");return Ok(None)}
-    let slots:Vec<usize>=free.iter().flat_map(|&b|(0..6).map(move |i|6*b+i)).collect();let t=std::time::Instant::now();
-    if factor_mode {
-        let sparse=match super::body_block_capture::capture_sparse(device,op,reduction,joints,&slots){Ok(x)=>x,Err(Fault::Platform{call:"direct body projection",detail})=>{eprintln!("PPF_BODY_TREE_PCG active=false reason=direct_{}",detail);return Ok(None)},Err(e)=>return Err(e.into())};
-        let tree=match super::shadow_tree::FreeForest::from_sparse_weighted(&sparse,170){Ok(x)=>x,Err(e)=>{eprintln!("PPF_BODY_TREE_PCG active=false reason=spd_{:?}",e.0);return Ok(None)}};
+    let free_count = fixed.iter().filter(|&&is_fixed| !is_fixed).count();
+    let mut free = Vec::new();
+    let mut roots = Vec::new();
+    if free.try_reserve_exact(free_count).is_err()
+        || roots.try_reserve_exact(bodies - free_count).is_err()
+    {
+        eprintln!("PPF_BODY_TREE_PCG active=false reason=body_tree_workspace");
+        return Ok(None);
+    }
+    for (body, is_fixed) in fixed.iter().copied().enumerate() {
+        if is_fixed { roots.push(body); } else { free.push(body); }
+    }
+    let Some(m) = body_tree_scalar_extent(free.len(), factor_mode, sparse_host) else {
+        eprintln!("PPF_BODY_TREE_PCG active=false reason=free_extent");
+        return Ok(None);
+    };
+    let plan = if sparse_host {
+        let Some(plan) = super::body_block_capture::host_sparse_plan(op, joints, bodies, free.len(), root_count) else {
+            eprintln!("PPF_BODY_TREE_PCG active=false reason=host_sparse_memory_budget");
+            return Ok(None);
+        };
+        Some(plan)
+    } else {
+        None
+    };
+    let mut slots = Vec::new();
+    if slots.try_reserve_exact(m).is_err() {
+        eprintln!("PPF_BODY_TREE_PCG active=false reason=host_sparse_workspace");
+        return Ok(None);
+    }
+    slots.extend(free.iter().flat_map(|&b|(0..6).map(move |i|6*b+i)));
+    let t=std::time::Instant::now();
+    if factor_mode || sparse_host {
+        let sparse=match super::body_block_capture::capture_sparse(device,op,reduction,joints,&slots,plan){
+            Ok(x)=>x,
+            Err(Fault::Platform{call:"direct body projection",detail})=>{eprintln!("PPF_BODY_TREE_PCG active=false reason=direct_{}",detail);return Ok(None)},
+            Err(Fault::Alloc { .. }) if sparse_host => {
+                eprintln!("PPF_BODY_TREE_PCG active=false reason=host_sparse_allocation");
+                return Ok(None);
+            }
+            Err(e)=>return Err(e.into())
+        };
+        let host_timing = sparse_host.then(|| (t.elapsed().as_secs_f64() * 1000.0, std::time::Instant::now()));
+        // The host uses the ordinary forest solve and has no CUDA packet
+        // limit. Keep the whole weighted forest that the dense host path
+        // would choose from the same blocks.
+        let capacity = if sparse_host { free.len() } else { 170 };
+        let tree=match super::shadow_tree::FreeForest::from_sparse_weighted(&sparse,capacity){Ok(x)=>x,Err(e)=>{eprintln!("PPF_BODY_TREE_PCG active=false reason=spd_{:?}",e.0);return Ok(None)}};
+        if let Some((direct_ms, factor_start)) = host_timing {
+            let factor_ms = factor_start.elapsed().as_secs_f64() * 1000.0;
+            eprintln!("PPF_BODY_TREE_PREP apply=host_sparse direct_ms={direct_ms:.6} factor_ms={factor_ms:.6}");
+            return Ok(Some((PreparedBodyTree::Host(HostBodyTree::new(tree,direct_ms,factor_ms)),None,None)));
+        }
         let (view,free_map,body_count)=tree.factor_view();
         let packed=match super::body_factor_pack::PackedFactor::from_view(view,free_map,body_count){Ok(x)=>x,Err(e)=>{eprintln!("PPF_BODY_TREE_PCG active=false reason=factor_pack_{:?}",e);return Ok(None)}};
         let owner=super::body_factor_device::BodyFactorDevice::upload(device,&packed)?;

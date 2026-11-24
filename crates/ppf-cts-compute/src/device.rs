@@ -2292,7 +2292,7 @@ pub fn encode_zero(
 ///
 /// A hand-written record carries no tables and is not validated; that is the
 /// same gap `guard_count` has and it closes with the last of them.
-fn validate_handles<A: KernelArgs>(args: &A) -> Result<(), Fault> {
+pub(crate) fn validate_handles<A: KernelArgs>(args: &A) -> Result<(), Fault> {
     let offsets = A::handle_offsets();
     let aligns = A::handle_aligns();
     if offsets.is_empty() {
@@ -2670,6 +2670,44 @@ pub trait Device {
         count: u32,
     ) -> Result<Diag, Fault> {
         self.run(region, |e| e.elements(args, count))
+    }
+
+    /// Whether this backend can use private per-range claim counters.
+    fn supports_empty_claim_probe(&self) -> bool {
+        false
+    }
+
+    /// Run an ordered-claim kernel with no record writes. True proves that
+    /// neither private counter nor a diagnostic was raised. False asks the
+    /// caller to use the ordinary ordered launch, including its error path.
+    ///
+    /// # Safety
+    /// As for [`Device::launch`]. The specified argument is a live handle
+    /// naming exactly two zero-based u32 counters, and must be written only
+    /// by the kernel's non-wrapping claim increments. The caller promises
+    /// record storage is disabled and that remaining writes are confined to
+    /// disjoint scratch for the query's own element. `max_increments` is a
+    /// conservative upper bound on the total for either counter.
+    unsafe fn probe_empty_claim<A: KernelArgs>(
+        &mut self,
+        _args: &A,
+        _count: u32,
+        _counter_offset: usize,
+        _max_increments: u64,
+    ) -> bool {
+        false
+    }
+
+    /// Run a disjoint scratch-only variant of a generated entry on supported hosts.
+    /// `None` means the target cannot run the probe.
+    ///
+    /// # Safety
+    /// The caller must enable the entry's scratch-only path. No element may
+    /// write shared storage or another element's scratch, even on failure.
+    unsafe fn launch_disjoint_probe<A: KernelArgs>(
+        &mut self, _region: &'static str, _args: &A, _count: u32,
+    ) -> Result<Option<Diag>, Fault> {
+        Ok(None)
     }
 
     /// One dispatch of a GROUP-shaped entry, submitted on its own.

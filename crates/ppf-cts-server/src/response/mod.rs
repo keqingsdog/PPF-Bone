@@ -12,13 +12,71 @@ use std::path::PathBuf;
 use serde_json::{json, Value};
 
 use crate::config::EngineConfig;
-use ppf_cts_core::state::{ServerState, Solver};
-use ppf_cts_formats::files::{session_data_dir, session_dir};
+use ppf_cts_core::state::{Build, ServerState, Solver};
+use ppf_cts_formats::files::{session_data_dir, session_dir, COMMAND_BAT};
 
 mod scene_info;
  pub(crate) mod resume_request;
 mod shape;
 mod summary;
+
+fn trial_mode_for_line(line: &str) -> Option<&'static str> {
+    match line {
+        "[PPFbone3 trial] backend=cpu mode=strict recipe=G-CPU+D2-CUDA"
+        | "[PPFbone3 trial] backend=cuda mode=strict recipe=G-CPU+D2-CUDA" => Some("strict"),
+        "[PPFbone3 trial] backend=cpu mode=animation recipe=G-CPU+D2-CUDA"
+        | "[PPFbone3 trial] backend=cuda mode=animation recipe=G-CPU+D2-CUDA" => Some("animation"),
+        _ => None,
+    }
+}
+
+fn command_solver_mode(command: &str) -> Option<&'static str> {
+    let mut sealed = command
+        .lines()
+        .filter_map(|line| line.strip_prefix("@rem PPF_SESSION_SOLVER_MODE="));
+    if let Some(mode) = sealed.next() {
+        return match (mode, sealed.next()) {
+            ("strict", None) => Some("strict"),
+            ("animation", None) => Some("animation"),
+            _ => None,
+        };
+    }
+    // The earlier Windows recipe explicitly froze the switch in ordinary
+    // batches. The echo line identifies those batches and the mode must
+    // agree with the actual switch assignment.
+    let mut labels = command.lines()
+        .filter_map(|line| line.strip_prefix("@echo ").and_then(trial_mode_for_line));
+    let mut switches = command.lines().filter_map(|line| {
+        line.strip_prefix("@set \"PPF_ANIMATION_BOUNDED_PROGRESS=")
+            .and_then(|value| value.strip_suffix('"'))
+    });
+    match (labels.next(), labels.next(), switches.next(), switches.next()) {
+        (Some("strict"), None, Some(""), None) => Some("strict"),
+        (Some("animation"), None, Some("1"), None) => Some("animation"),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn check_legacy_r14_animation_resume(command_path: &std::path::Path, stdout_path: &std::path::Path) -> Result<(), String> {
+    use std::io::{BufRead, BufReader};
+
+    let command = std::fs::read_to_string(command_path).map_err(|e| format!("read solver run script: {e}"))?;
+    if !command.contains("_r14_solver_launcher.py") || command.contains(" --sealed-solver-mode=") {
+        return Ok(());
+    }
+    let log = match std::fs::File::open(stdout_path) {
+        Ok(log) => log,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("read historical solver mode: {error}")),
+    };
+    if BufReader::new(log).lines().map_while(Result::ok)
+        .any(|line| trial_mode_for_line(&line) == Some("animation"))
+    {
+        return Err("LEGACY_ANIMATION_RESUME_REQUIRES_RETRANSFER: transfer again and start a new run, or resume with the previous interpreter".into());
+    }
+    Ok(())
+}
 
 /// Build the full status response value.
 ///
@@ -42,6 +100,9 @@ pub fn build_response(state: &ServerState, config: &EngineConfig) -> Value {
     }
     let state=&effective;
     let mut m = shape::base_map(state, config);
+    if config.solver_mode_v1 {
+        m.insert("solver_mode_v1".into(), json!(true));
+    }
     if retained {
         m.insert("resume_block_reason".into(), Value::String("CHECKPOINTS_FROM_PREVIOUS_BUILD".into()));
     }
@@ -64,6 +125,15 @@ pub fn build_response(state: &ServerState, config: &EngineConfig) -> Value {
         m.insert("saved_states".into(), Value::Array(saved));
 
         let info_path = session_dir(&PathBuf::from(&state.root));
+        if config.solver_mode_v1 && state.build == Build::Built {
+            // The same per-session launcher that Run and Resume use owns the
+            // mode. In particular R14 includes command.bat in its build seal.
+            if let Some(mode) = std::fs::read_to_string(info_path.join(COMMAND_BAT))
+                .ok().as_deref().and_then(command_solver_mode)
+            {
+                m.insert("solver_mode".into(), json!(mode));
+            }
+        }
         match state.solver {
             Solver::Running | Solver::Saving => {
                 let live = summary::build_live_summary(
@@ -93,6 +163,17 @@ mod tests {
     use crate::config::EngineConfig;
     use crate::PROTOCOL_VERSION;
     use ppf_cts_core::state::{Build, Data, ServerState, Solver};
+
+    #[test]
+    fn solver_mode_reports_new_seals_and_unambiguous_old_ordinary_batches() {
+        assert_eq!(command_solver_mode("@rem PPF_SESSION_SOLVER_MODE=animation\r\n"), Some("animation"));
+        assert_eq!(command_solver_mode("@rem PPF_SESSION_SOLVER_MODE=strict\n@rem PPF_SESSION_SOLVER_MODE=animation"), None);
+        let legacy = "@set \"PPF_ANIMATION_BOUNDED_PROGRESS=1\"\r\n@echo [PPFbone3 trial] backend=cpu mode=animation recipe=G-CPU+D2-CUDA\r\n";
+        assert_eq!(command_solver_mode(legacy), Some("animation"));
+        assert_eq!(command_solver_mode(&legacy.replace("=1", "=")), None);
+        assert_eq!(command_solver_mode(&legacy.replace("=1", "=").replace("mode=animation", "mode=strict")), Some("strict"));
+        assert_eq!(command_solver_mode("@echo off\npython -I _r14_solver_launcher.py"), None);
+    }
 
     #[test]
     fn ready_state_response_has_required_fields() {

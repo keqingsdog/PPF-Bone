@@ -129,3 +129,4 @@ zz_joint_patch/joint_patch.kernel.cpp
 zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz_pcg_warm_mask_history/pcg_warm_mask_history.kernel.cpp
 zz_device_tree_factor/body_factor.kernel.cpp
 zz_joint_batch8_fault/joint_batch8_fault.kernel.cpp
+contact/aabb_refit_siblings.kernel.cpp

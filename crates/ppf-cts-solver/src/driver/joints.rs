@@ -89,6 +89,7 @@ fn twist_sample_fault_with_capture(index:usize,code:u32,capture:impl FnOnce()->R
 }
 #[derive(Default)]
 pub struct Joints {
+    anchored_flight: Option<super::anchored_flight::Components>,
     shadow_identity:Option<([u8;36],[u8;64])>,
     pub soft:super::soft_joints::SoftJoints,
     pub curves:super::restoring::Curves,
@@ -168,6 +169,24 @@ pub struct View { pub frozen_ball:Option<FrozenBallView>, pub frozen_angular:Opt
     pub count: u32, pub control_count: u32,
     pub bodies: u32, pub base: u32, pub dim: u32, pub dt: f32 }
 impl View {
+    pub(super) fn with_preview_buffers(
+        mut self,
+        map: &mut impl FnMut(Handle, bool) -> Result<Handle, Fault>,
+    ) -> Result<Self, Fault> {
+        self.fault = map(self.fault, true)?;
+        self.control_tangent_fault = map(self.control_tangent_fault, true)?;
+        self.extension_tangent_fault = map(self.extension_tangent_fault, true)?;
+        if let Some(view) = self.frozen_angular.as_mut() {
+            view.fault = map(view.fault, true)?;
+        }
+        if let Some(view) = self.frozen_ball.as_mut() {
+            view.fault = map(view.fault, true)?;
+        }
+        self.curves = self.curves.map(|view| view.with_preview_buffers(map)).transpose()?;
+        self.soft = self.soft.map(|view| view.with_preview_buffers(map)).transpose()?;
+        Ok(self)
+    }
+
     pub(super) fn reduced_capture_epochs(&self)->Vec<(&'static str,Handle,u32,usize,Handle,usize,Option<(Handle,usize)>)>{
         let mut out=Vec::new();
         if let Some(f)=self.frozen_ball {out.push(("ball",f.published,f.epoch,self.count as usize,f.factors,15,Some((f.offsets,3))));}
@@ -267,8 +286,20 @@ impl Joints {
                 self.device_keys.size(device,0,AllocLabel("joints.device_keys"))?;
             },
         }
+        self.anchored_flight = if cfg!(cuda_backend)
+            && std::env::var_os("PPF_BODY_FULL_ANCHORED_FREE_FLIGHT").is_some_and(|value| value == "1")
+        {
+            super::anchored_flight::Components::build(bodies, &ball)
+        } else {
+            None
+        };
         Ok(())
     }
+
+    pub(super) fn anchored_flight_covers(&self, enabled_roots: &[u32]) -> bool {
+        self.anchored_flight.as_ref().is_some_and(|graph| graph.all_prescribed(enabled_roots))
+    }
+
     pub unsafe fn prepare_ball_cache<D:Device>(&mut self,device:&mut D,view:View)->Result<FrozenBallView,Fault> {
         // A valid device handle is supplied for every pointer even when no
         // curve pack exists. Zero counts guarantee lookup never dereferences

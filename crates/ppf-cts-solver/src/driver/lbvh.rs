@@ -49,7 +49,8 @@
 
 use ppf_cts_compute::{AllocLabel, Buffer, Device, EncoderExt, Fault, ReadbackBuffer};
 use super::kernels::{
-    AabbLeafEdgeArgs, AabbLeafFaceArgs, AabbLeafVertexArgs, AabbMergeLevelArgs, LbvhNodeDepthArgs,
+    AabbLeafEdgeArgs, AabbLeafFaceArgs, AabbLeafVertexArgs, AabbMergeLevelArgs, AabbRefitMergeThreeArgs,
+    LbvhNodeDepthArgs,
     LbvhNodesArgs, VecFillU32Args, LbvhSetParentArgs, LbvhFindRootArgs,
     LbvhCountLevelsArgs, LbvhScatterLevelsArgs,};
 use super::scene::{Fatal, FatalResult};
@@ -1080,16 +1081,79 @@ pub(crate) unsafe fn plan_vertex_leaves(
     ops.push(Box::new(move |encoder| unsafe { encoder.elements(&args, n) }));
 }
 
+fn refit_level_args(tree: &mut Tree, depth: usize) -> Option<AabbMergeLevelArgs> {
+    let levels = tree.level_offset.len().saturating_sub(1);
+    if levels <= 1 || depth >= levels {
+        return None;
+    }
+    let begin = tree.level_offset[depth] as usize;
+    let end = tree.level_offset[depth + 1] as usize;
+    let size = end - begin;
+    if size == 0 {
+        return None;
+    }
+    Some(AabbMergeLevelArgs {
+        level: tree.level_data.span(begin, size),
+        nodes: tree.node.handle(),
+        aabb: tree.aabb.span(0, tree.aabb.len()),
+        count: size as u32,
+        seam_arena_count: 0,
+    })
+}
+
+fn plan_one_level(ops: &mut Vec<RefitOp>, args: AabbMergeLevelArgs) {
+    let count = args.count;
+    ops.push(Box::new(move |encoder| unsafe { encoder.elements(&args, count) }));
+}
+
 pub(crate) fn plan_propagate(ops: &mut Vec<RefitOp>, tree: &mut Tree) {
     let levels = tree.level_offset.len().saturating_sub(1);
-    if levels <= 1 { return; }
-    for level in (0..levels).rev() {
-        let begin = tree.level_offset[level] as usize;
-        let end = tree.level_offset[level + 1] as usize;
-        let size = end - begin;
-        if size == 0 { continue; }
-        let args = AabbMergeLevelArgs { level: tree.level_data.span(begin, size), nodes: tree.node.handle(), aabb: tree.aabb.span(0, tree.aabb.len()), count: size as u32, seam_arena_count: 0 };
-        ops.push(Box::new(move |encoder| unsafe { encoder.elements(&args, size as u32) }));
+    for depth in (0..levels).rev() {
+        if let Some(args) = refit_level_args(tree, depth) {
+            plan_one_level(ops, args);
+        }
+    }
+}
+
+/// Lay out the same bottom-up dependency levels for independent trees.
+/// Multiple present trees share one dispatch. A single present tree uses
+/// the original launch. The caller builds every tree's leaves first.
+pub(crate) fn plan_refit_merge_siblings(ops: &mut Vec<RefitOp>, mut trees: [&mut Tree; 3]) {
+    let levels = trees.iter().map(|tree| tree.level_offset.len().saturating_sub(1))
+        .max().unwrap_or(0);
+    for depth in (0..levels).rev() {
+        let mut ranges = trees.iter_mut().filter_map(|tree| refit_level_args(tree, depth));
+        let Some(first) = ranges.next() else { continue; };
+        let Some(second) = ranges.next() else {
+            plan_one_level(ops, first);
+            continue;
+        };
+        let third = ranges.next();
+        // The generated CUDA launcher rounds up in u32. Leave room for
+        // a full block of 1,024 lanes even when the sum itself fits.
+        let count = first.count.checked_add(second.count)
+            .and_then(|count| count.checked_add(third.as_ref().map_or(0, |args| args.count)))
+            .filter(|&count| count <= u32::MAX - 1023);
+        let Some(count) = count else {
+            plan_one_level(ops, first);
+            plan_one_level(ops, second);
+            if let Some(args) = third { plan_one_level(ops, args); }
+            continue;
+        };
+        // The unused third slot must still name live handles for entry
+        // binding. No index reaches it when only two ranges are dispatched.
+        let unused_fallback = third.as_ref().unwrap_or(&first);
+        let args = AabbRefitMergeThreeArgs {
+            first_level: first.level, first_nodes: first.nodes, first_aabb: first.aabb,
+            first_count: first.count,
+            second_level: second.level, second_nodes: second.nodes, second_aabb: second.aabb,
+            second_count: second.count,
+            third_level: unused_fallback.level, third_nodes: unused_fallback.nodes,
+            third_aabb: unused_fallback.aabb,
+            count,
+            seam_arena_count: 0,
+        };
+        ops.push(Box::new(move |encoder| unsafe { encoder.elements(&args, count) }));
     }
 }
 

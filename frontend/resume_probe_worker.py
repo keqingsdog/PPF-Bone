@@ -59,8 +59,9 @@ def probe(scene, root, profile_loader=None, capability=None):
     output = (scene / 'output').resolve()
     if profile.platform == 'win32':
         raw = (scene / 'command.bat').read_bytes()
-        valid = adapter.verify_windows_launcher_bytes(raw, interpreter, helper,
-            profile.product_root, scene, output, profile.runtime_dir, backend)
+        valid = any(adapter.verify_windows_launcher_bytes(raw, interpreter, helper,
+            profile.product_root, scene, output, profile.runtime_dir, backend, mode)
+            for mode in (None, 'strict', 'animation'))
     elif profile.local_source and profile.platform in ('linux', 'darwin'):
         prefix = 'export PPF_BACKEND=' + backend + '\n' if backend else ''
         frozen = ['--frozen-python-target', profile.python_target] if backend else []

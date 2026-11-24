@@ -25,6 +25,13 @@ def require_pcg_precision(scene, profile, child_env):
 
 
 def main(argv):
+    solver_mode = 'strict'
+    sealed_mode = len(argv) > 1 and argv[1].startswith('--sealed-solver-mode=')
+    if sealed_mode:
+        solver_mode = argv[1].split('=', 1)[1]
+        if solver_mode not in ('strict', 'animation'):
+            raise ValueError('R14_SOLVER_MODE_INVALID')
+        argv = [argv[0], *argv[2:]]
     # Generated v2 POSIX commands carry a canonical target frozen at Build.
     # Normalize this protected launcher argument before the existing routing
     # parser so solver arguments and query-backend retain their old positions.
@@ -94,13 +101,17 @@ def main(argv):
     if len(argv) < 7 or argv[1].startswith('--') or argv[2] != '--path' or argv[4] != '--output' or argv[6] != '--':
         raise ValueError('R14_LAUNCHER_USAGE: ROOT --path SCENE --output OUTPUT -- SOLVER_ARGS')
     profile = load_profile(argv[1])
+    if solver_mode == 'animation' and (
+        os.name != 'nt' or not profile.local_source or profile.backend not in ('cpu', 'cuda')
+    ):
+        raise ValueError('R14_SOLVER_MODE_UNSUPPORTED')
     verify_binaries(profile)
     scene, output = Path(argv[3]), Path(argv[5])
     if not scene.is_absolute() or not output.is_absolute():
         raise ValueError('R14_LAUNCHER_ABSOLUTE_PATHS_REQUIRED')
     identity = verify_binaries(profile)
     forwarded = argv[7:]
-    protected = {'--product-root', '--root', '--path', '--output', '--query-backend', '--await-parent-job', '--frozen-python-target'}
+    protected = {'--product-root', '--root', '--path', '--output', '--query-backend', '--await-parent-job', '--frozen-python-target', '--sealed-solver-mode'}
     if any(arg.split('=', 1)[0] in protected for arg in forwarded):
         raise ValueError('R14_LAUNCHER_ROUTING_OVERRIDE_FORBIDDEN')
     if any(arg == '--async-output' or arg.startswith('--async-output=') for arg in forwarded):
@@ -113,6 +124,12 @@ def main(argv):
     v2_resume = load > 0 and mode is None and resume.v2_history_candidate(output, load)
     rebind = load > 0 and (mode == 'continuous_from_current' or v2_resume)
     child_env = solver_child_env(profile, os.environ)
+    child_env.pop('PPF_ANIMATION_BOUNDED_PROGRESS', None)
+    if os.name == "nt" and profile.local_source:
+        trial_options = sibling('_bone_trial_options')
+        if not sealed_mode and load != 0:
+            trial_options.check_legacy_r14_animation_resume(scene / 'stdout.log')
+        trial_options.solver_env(child_env, profile.backend, solver_mode)
     capability = None
     if target is not None or mode is not None or v2_resume:
         capability = resume.capability(profile, child_env, 'continuous_from_current' if rebind else mode)

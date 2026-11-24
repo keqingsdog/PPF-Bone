@@ -54,7 +54,7 @@ def _product_launcher_bytes(content, product):
     """Keep Linux source shell LF; retain legacy and Windows batch CRLF."""
     content.decode("utf-8")
     normalized = content.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
-    if product.local_source and product.platform in ("linux", "darwin"):
+    if product is not None and product.local_source and product.platform in ("linux", "darwin"):
         return normalized
     return normalized.replace(b"\n", b"\r\n")
 
@@ -129,7 +129,10 @@ class SessionExport:
         from . import _r14_product_adapter as r14
         from ._build_contract_ import optional_contract_for
         contract = optional_contract_for(self._fixed_session.fixed_scene)
+        mode = getattr(self._fixed_session.fixed_scene, "_solver_mode", "strict")
         product = contract.profile if contract is not None else None
+        if mode == "animation" and (os.name != "nt" or (product is not None and not product.local_source)):
+            raise ValueError("Current solver product does not support Animation Mode")
         require_fp32_pcg(param)
         if product is not None:
             # Pin the actual exported input before launcher generation and seal.
@@ -141,8 +144,10 @@ class SessionExport:
             # Preserve the original runtime probe/extension stamp gate.
             _run_directory(contract=contract)
             command_path = r14.write_launcher(product, self._fixed_session.info.path,
-                                              self._fixed_session.output.path)
+                                              self._fixed_session.output.path,
+                                              solver_mode=mode if os.name == "nt" else None)
         else:
+            build_dir = _run_directory(contract=contract)
             command_path = _rust.write_shell_command_script(
                 self._fixed_session.info.path,
                 self._fixed_session.output.path,
@@ -152,15 +157,18 @@ class SessionExport:
                 # (``App.get_backend``), checked to hold a solver built from
                 # the same sources as this process's extension module. A path
                 # composed here instead would name a build nobody asked about.
-                _run_directory(contract=contract),
+                build_dir,
             )
+            if os.name == "nt":
+                from ._bone_trial_options import configure_ordinary_batch
+                configure_ordinary_batch(command_path, build_dir, mode)
         fixed = self._fixed_session.fixed_scene
         if getattr(fixed, "_collision_filter", None) is not None or getattr(fixed, "_static_collision_filter", None) is not None:
             from ._collision_filter_ import require_command
             require_command(command_path)
-        if product is not None:
+        if product is not None or os.name == "nt":
             # The legacy collision hook uses universal-newline text IO. Restore
-            # the final product batch encoding here, before the caller seals it.
+            # the batch line endings before the caller seals the command.
             with open(command_path, "rb") as handle:
                 launcher_bytes = handle.read()
             with open(command_path, "wb") as handle:

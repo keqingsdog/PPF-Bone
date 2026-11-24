@@ -65,6 +65,11 @@
 #include "contact_assembly.kernel.cpp"
 #include "contact_statistics.kernel.cpp"
 
+// Only the CPU scratch launch can use the reserved witness capacity.
+[[seam::device_fn]] bool contact_query_witness_mode(unsigned dyn_capacity) {
+    return compute::has_contact_query_witness && dyn_capacity == 0xffffffffu;
+}
+
 // Two edges that meet at a vertex are adjacent rather than in contact: their
 // closest points coincide at the shared vertex, so the separation is zero and
 // no barrier is defined there.
@@ -392,17 +397,32 @@ template <unsigned N, bool InteriorVF = false>
     unsigned statistics_contact_count_size,
     const unsigned *statistics_object_index,
     unsigned statistics_object_index_size,
-    CcdOverlapRecord &out_overlap, DiagHandle diag) {
+    CcdOverlapRecord &out_overlap, DiagHandle diag, bool witness_only) {
     for (unsigned i = 0; i < 4u; ++i) {
         out_slot[i] = 0u;
     }
     const unsigned vertex_index = first_index;
     const unsigned face_index = second_index;
+    if (witness_only) {
+        const bool pair_in_range = vertex_index < statistics_object_index_size &&
+                                   face_index < statistics_contact_count_size;
+        DIAG_ASSERT4(diag, pair_in_range, float(vertex_index), float(face_index),
+                     float(statistics_object_index_size), float(statistics_contact_count_size));
+        if (!pair_in_range) return false;
+    }
     const Vec3u f = face[face_index];
+    if (witness_only) {
+        const bool vertices_in_range = f[0] < statistics_object_index_size && f[1] < statistics_object_index_size && f[2] < statistics_object_index_size;
+        DIAG_ASSERT4(diag, vertices_in_range, float(f[0]), float(f[1]),
+                     float(face_index), float(statistics_object_index_size));
+        if (!vertices_in_range) return false;
+    }
     // Thread-space copies, which the MSL rendering needs before it can bind
     // them to the side constructors' references.
     const VertexProp vprop = vertex_prop[vertex_index];
     const VertexProp fanchor = vertex_prop[f[0]];
+    if (witness_only && vprop.pdrd_body_index != 0u &&
+        vprop.pdrd_body_index == fanchor.pdrd_body_index) return false;
     const FaceProp fprop = face_prop[face_index];
     if (!contact_pair_admitted(pair_side_of_vertex(vprop, vertex_index),
                                pair_side_of_face(fanchor, fprop, f),
@@ -428,6 +448,12 @@ template <unsigned N, bool InteriorVF = false>
                     c[2] * (p - t2).cast<float>();
     proximity::point_triangle_interior_separation<float, float>(
         p, t0, t1, t2, c, e);
+    if (witness_only) {
+        const bool params_in_range = vprop.param_index < barrier_id && fprop.param_index < row_count;
+        DIAG_ASSERT4(diag, params_in_range, float(vprop.param_index), float(fprop.param_index),
+                     float(barrier_id), float(row_count));
+        if (!params_in_range) return false;
+    }
     const VertexParam vparam =
         vertex_param[vertex_prop[vertex_index].param_index];
     const FaceParam fparam = face_param[face_prop[face_index].param_index];
@@ -439,6 +465,9 @@ template <unsigned N, bool InteriorVF = false>
     if (!(e.squaredNorm() < reach * reach)) {
         return false;
     }
+    // Positive queries replay all observable writes and diagnostics. For PE,
+    // this also replays incident-face multiplicity before embedding.
+    if (witness_only) return true;
     unsigned index[4];
     index[0] = vertex_index;
     index[1] = f[0];
@@ -527,15 +556,30 @@ template <unsigned N, bool InteriorVF = false>
     unsigned statistics_contact_count_size,
     const unsigned *statistics_object_index,
     unsigned statistics_object_index_size,
-    CcdOverlapRecord &out_overlap, DiagHandle diag) {
+    CcdOverlapRecord &out_overlap, DiagHandle diag, bool witness_only) {
     for (unsigned i = 0; i < 4u; ++i) {
         out_slot[i] = 0u;
     }
     const unsigned vertex_index = first_index;
     const unsigned edge_index = second_index;
+    if (witness_only) {
+        const bool pair_in_range = vertex_index < statistics_object_index_size &&
+                                   edge_index < statistics_contact_count_size;
+        DIAG_ASSERT4(diag, pair_in_range, float(vertex_index), float(edge_index),
+                     float(statistics_object_index_size), float(statistics_contact_count_size));
+        if (!pair_in_range) return false;
+    }
     const Vec2u f = edge[edge_index];
+    if (witness_only) {
+        const bool vertices_in_range = f[0] < statistics_object_index_size && f[1] < statistics_object_index_size;
+        DIAG_ASSERT4(diag, vertices_in_range, float(f[0]), float(f[1]),
+                     float(edge_index), float(statistics_object_index_size));
+        if (!vertices_in_range) return false;
+    }
     const VertexProp vprop = vertex_prop[vertex_index];
     const VertexProp eanchor = vertex_prop[f[0]];
+    if (witness_only && vprop.pdrd_body_index != 0u &&
+        vprop.pdrd_body_index == eanchor.pdrd_body_index) return false;
     const EdgeProp eprop = edge_prop[edge_index];
     if (!contact_pair_admitted(pair_side_of_vertex(vprop, vertex_index),
                                pair_side_of_edge(eanchor, eprop, f),
@@ -556,6 +600,12 @@ template <unsigned N, bool InteriorVF = false>
     }
     const Vec3f e =
         c[0] * (p - t0).cast<float>() + c[1] * (p - t1).cast<float>();
+    if (witness_only) {
+        const bool params_in_range = vprop.param_index < barrier_id && eprop.param_index < row_count;
+        DIAG_ASSERT4(diag, params_in_range, float(vprop.param_index), float(eprop.param_index),
+                     float(barrier_id), float(row_count));
+        if (!params_in_range) return false;
+    }
     const VertexParam vparam =
         vertex_param[vertex_prop[vertex_index].param_index];
     const EdgeParam eparam = edge_param[edge_prop[edge_index].param_index];
@@ -567,6 +617,9 @@ template <unsigned N, bool InteriorVF = false>
     if (!(e.squaredNorm() < reach * reach)) {
         return false;
     }
+    // Positive queries replay all observable writes and diagnostics. For PE,
+    // this also replays incident-face multiplicity before embedding.
+    if (witness_only) return true;
     unsigned multiplicity = 0u;
     bool include_friction = true;
     if (has_edge_face != 0u &&
@@ -940,11 +993,25 @@ template <unsigned N, bool InteriorVF = false>
     }
     const unsigned edge_index = first_index;
     const unsigned other = second_index;
+    // The fused EE launch reserves 16 times its query count, so UINT_MAX
+    // cannot be a production capacity. Only the host scratch launch sets it.
+    const bool witness_only = contact_query_witness_mode(dyn_capacity);
+    const bool pair_in_range = !witness_only ||
+        (edge_index < statistics_contact_count_size && other < statistics_contact_count_size);
+    DIAG_ASSERT4(diag, pair_in_range, float(edge_index), float(other),
+                 float(statistics_contact_count_size), 0.0f);
+    if (!pair_in_range) return false;
     if (!(edge_index < other)) {
         return false;
     }
     const Vec2u e0 = edge[edge_index];
     const Vec2u e1 = edge[other];
+    if (witness_only) {
+        const unsigned nvert = statistics_object_index_size;
+        const bool vertices_in_range = e0[0] < nvert && e0[1] < nvert && e1[0] < nvert && e1[1] < nvert;
+        DIAG_ASSERT4(diag, vertices_in_range, float(e0[0]), float(e0[1]), float(e1[0]), float(e1[1]));
+        if (!vertices_in_range) return false;
+    }
     if (edges_share_a_vertex(e0, e1)) {
         return false;
     }
@@ -970,6 +1037,13 @@ template <unsigned N, bool InteriorVF = false>
     const Vec3f y0 = float(c[0]) * p0 + float(c[1]) * p1;
     const Vec3f y1 = float(c[2]) * q0 + float(c[3]) * q1;
     const Vec3f e = (y0 - y1).cast<float>();
+    if (witness_only) {
+        // The probe carries the EdgeParam count in the unused CSR row count.
+        const bool params_in_range = eprop_a.param_index < row_count && eprop_b.param_index < row_count;
+        DIAG_ASSERT4(diag, params_in_range, float(eprop_a.param_index), float(eprop_b.param_index),
+                     float(row_count), 0.0f);
+        if (!params_in_range) return false;
+    }
     const EdgeParam eparam_a = edge_param[edge_prop[edge_index].param_index];
     const EdgeParam eparam_b = edge_param[edge_prop[other].param_index];
     const float offset = eparam_a.offset + eparam_b.offset;
@@ -980,6 +1054,9 @@ template <unsigned N, bool InteriorVF = false>
     if (!(e.squaredNorm() < reach * reach)) {
         return false;
     }
+    // Everything observable starts below: force, matrix and overlap writes,
+    // statistics and embed diagnostics. A positive witness must replay.
+    if (witness_only) return true;
     unsigned index[4];
     index[0] = e0[0];
     index[1] = e0[1];
@@ -1108,10 +1185,10 @@ struct ContactPointFaceEmbed {
         overlap.elem1 = 0u;
         overlap.d2 = 0.0f;
         overlap.offset = 0.0f;
-        if (contact_point_face_at(x0, x, face, vertex_prop, start_link_index, start_link_offset, has_start_link, face_prop, vertex_param, face_param, fixed_index, fixed_offset, fixed_value, row_count, friction_mode, barrier_id, friction_eps, residual, dt, query_index, primitive, slot, out_vertex_force, out_fixed_value, dyn_claim, dyn_row, dyn_column, dyn_block, dyn_capacity, statistics_contact_count, statistics_contact_count_size, statistics_object_index, statistics_object_index_size, overlap, diag)) {
+        if (contact_point_face_at(x0, x, face, vertex_prop, start_link_index, start_link_offset, has_start_link, face_prop, vertex_param, face_param, fixed_index, fixed_offset, fixed_value, row_count, friction_mode, barrier_id, friction_eps, residual, dt, query_index, primitive, slot, out_vertex_force, out_fixed_value, dyn_claim, dyn_row, dyn_column, dyn_block, dyn_capacity, statistics_contact_count, statistics_contact_count_size, statistics_object_index, statistics_object_index_size, overlap, diag, contact_query_witness_mode(dyn_capacity))) {
             ++count;
         }
-        if (overlap.flagged != 0u && out_overlap[query_index].flagged == 0u) {
+        if (!contact_query_witness_mode(dyn_capacity) && overlap.flagged != 0u && out_overlap[query_index].flagged == 0u) {
             out_overlap[query_index] = overlap;
         }
         return true;
@@ -1166,12 +1243,18 @@ struct ContactPointFaceEmbed {
     compute::atomic_uint_t *assembled,
     CcdOverlapRecord *out_overlap, DiagHandle diag,
     unsigned element) {
+    const bool witness_only = contact_query_witness_mode(dyn_capacity);
+    if (witness_only) compute::atomic_store(assembled + element, 0u);
     const AABB box = query[element];
     if (!box.active) {
         return;
     }
     ContactPointFaceEmbed embed{x0, x, face, vertex_prop, start_link_index, start_link_offset, has_start_link, face_prop, vertex_param, face_param, fixed_index, fixed_offset, fixed_value, row_count, friction_mode, barrier_id, friction_eps, residual, dt, out_vertex_force, out_fixed_value, dyn_claim, dyn_row, dyn_column, dyn_block, dyn_capacity, statistics_contact_count, statistics_contact_count_size, statistics_object_index, statistics_object_index_size, out_overlap, element, diag, 0u};
     aabb_query(node, node_count, tree_aabb, root, embed, box, diag);
+    if (witness_only) {
+        compute::atomic_store(assembled + element, embed.count > 0u ? 1u : 0u);
+        return;
+    }
     if (embed.count > 0u) {
         compute::atomic_add(assembled, embed.count);
     }
@@ -1225,7 +1308,7 @@ struct ContactPointFaceEmbed {
     overlap.elem1 = 0u;
     overlap.d2 = 0.0f;
     overlap.offset = 0.0f;
-    const bool accepted = contact_point_face_at(x0, x, face, vertex_prop, start_link_index, start_link_offset, has_start_link, face_prop, vertex_param, face_param, fixed_index, fixed_offset, fixed_value, row_count, friction_mode, barrier_id, friction_eps, residual, dt, pair[2 * k], pair[2 * k + 1], slot, out_vertex_force, out_fixed_value, dyn_claim, dyn_row, dyn_column, dyn_block, dyn_capacity, statistics_contact_count, statistics_contact_count_size, statistics_object_index, statistics_object_index_size, overlap, diag);
+    const bool accepted = contact_point_face_at(x0, x, face, vertex_prop, start_link_index, start_link_offset, has_start_link, face_prop, vertex_param, face_param, fixed_index, fixed_offset, fixed_value, row_count, friction_mode, barrier_id, friction_eps, residual, dt, pair[2 * k], pair[2 * k + 1], slot, out_vertex_force, out_fixed_value, dyn_claim, dyn_row, dyn_column, dyn_block, dyn_capacity, statistics_contact_count, statistics_contact_count_size, statistics_object_index, statistics_object_index_size, overlap, diag, false);
     if (overlap.flagged != 0u && out_overlap[k].flagged == 0u) {
         out_overlap[k] = overlap;
     }
@@ -1302,10 +1385,10 @@ struct ContactPointEdgeEmbed {
         overlap.elem1 = 0u;
         overlap.d2 = 0.0f;
         overlap.offset = 0.0f;
-        if (contact_point_edge_at(x0, x, face, edge, vertex_prop, start_link_index, start_link_offset, has_start_link, edge_prop, vertex_param, edge_param, edge_face_index, edge_face_offset, has_edge_face, fixed_index, fixed_offset, fixed_value, row_count, friction_mode, barrier_id, friction_eps, residual, dt, query_index, primitive, slot, out_vertex_force, out_fixed_value, dyn_claim, dyn_row, dyn_column, dyn_block, dyn_capacity, statistics_contact_count, statistics_contact_count_size, statistics_object_index, statistics_object_index_size, overlap, diag)) {
+        if (contact_point_edge_at(x0, x, face, edge, vertex_prop, start_link_index, start_link_offset, has_start_link, edge_prop, vertex_param, edge_param, edge_face_index, edge_face_offset, has_edge_face, fixed_index, fixed_offset, fixed_value, row_count, friction_mode, barrier_id, friction_eps, residual, dt, query_index, primitive, slot, out_vertex_force, out_fixed_value, dyn_claim, dyn_row, dyn_column, dyn_block, dyn_capacity, statistics_contact_count, statistics_contact_count_size, statistics_object_index, statistics_object_index_size, overlap, diag, contact_query_witness_mode(dyn_capacity))) {
             ++count;
         }
-        if (overlap.flagged != 0u && out_overlap[query_index].flagged == 0u) {
+        if (!contact_query_witness_mode(dyn_capacity) && overlap.flagged != 0u && out_overlap[query_index].flagged == 0u) {
             out_overlap[query_index] = overlap;
         }
         return true;
@@ -1355,12 +1438,18 @@ struct ContactPointEdgeEmbed {
     compute::atomic_uint_t *assembled,
     CcdOverlapRecord *out_overlap, DiagHandle diag,
     unsigned element) {
+    const bool witness_only = contact_query_witness_mode(dyn_capacity);
+    if (witness_only) compute::atomic_store(assembled + element, 0u);
     const AABB box = query[element];
     if (!box.active) {
         return;
     }
     ContactPointEdgeEmbed embed{x0, x, face, edge, vertex_prop, start_link_index, start_link_offset, has_start_link, edge_prop, vertex_param, edge_param, edge_face_index, edge_face_offset, has_edge_face, fixed_index, fixed_offset, fixed_value, row_count, friction_mode, barrier_id, friction_eps, residual, dt, out_vertex_force, out_fixed_value, dyn_claim, dyn_row, dyn_column, dyn_block, dyn_capacity, statistics_contact_count, statistics_contact_count_size, statistics_object_index, statistics_object_index_size, out_overlap, element, diag, 0u};
     aabb_query(node, node_count, tree_aabb, root, embed, box, diag);
+    if (witness_only) {
+        compute::atomic_store(assembled + element, embed.count > 0u ? 1u : 0u);
+        return;
+    }
     if (embed.count > 0u) {
         compute::atomic_add(assembled, embed.count);
     }
@@ -1416,7 +1505,7 @@ struct ContactPointEdgeEmbed {
     overlap.elem1 = 0u;
     overlap.d2 = 0.0f;
     overlap.offset = 0.0f;
-    const bool accepted = contact_point_edge_at(x0, x, face, edge, vertex_prop, start_link_index, start_link_offset, has_start_link, edge_prop, vertex_param, edge_param, edge_face_index, edge_face_offset, has_edge_face, fixed_index, fixed_offset, fixed_value, row_count, friction_mode, barrier_id, friction_eps, residual, dt, pair[2 * k], pair[2 * k + 1], slot, out_vertex_force, out_fixed_value, dyn_claim, dyn_row, dyn_column, dyn_block, dyn_capacity, statistics_contact_count, statistics_contact_count_size, statistics_object_index, statistics_object_index_size, overlap, diag);
+    const bool accepted = contact_point_edge_at(x0, x, face, edge, vertex_prop, start_link_index, start_link_offset, has_start_link, edge_prop, vertex_param, edge_param, edge_face_index, edge_face_offset, has_edge_face, fixed_index, fixed_offset, fixed_value, row_count, friction_mode, barrier_id, friction_eps, residual, dt, pair[2 * k], pair[2 * k + 1], slot, out_vertex_force, out_fixed_value, dyn_claim, dyn_row, dyn_column, dyn_block, dyn_capacity, statistics_contact_count, statistics_contact_count_size, statistics_object_index, statistics_object_index_size, overlap, diag, false);
     if (overlap.flagged != 0u && out_overlap[k].flagged == 0u) {
         out_overlap[k] = overlap;
     }
@@ -1796,12 +1885,18 @@ struct ContactEdgeEdgeEmbed {
     compute::atomic_uint_t *assembled,
     CcdOverlapRecord *out_overlap, DiagHandle diag,
     unsigned element) {
+    const bool witness_only = contact_query_witness_mode(dyn_capacity);
+    if (witness_only) compute::atomic_store(assembled + element, 0u);
     const AABB box = query[element];
     if (!box.active) {
         return;
     }
     ContactEdgeEdgeEmbed embed{x0, x, edge, vertex_prop, start_link_index, start_link_offset, has_start_link, edge_prop, edge_param, fixed_index, fixed_offset, fixed_value, row_count, friction_mode, barrier_id, friction_eps, residual, dt, out_vertex_force, out_fixed_value, dyn_claim, dyn_row, dyn_column, dyn_block, dyn_capacity, statistics_contact_count, statistics_contact_count_size, statistics_object_index, statistics_object_index_size, out_overlap, element, diag, 0u};
     aabb_query(node, node_count, tree_aabb, root, embed, box, diag);
+    if (witness_only) {
+        compute::atomic_store(assembled + element, embed.count > 0u ? 1u : 0u);
+        return;
+    }
     if (embed.count > 0u) {
         compute::atomic_add(assembled, embed.count);
     }

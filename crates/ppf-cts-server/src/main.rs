@@ -164,6 +164,7 @@ async fn main() -> anyhow::Result<()> {
     );
     config.solver_target_dir = solver.target_dir;
     config.solver_backend = solver.backend;
+    config.solver_mode_v1 = solver.solver_mode_v1;
     let src_roots: Vec<std::path::PathBuf> = if let Ok(override_paths) =
         std::env::var("PPF_CTS_LOG_SRC_DIR")
     {

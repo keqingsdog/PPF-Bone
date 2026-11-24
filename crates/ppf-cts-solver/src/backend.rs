@@ -23,6 +23,9 @@ use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
 
+#[path = "animation_work.rs"]
+pub(crate) mod animation_work;
+
 #[cfg(all(test,feature="cpu"))]
 #[path="backend_sampler_test.rs"]
 mod backend_sampler_test;
@@ -80,6 +83,176 @@ impl crate::driver::adaptive_controller::DtParameter for ParamSet {
 
 pub(crate) fn adaptive_cg_retry_enabled() -> bool {
     std::env::var_os("PPF_ADAPTIVE_CG_RETRY").is_some_and(|v| v == "1")
+}
+
+/// The interactive animation preview has its own, non-checkpointed h policy.
+/// All numerical acceptance checks belong to the same native advance paths.
+struct AnimationStepPolicy {
+    multiplier: f32,
+    clean_accepts: u8,
+}
+
+/// An opt-in animation profile that tests the frame period first. A partial
+/// step can still be useful when it advances more than the authored step.
+#[derive(Default)]
+struct EagerAnimationStepPolicy {
+    ceiling: Option<f32>,
+    slow_accepts: u8,
+    recovery_accepts: u8,
+}
+
+impl EagerAnimationStepPolicy {
+    fn choose(&self, authored: f32, fps: f64) -> f32 {
+        let frame_period = (1.0 / fps) as f32;
+        if !authored.is_finite() || authored <= 0.0 || !frame_period.is_finite()
+            || frame_period <= authored {
+            return authored;
+        }
+        self.ceiling.unwrap_or(frame_period).clamp(authored, frame_period)
+    }
+
+    fn observe(&mut self, authored: f32, requested: f32, final_requested: f32,
+        accepted: f64, rejections: u32, authored_boundary: bool)
+    {
+        if !accepted.is_finite() || accepted <= 0.0 {
+            self.slow_accepts = 0;
+            self.recovery_accepts = 0;
+            return;
+        }
+        if rejections != 0 {
+            self.ceiling = Some(final_requested.min(requested * 0.5).max(authored));
+            self.slow_accepts = 0;
+            self.recovery_accepts = 0;
+            return;
+        }
+        if authored_boundary {
+            self.slow_accepts = 0;
+            return;
+        }
+        let ordinary_scale = f64::from(authored);
+        if accepted < 0.75 * ordinary_scale {
+            self.recovery_accepts = 0;
+            self.slow_accepts += 1;
+            if self.slow_accepts >= 2 {
+                self.ceiling = Some((requested * 0.5).max(authored));
+                self.slow_accepts = 0;
+            }
+        } else {
+            self.slow_accepts = 0;
+            let enough_advance = accepted >= (0.9 * f64::from(requested)).min(ordinary_scale);
+            if self.ceiling.is_some() && enough_advance {
+                self.recovery_accepts += 1;
+                if self.recovery_accepts >= 2 {
+                    self.ceiling = Some(requested * 2.0);
+                    self.recovery_accepts = 0;
+                }
+            } else {
+                self.recovery_accepts = 0;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod animation_step_policy_tests {
+    use super::{AnimationStepPolicy, EagerAnimationStepPolicy};
+
+    #[test]
+    fn eager_keeps_a_useful_partial_step_and_ignores_event_clipping() {
+        let mut policy = EagerAnimationStepPolicy::default();
+        let cap = policy.choose(0.01, 25.0);
+        assert_eq!(cap, 0.04);
+        for _ in 0..8 {
+            policy.observe(0.01, cap, cap, 0.025, 0, false);
+            policy.observe(0.01, cap, cap, 0.002, 0, true);
+        }
+        assert_eq!(policy.choose(0.01, 25.0), cap);
+    }
+
+    #[test]
+    fn invalid_accepted_advances_do_not_raise_either_ceiling() {
+        let mut eager = EagerAnimationStepPolicy { ceiling: Some(0.02), ..Default::default() };
+        let mut conservative = AnimationStepPolicy::new();
+        for accepted in [f64::NAN, f64::INFINITY, 0.0, -1.0] {
+            for _ in 0..4 {
+                eager.observe(0.01, 0.02, 0.02, accepted, 0, false);
+                conservative.observe(0.01, 0.01, accepted, 0);
+            }
+        }
+        assert_eq!(eager.choose(0.01, 25.0), 0.02);
+        assert_eq!(conservative.choose(0.01, 25.0), 0.01);
+    }
+
+    #[test]
+    fn eager_backs_off_then_quickly_recovers() {
+        let mut policy = EagerAnimationStepPolicy::default();
+        assert_eq!(policy.choose(0.01, 25.0), 0.04);
+        policy.observe(0.01, 0.04, 0.01, 0.009, 1, false);
+        assert_eq!(policy.choose(0.01, 25.0), 0.01);
+        for _ in 0..2 { policy.observe(0.01, 0.01, 0.01, 0.01, 0, false); }
+        assert_eq!(policy.choose(0.01, 25.0), 0.02);
+        for _ in 0..2 { policy.observe(0.01, 0.02, 0.02, 0.005, 0, false); }
+        assert_eq!(policy.choose(0.01, 25.0), 0.01);
+    }
+
+    #[test]
+    fn grows_after_success_and_reduces_after_a_retry() {
+        let mut policy = AnimationStepPolicy::new();
+        assert_eq!(policy.choose(0.005, 25.0), 0.005);
+        for _ in 0..3 {
+            policy.observe(0.005, 0.005, 0.005, 0);
+        }
+        let larger = policy.choose(0.005, 25.0);
+        assert!(larger > 0.005);
+        policy.observe(0.005, larger, 0.005, 1);
+        assert_eq!(policy.choose(0.005, 25.0), 0.005);
+    }
+
+    #[test]
+    fn grows_at_most_one_output_period_and_keeps_coarser_authored_h() {
+        let policy = AnimationStepPolicy { multiplier: 100.0, clean_accepts: 0 };
+        assert_eq!(policy.choose(0.005, 25.0), 0.04);
+        assert_eq!(policy.choose(0.05, 25.0), 0.05);
+        assert_eq!(policy.choose(0.005, 0.0), 0.005);
+    }
+}
+
+impl AnimationStepPolicy {
+    fn new() -> Self {
+        Self { multiplier: 1.0, clean_accepts: 0 }
+    }
+
+    fn choose(&self, authored: f32, fps: f64) -> f32 {
+        let frame_period = (1.0 / fps) as f32;
+        if !authored.is_finite() || authored <= 0.0 || !frame_period.is_finite()
+            || frame_period <= authored {
+            return authored;
+        }
+        (authored * self.multiplier).min(frame_period)
+    }
+
+    fn observe(&mut self, authored: f32, requested: f32, accepted: f64, rejections: u32) {
+        if !accepted.is_finite() || accepted <= 0.0 {
+            self.clean_accepts = 0;
+            return;
+        }
+        // A typed retry or materially clipped candidate gives the controller
+        // a safer next h. Author events may also clip an individual step.
+        if rejections != 0 || accepted < 0.9 * f64::from(requested) {
+            if requested > authored {
+                self.multiplier = (self.multiplier * 0.5).max(1.0);
+            }
+            self.clean_accepts = 0;
+        } else {
+            self.clean_accepts += 1;
+            if self.clean_accepts >= 3 {
+                // Bound growth per clean group; the physical ceiling is the
+                // authored output frame period, not a scene-size heuristic.
+                self.multiplier = (self.multiplier * 1.5).min(f32::MAX);
+                self.clean_accepts = 0;
+            }
+        }
+    }
 }
 
 /// Own the device-side previous-position snapshot for exactly one backend
@@ -637,6 +810,149 @@ pub struct State {
     pub curr_frame: i32,
 }
 
+/// Pose bindings from the validated material scene are constant for one run.
+#[derive(Clone)]
+struct FemPosePublication {
+    scene_uuid: String,
+    scene_inputs_sha256: String,
+    payload_sha256: String,
+    bindings: Vec<crate::soft_pose_output::MaterialBinding>,
+}
+
+enum FemPosePublicationMode {
+    PerFrame,
+    Cached(Option<FemPosePublication>),
+}
+
+impl FemPosePublicationMode {
+    fn for_frame(&self, scene: &Scene) -> Option<std::borrow::Cow<'_, FemPosePublication>> {
+        match self {
+            Self::Cached(publication) => publication.as_ref().map(std::borrow::Cow::Borrowed),
+            Self::PerFrame => {
+                let input = scene.joint_input.as_ref()?;
+                let owned = crate::soft_joint::prepare(input).expect("FEM retained input identity");
+                FemPosePublication::from_owned(owned.as_ref()).expect("FEM pose binding")
+                    .map(std::borrow::Cow::Owned)
+            }
+        }
+    }
+}
+
+impl FemPosePublication {
+    fn from_owned(owned: Option<&crate::soft_joint::OwnedSoftScene>) -> Result<Option<Self>, String> {
+        let Some(owned) = owned else { return Ok(None); };
+        let bindings = crate::soft_pose_output::bindings_from_owned(owned)?;
+        if bindings.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            scene_uuid: owned.scene_uuid.clone(),
+            scene_inputs_sha256: owned.scene_inputs_sha256.clone(),
+            payload_sha256: owned.payload_sha256.clone(),
+            bindings,
+        }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn frame(
+        &self,
+        vertices: &[u8],
+        frame: i32,
+        time: f64,
+        start: f64,
+        end: f64,
+        steps: u64,
+        controls: Option<&crate::fem_control_events::OutputEvidence>,
+    ) -> crate::soft_pose_output::PoseFrame {
+        let mut pose = crate::soft_pose_output::PoseFrame::from_vertices(
+            self.scene_uuid.clone(),
+            self.scene_inputs_sha256.clone(),
+            self.payload_sha256.clone(),
+            vertices,
+            u32::try_from(frame).expect("negative FEM pose frame"),
+            time,
+            start,
+            end,
+            steps,
+            &self.bindings,
+        ).expect("accepted FEM material frame validation");
+        if let Some(controls) = controls {
+            pose.version = 2;
+            pose.constrained_root_state_authority = "native_fem_control_segments_v2".into();
+            pose.control_program_sha256 = Some(controls.program_sha256.clone());
+            pose.control_segments = Some(controls.rows.clone());
+        }
+        pose
+    }
+}
+
+
+#[cfg(test)]
+mod fem_pose_publication_tests {
+    use super::FemPosePublication;
+    use crate::soft_joint::{BodyWire, OwnedSoftScene};
+
+    // The cross-only shape produced by prepare_batch contains no material bodies.
+    fn cross_only() -> OwnedSoftScene {
+        OwnedSoftScene {
+            scene_uuid: "11111111-1111-1111-1111-111111111111".into(),
+            scene_inputs_sha256: "1".repeat(64),
+            payload_sha256: String::new(),
+            controlled_vertices: Vec::new(),
+            control_receipt: serde_json::Value::Null,
+            control_events: None,
+            bodies: Vec::new(),
+            wires: Vec::new(),
+            records: Vec::new(),
+            extensions: None,
+            connected_collision: None,
+        }
+    }
+
+    #[test]
+    fn absent_and_cross_only_inputs_do_not_publish_fem() {
+        assert!(FemPosePublication::from_owned(None).unwrap().is_none());
+        assert!(FemPosePublication::from_owned(Some(&cross_only())).unwrap().is_none());
+    }
+
+    #[test]
+    fn binding_errors_propagate_and_cached_frame_uses_current_vertices() {
+        let mut owned = cross_only();
+        owned.payload_sha256 = "2".repeat(64);
+        let identity = [1., 0., 0., 0., 1., 0., 0., 0., 1.];
+        owned.bodies.push(BodyWire {
+            body_uuid: "22222222-2222-2222-2222-222222222222".into(),
+            kind: "FEM_TET_MATERIAL".into(),
+            runtime_body_index: None,
+            tet_index: Some(0),
+            vertex_indices: Some([0, 1, 2, 3]),
+            dm_inv_column_major: None,
+            center_bary: Some([0.25; 4]),
+            frame_rest_column_major: Some(identity),
+        });
+        assert_eq!(FemPosePublication::from_owned(Some(&owned)).err().unwrap(), "missing FEM Dm inverse");
+
+        owned.bodies[0].dm_inv_column_major = Some(identity);
+        let publication = FemPosePublication::from_owned(Some(&owned)).unwrap().unwrap();
+        drop(owned);
+        let vertices = |offset: f32| {
+            [0.0_f32, 0., 0., 1., 0., 0., 0., 1., 0., 0., 0., 1.]
+                .into_iter()
+                .enumerate()
+                .flat_map(|(i, value)| (value + if i % 3 == 0 { offset } else { 0. }).to_le_bytes())
+                .collect::<Vec<u8>>()
+        };
+        let initial_vertices = vertices(0.);
+        let resumed_vertices = vertices(2.);
+        let initial = publication.frame(&initial_vertices, 0, 0., 0., 0., 0, None);
+        let resumed = publication.frame(&resumed_vertices, 12, 0.5, 0.49, 0.51, 28, None);
+        assert_eq!(resumed.bodies[0].centroid_m[0] - initial.bodies[0].centroid_m[0], 2.);
+        assert_eq!(resumed.frame_id, 12);
+        resumed.verify(&resumed_vertices).unwrap();
+        assert!(resumed.verify(&initial_vertices).is_err());
+    }
+}
+
 impl Backend {
     pub fn new(mesh: MeshSet) -> Self {
         let state = State {
@@ -747,11 +1063,16 @@ impl Backend {
         t_curr: f64,
         statistics: &mut Option<crate::statistics::TimelineStatistics>,
         pose_accepted_steps: u64,
+        fem_publication: &FemPosePublicationMode,
         publisher: &mut Option<crate::frame_output::Publisher>,
         publish_progress: bool,
     ) {
         if let Some(publisher) = publisher.as_mut() {
-            self.snapshot_frame_outputs(program_args,sim_args,dataset,param,scene,last_time,frame,t_frame,t_prev,t_curr,statistics,pose_accepted_steps,publisher,publish_progress);
+            self.snapshot_frame_outputs(
+                program_args, sim_args, dataset, param, scene, last_time, frame,
+                t_frame, t_prev, t_curr, statistics, pose_accepted_steps,
+                fem_publication, publisher, publish_progress,
+            );
             return;
         }
         // Name: Time Per Video Frame
@@ -988,26 +1309,17 @@ impl Backend {
                 .expect("accepted frame pose publication");
         }
         }
-// Add `mod soft_pose_output;` beside pose_output in main.rs.
-// Insert after atomic vert_<frame>.bin rename, before remove_old_files,
-// alongside (NOT inside) existing PDRD pose block. Published bytes are meters;
-// do not reapply world_scaling. `prepare` validates retained immutable inputs.
-#[cfg(neutral_driver)]
-if let Some(input)=scene.joint_input.as_ref() {
-    if let Some(soft)=crate::soft_joint::prepare(input).expect("FEM retained input identity") {
-        let bindings=crate::soft_pose_output::bindings_from_owned(&soft).expect("FEM pose binding");
-        if !bindings.is_empty() {
-            let vertices=std::fs::read(&final_path).expect("exact published FEM vertex generation");
-            let mut pose=crate::soft_pose_output::PoseFrame::from_vertices(
-                soft.scene_uuid.clone(),soft.scene_inputs_sha256.clone(),soft.payload_sha256.clone(),
-                &vertices,u32::try_from(frame).expect("negative FEM pose frame"),t_frame,t_prev,t_curr,
-                pose_accepted_steps,&bindings).expect("accepted FEM material frame validation");
-            if let Some(controls)=&fem_control_output {pose.version=2;pose.constrained_root_state_authority="native_fem_control_segments_v2".into();pose.control_program_sha256=Some(controls.program_sha256.clone());pose.control_segments=Some(controls.rows.clone());}
-            crate::soft_pose_output::publish(std::path::Path::new(&program_args.output),&pose,&vertices)
+        #[cfg(neutral_driver)]
+        if let Some(publication) = fem_publication.for_frame(scene) {
+            // Measure the exact atomically published generation in authored meters.
+            let vertices = std::fs::read(&final_path).expect("exact published FEM vertex generation");
+            let pose = publication.frame(
+                &vertices, frame, t_frame, t_prev, t_curr, pose_accepted_steps,
+                fem_control_output.as_ref(),
+            );
+            crate::soft_pose_output::publish(std::path::Path::new(&program_args.output), &pose, &vertices)
                 .expect("accepted FEM material pose publication");
         }
-    }
-}
 
         super::remove_old_files(
             &program_args.output,
@@ -1086,6 +1398,7 @@ if let Some(input)=scene.joint_input.as_ref() {
         t_curr: f64,
         statistics: &mut Option<crate::statistics::TimelineStatistics>,
         pose_accepted_steps: u64,
+        fem_publication: &FemPosePublicationMode,
         publisher: &mut crate::frame_output::Publisher,
         publish_progress: bool,
     ) {
@@ -1305,24 +1618,15 @@ if let Some(input)=scene.joint_input.as_ref() {
             rigid_pose=Some(crate::pose_output::encode(&pose,&vertices).expect("encode immutable rigid pose"));
         }
         }
-// Add `mod soft_pose_output;` beside pose_output in main.rs.
-// Insert after atomic vert_<frame>.bin rename, before remove_old_files,
-// alongside (NOT inside) existing PDRD pose block. Published bytes are meters;
-// do not reapply world_scaling. `prepare` validates retained immutable inputs.
-#[cfg(neutral_driver)]
-if let Some(input)=scene.joint_input.as_ref() {
-    if let Some(soft)=crate::soft_joint::prepare(input).expect("FEM retained input identity") {
-        let bindings=crate::soft_pose_output::bindings_from_owned(&soft).expect("FEM pose binding");
-        if !bindings.is_empty() {
-            let mut pose=crate::soft_pose_output::PoseFrame::from_vertices(
-                soft.scene_uuid.clone(),soft.scene_inputs_sha256.clone(),soft.payload_sha256.clone(),
-                &vertices,u32::try_from(frame).expect("negative FEM pose frame"),t_frame,t_prev,t_curr,
-                pose_accepted_steps,&bindings).expect("accepted FEM material frame validation");
-            if let Some(controls)=&fem_control_output {pose.version=2;pose.constrained_root_state_authority="native_fem_control_segments_v2".into();pose.control_program_sha256=Some(controls.program_sha256.clone());pose.control_segments=Some(controls.rows.clone());}
-            fem_pose=Some(crate::soft_pose_output::encode(&pose,&vertices).expect("encode immutable FEM pose"));
+        #[cfg(neutral_driver)]
+        if let Some(publication) = fem_publication.for_frame(scene) {
+            let pose = publication.frame(
+                &vertices, frame, t_frame, t_prev, t_curr, pose_accepted_steps,
+                fem_control_output.as_ref(),
+            );
+            fem_pose = Some(crate::soft_pose_output::encode(&pose, &vertices)
+                .expect("encode immutable FEM pose"));
         }
-    }
-}
 
         let mut display_pins = None;
         // Display pins: the scripted positions, at t_frame, of the Blender
@@ -1760,6 +2064,15 @@ if let Some(input)=scene.joint_input.as_ref() {
         });
         let soft_owned=scene.joint_input.as_ref().and_then(|input|
             crate::cross_links::prepare_batch(input,scene.args().world_scaling as f64).unwrap_or_else(|e|panic!("material/cross-link handoff: {e}")));
+        // Rebuilt from the validated input on both fresh launch and resume.
+        // Cross-only batches have no material bindings and publish no FEM pose.
+        let fem_publication = if std::env::var_os("PPF_FEM_CACHE_POSE_PUBLICATION").is_some_and(|v| v == "1") {
+            FemPosePublicationMode::Cached(
+                FemPosePublication::from_owned(soft_owned.as_ref()).expect("FEM pose binding"),
+            )
+        } else {
+            FemPosePublicationMode::PerFrame
+        };
         let actual_fem_overlay=soft_owned.as_ref().map(crate::twist_overlay::fem_material_spin_from_owned).transpose().unwrap_or_else(|e|panic!("{e}")).flatten();
         if self.fem_material_spin_overlay.is_some() && self.fem_material_spin_overlay!=actual_fem_overlay {panic!("CHECKPOINT_MATERIAL_SPIN_INVALID: FEM selection changed");}
         self.fem_material_spin_overlay=actual_fem_overlay;
@@ -1995,6 +2308,7 @@ if let Some(input)=scene.joint_input.as_ref() {
                 0.0,
                 &mut timeline_statistics,
                 0,
+                &fem_publication,
                 &mut frame_publisher,
                 true,
             );
@@ -2056,6 +2370,65 @@ if let Some(input)=scene.joint_input.as_ref() {
         self.checkpoint_adaptive=Some(adaptive_controller.clone());
         self.checkpoint_adaptive_start=self.resume_history.as_ref().map_or(0.,|h|h.adaptive_start_time);
         let requested_frames=program_args.target_frame.unwrap_or(sim_args.frames);
+        let animation_requested = std::env::var_os("PPF_ANIMATION_FRAME_STEP").is_some_and(|v| v == "1");
+        let animation_receipt = animation_requested
+            && std::env::var_os("PPF_ANIMATION_FRAME_STEP_RECEIPT").is_some_and(|v| v == "1");
+        let eager_animation = animation_requested
+            && std::env::var_os("PPF_ANIMATION_FRAME_POLICY").is_some_and(|v| v == "eager");
+        let work_animation = animation_requested
+            && std::env::var_os("PPF_ANIMATION_FRAME_POLICY").is_some_and(|v| v == "work");
+        // Outer PCG reports do not charge the hard Schur inner solves.
+        let work_hard_scope = work_animation
+            && joint_owned.as_ref().is_some_and(|joints| !joints.hard_records.is_empty());
+        // A larger h can visibly stretch driven elastic anchors despite a
+        // converged linear solve. Protect the complete authored drive program,
+        // including roots that become kinematic after the initial frame.
+        let work_author_ceiling = work_animation && {
+            use crate::fem_control_events::Mode as FemControlMode;
+            use crate::joint_root_motion_wire::{RootControlMode, RootMotionMode};
+            let rigid_drive = joint_owned.as_ref().is_some_and(|joints| {
+                joints.roots.iter().any(|root| {
+                    root.mode == RootMotionMode::Kinematic
+                        || root.control_events.iter().any(|event| event.mode == RootControlMode::Kinematic)
+                })
+            });
+            let fem_drive = soft_owned.as_ref().is_some_and(|soft| {
+                !soft.controlled_vertices.is_empty()
+                    || soft.control_events.as_ref().is_some_and(|controls| controls.bodies.iter().any(|body| {
+                        body.initial_mode == FemControlMode::Kinematic
+                            || body.events.iter().any(|event| event.mode == FemControlMode::Kinematic)
+                    }))
+            });
+            let rigid_ball = joint_owned.as_ref().is_some_and(|joints| {
+                joints.joints.iter().any(|joint| joint.wire.enabled && joint.wire.stiffness_N_per_m > 0.0)
+            });
+            let fem_ball = soft_owned.as_ref().is_some_and(|soft| {
+                soft.records.iter().any(|joint| joint.enabled != 0 && joint.ball_stiffness > 0.0)
+            });
+            (rigid_drive || fem_drive) && (rigid_ball || fem_ball)
+        };
+        let mut animation_events = Vec::new();
+        if let Some(joint_scene) = joint_owned.as_ref().filter(|_| eager_animation) {
+            for root in &joint_scene.roots {
+                animation_events.extend(root.keys.iter().map(|key| key.time_s));
+                animation_events.extend(root.control_events.iter().map(|event| event.time_s));
+            }
+        }
+        if let Some(events) = soft_owned.as_ref().and_then(|scene| scene.control_events.as_ref())
+            .filter(|_| eager_animation) {
+            for body in &events.bodies {
+                animation_events.extend(body.keys.iter().map(|key| key.time_s));
+                animation_events.extend(body.events.iter().map(|event| event.time_s));
+            }
+        }
+        animation_events.sort_unstable_by(f64::total_cmp);
+        animation_events.dedup_by(|a, b| a.to_bits() == b.to_bits());
+        let animation_inputs_need_preparation = scene.has_time_sensitive_inputs() || collision_windows_enabled
+            || !rest_shape_keyframes.is_empty() || material_keyframes.as_ref().is_some_and(|keys| !keys.is_empty());
+        let mut animation_steps = AnimationStepPolicy::new();
+        let mut eager_steps = EagerAnimationStepPolicy::default();
+        let mut work_steps = animation_work::Policy::default();
+        let mut animation_scope_reported = false;
         let adaptive_configuration = joint_owned.as_ref().map_or("unsealed", |owned| owned.scene_inputs_sha256.as_str()).to_owned();
         let mut retry_save_latched=false;
         loop {
@@ -2230,7 +2603,7 @@ if let Some(input)=scene.joint_input.as_ref() {
             let cg_limit = param.cg_max_iter;
             let cg_tolerance = param.cg_tol;
             let retry_run = crate::driver::adaptive_controller::logical_step(
-                adaptive_retry, host_fem_retry||host_material_retry, &mut adaptive_controller, &mut param,
+                adaptive_retry, host_fem_retry||host_material_retry||animation_requested, &mut adaptive_controller, &mut param,
                 logical_start_time, &adaptive_configuration, cg_limit, cg_tolerance,
                 |param| scene.update_param(sim_args, logical_start_time, param),
                 |param, selection| {
@@ -2243,6 +2616,31 @@ if let Some(input)=scene.joint_input.as_ref() {
                 && !host_fem_retry && !host_swing_retry && !host_material_retry
                 && crate::driver::host_kinematics_retry_scope(param.playback).unwrap_or_else(|fatal|crate::driver::report_host_fatal(fatal));
             let host_domain_retry=host_fem_retry||host_swing_retry||host_material_retry||host_kinematics_retry;
+            // With external time-dependent inputs, only use the already
+            // prepared host paths that resample the actual trial endpoint.
+            // Root/FEM programs owned by the native solver still plan their
+            // own authored event boundaries.
+            let animation_active = animation_requested && !work_hard_scope
+                && !adaptive_retry && param.playback == 1.0
+                && (!animation_inputs_need_preparation || host_kinematics_retry || host_newton_root_retry);
+            if animation_receipt && !animation_scope_reported {
+                eprintln!("PPF_ANIMATION_FRAME_STEP active={animation_active} playback={} external_sample_scope={} adaptive_cg={adaptive_retry} work_hard_author_only={work_hard_scope}",
+                    param.playback, !animation_inputs_need_preparation || host_kinematics_retry || host_newton_root_retry);
+                animation_scope_reported = true;
+            }
+            let initial_trial_h = if animation_active {
+                if work_animation {
+                    work_steps.choose(nominal_h, sim_args.fps, work_author_ceiling)
+                } else if eager_animation {
+                    eager_steps.choose(nominal_h, sim_args.fps)
+                } else {
+                    animation_steps.choose(nominal_h, sim_args.fps)
+                }
+            } else {
+                selection.initial_trial_h
+            };
+            let retry_for_cg = adaptive_retry || (animation_active
+                && (initial_trial_h > nominal_h || (work_animation && initial_trial_h < nominal_h)));
             let seed_snapshot = std::rc::Rc::new(std::cell::RefCell::new(AdaptiveSeedSnapshotGuard::new()));
             let attempt_seed = seed_snapshot.clone();
             let finish_seed = seed_snapshot.clone();
@@ -2266,7 +2664,7 @@ if let Some(input)=scene.joint_input.as_ref() {
             let _attempt_control_phase = crate::driver::phase::start("solver.host_control_before_advance");
             if host_domain_retry {
                 host_attempt_seed.borrow_mut().capture_or_restore()?;
-            } else if adaptive_retry {
+            } else if retry_for_cg {
                 unsafe { attempt_seed.borrow_mut().capture_or_restore() };
             }
 
@@ -2280,14 +2678,19 @@ if let Some(input)=scene.joint_input.as_ref() {
             let _phase = crate::driver::phase::start("solver.advance");
             if let Some(p)=frame_publisher.as_ref() { p.check().expect("frame publisher immediately before advance"); }
             let outcome = if host_kinematics_retry {
-                unsafe { crate::driver::advance_host_kinematics(continuation,remaining_rejections,adaptive_retry,prepared) }
+                let affine_pins = prepared.and_then(|plan| {
+                    scene.affine_pin_prefix(logical_start_time, plan.end_s(), collision_windows_enabled)
+                });
+                unsafe { crate::driver::advance_host_kinematics(
+                    continuation, remaining_rejections, retry_for_cg, prepared, affine_pins.as_ref(),
+                ) }
             } else if host_fem_retry || host_material_retry {
-                unsafe { crate::driver::advance_host(continuation,remaining_rejections,adaptive_retry,true,prepared) }
+                unsafe { crate::driver::advance_host(continuation,remaining_rejections,retry_for_cg,true,prepared) }
             } else if host_swing_retry {
-                unsafe { crate::driver::advance_host_swing(continuation,remaining_rejections,adaptive_retry,prepared) }
+                unsafe { crate::driver::advance_host_swing(continuation,remaining_rejections,retry_for_cg,prepared) }
             } else {
                 let mut result=StepResult::default();
-                let returned=if adaptive_retry {unsafe{advance_retry(&mut result,continuation,remaining_rejections)}}else{unsafe{advance(&mut result)};0};
+                let returned=if retry_for_cg {unsafe{advance_retry(&mut result,continuation,remaining_rejections)}}else{unsafe{advance(&mut result)};0};
                 if result.success(){Ok(crate::driver::HostAdvanceOutcome::Accepted(result))}
                 else if result.retry_reason==crate::data::RETRY_REASON_PCG_MAX_ITERATIONS {Ok(crate::driver::HostAdvanceOutcome::PcgCap{result,continuation:returned,failed_dt:candidate_h})}
                 else {Ok(crate::driver::HostAdvanceOutcome::Refused(result))}
@@ -2298,9 +2701,10 @@ if let Some(input)=scene.joint_input.as_ref() {
             drop(_phase);
             outcome
             };
+            let work_scope = (animation_active && work_animation).then(animation_work::WorkScope::begin);
             let run = if host_domain_retry {
                 crate::driver::adaptive_retry::run_host_attempts(&mut prepare,|token| { let r=crate::driver::cancel_host_retry(token); #[cfg(all(test, feature="cpu"))] if r.is_ok(){backend_save_fixture::observe_cancel();} r },
-                    move || {let r=host_finish_seed.borrow_mut().finish(); #[cfg(all(test, feature="cpu"))] if r.is_ok(){backend_save_fixture::observe_finish();} r},selection.initial_trial_h,logical_start_time,
+                    move || {let r=host_finish_seed.borrow_mut().finish(); #[cfg(all(test, feature="cpu"))] if r.is_ok(){backend_save_fixture::observe_finish();} r},initial_trial_h,logical_start_time,
                     crate::driver::adaptive_retry::MAX_REJECTIONS,selection.controller_ceiling_h)
                     .unwrap_or_else(|fatal|crate::driver::report_host_fatal(fatal))
             } else {
@@ -2318,17 +2722,42 @@ if let Some(input)=scene.joint_input.as_ref() {
                     },
                     |token| unsafe { adaptive_retry_cancel(token) },
                     move || unsafe { finish_seed.borrow_mut().finish() });
-                if adaptive_retry {crate::driver::adaptive_retry::run_adaptive_attempts(&mut retry_ops,selection.initial_trial_h,logical_start_time,crate::driver::adaptive_retry::MAX_REJECTIONS)} else {
+                if retry_for_cg {crate::driver::adaptive_retry::run_adaptive_attempts(&mut retry_ops,initial_trial_h,logical_start_time,crate::driver::adaptive_retry::MAX_REJECTIONS)} else {
                 use crate::driver::adaptive_retry::RetryAttemptOps as _;
                 let attempt = retry_ops.prepare_and_advance(nominal_h, 0, 0, 0);
                 retry_ops.finish();
                 crate::driver::adaptive_retry::RetryRun { save_requested:false, result: attempt.result, requested_h: nominal_h, retry_count: 0, events: Vec::new(),cg_ceiling_candidate:None,final_remaining_budget:None }
                 }
             };
+            let measured_work = work_scope.map(animation_work::WorkScope::finish);
             // When adaptive CG is disabled, logical_step's legacy no-host
             // branch does not install a dt restore guard. A swing-only host
             // refusal may have changed dt even though the authored dt did not.
             if (host_swing_retry || host_kinematics_retry) && !adaptive_retry {param.dt=nominal_h;}
+            if animation_active && run.result.success() {
+                let accepted_h = run.result.time - logical_start_time;
+                let rejections = run.retry_count.saturating_add(run.result.retry_rejections);
+                let authored_boundary = eager_animation && (animation_events
+                    .binary_search_by(|t| t.total_cmp(&run.result.time)).is_ok()
+                    || (host_kinematics_retry && scene.next_discrete_input_event(logical_start_time)
+                        .is_some_and(|t| t.to_bits() == run.result.time.to_bits())));
+                if let Some(work) = measured_work {
+                    work_steps.observe(nominal_h, accepted_h, work, rejections);
+                } else if eager_animation {
+                    eager_steps.observe(nominal_h, initial_trial_h, run.requested_h,
+                        accepted_h, rejections, authored_boundary);
+                } else {
+                    animation_steps.observe(nominal_h, initial_trial_h, accepted_h, rejections);
+                }
+                if animation_receipt {
+                    eprintln!("PPF_ANIMATION_FRAME_STEP start={logical_start_time:.17e} authored_h={nominal_h:.9e} trial_h={initial_trial_h:.9e} final_requested_h={:.9e} accepted_h={accepted_h:.17e} rejections={rejections} cg_tol={cg_tolerance:.9e} policy={} authored_boundary={authored_boundary}",
+                        run.requested_h, if work_animation {"work"} else if eager_animation {"eager"} else {"conservative"});
+                    if let Some(work) = measured_work {
+                        eprintln!("PPF_ANIMATION_WORK start={logical_start_time:.17e} newton={} pcg={} caps={} author_ceiling={work_author_ceiling}",
+                            work.newton, work.pcg, work.caps);
+                    }
+                }
+            }
             run
                 },
             );
@@ -2451,6 +2880,7 @@ let _wphase = crate::driver::phase::start("solver.write_frame");
                         t_curr,
                         &mut timeline_statistics,
                         joint_accepted,
+                        &fem_publication,
                         &mut frame_publisher,
                         f == new_frame,
                     );

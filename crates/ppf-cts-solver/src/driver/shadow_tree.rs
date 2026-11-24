@@ -138,7 +138,8 @@ impl FreeForest {
         }
         let mut edges=std::collections::BTreeSet::new();
         for &(a,b) in matrix.blocks.keys(){if a!=b{edges.insert((a.min(b),a.max(b)));}}
-        let mut candidates=Vec::with_capacity(edges.len());
+        let mut candidates=Vec::new();
+        candidates.try_reserve_exact(edges.len()).map_err(|_| Unsupported("forest candidate allocation".into()))?;
         for (a,b) in edges {let ab=matrix.blocks.get(&(a,b)).unwrap_or(&zero);let ba=matrix.blocks.get(&(b,a)).unwrap_or(&zero);let mut c=[[0f64;6];6];
             for i in 0..6{for j in 0..6{c[i][j]=0.5*((ab[i][j] as f64)+(ba[j][i] as f64));}}
             if c.iter().flatten().all(|v|*v==0.){continue;}

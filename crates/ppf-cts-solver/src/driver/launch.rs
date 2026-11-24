@@ -785,6 +785,7 @@ static LAUNCH: [Launch; id::COUNT] = [
     launch_pcg_warm_mask_history,
     launch_body_factor_apply,
     launch_joint_pcg_batch8_factor_fault,
+    launch_aabb_refit_merge_three,
 ];
 
 // ===========================================================================

@@ -86,6 +86,8 @@ fn transition_inner(state: ServerState, event: Event) -> (ServerState, Vec<Effec
             // value from an in-flight BuildMetadata with a stale
             // scene_info.json read.
             if name == state.name && root == state.root {
+                let inputs_changed = state.upload_id != upload_id
+                    || state.data_hash != data_hash || state.param_hash != param_hash;
                 let preserved_total = if state.total_frames > 0 {
                     state.total_frames
                 } else {
@@ -102,6 +104,11 @@ fn transition_inner(state: ServerState, event: Event) -> (ServerState, Vec<Effec
                 };
                 if new.build == Build::Built {
                     new.resumable = is_resumable;
+                }
+                if inputs_changed && new.launch_pending {
+                    retire_pending_launch(&mut new);
+                    new.build = Build::None;
+                    new.resumable = false;
                 }
                 return (new, vec![]);
             }
@@ -230,16 +237,22 @@ fn transition_inner(state: ServerState, event: Event) -> (ServerState, Vec<Effec
             let log = format!(
                 "Upload landed (id={upload_id}, data={has_data}, param={has_param})."
             );
+            let inputs_changed = state.upload_id != upload_id
+                || state.data_hash != new_data_hash || state.param_hash != new_param_hash;
+            let mut new = ServerState {
+                data,
+                upload_id,
+                data_hash: new_data_hash,
+                param_hash: new_param_hash,
+                build: new_build,
+                resumable: false,
+                ..state
+            };
+            if inputs_changed && new.launch_pending {
+                retire_pending_launch(&mut new);
+            }
             (
-                ServerState {
-                    data,
-                    upload_id,
-                    data_hash: new_data_hash,
-                    param_hash: new_param_hash,
-                    build: new_build,
-                    resumable: false,
-                    ..state
-                },
+                new,
                 vec![Effect::DoLog { message: log }],
             )
         }
@@ -248,6 +261,7 @@ fn transition_inner(state: ServerState, event: Event) -> (ServerState, Vec<Effec
         Event::BuildRequested { preserve_output }
             if state.data == Data::Uploaded && state.build != Build::Building =>
         {
+            let context = crate::effects::BuildContext::capture(&state);
             (
                 ServerState {
                     build: Build::Building,
@@ -259,7 +273,7 @@ fn transition_inner(state: ServerState, event: Event) -> (ServerState, Vec<Effec
                     exemptions: vec![],
                     ..state
                 },
-                vec![Effect::DoSpawnBuild { preserve_output }],
+                vec![Effect::DoSpawnBuild { preserve_output, context }],
             )
         }
 
@@ -623,6 +637,13 @@ fn title_bool(b: bool) -> &'static str {
     } else {
         "False"
     }
+}
+
+fn retire_pending_launch(state: &mut ServerState) {
+    state.launch_pending = false;
+    state.solver = Solver::Idle;
+    state.requested_target_frame = None;
+    state.resume_from_frame = None;
 }
 
 #[cfg(test)]

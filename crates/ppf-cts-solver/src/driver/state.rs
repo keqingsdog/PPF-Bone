@@ -254,6 +254,7 @@ impl TestMesh {
             edge_face_index: self.empty_adjacency.span(0, 0),
             edge_face_offset: self.empty_adjacency.span(0, 0),
             has_edge_face: 0,
+            covered_point_edges: false,
             start_link: crate::driver::contact::StartLinkRefs {
                 index: adjacency_handle(&self.start_link_index),
                 offset: adjacency_handle(&self.start_link_offset),
@@ -1173,6 +1174,7 @@ pub struct SolverState {
     pub neighbor_vertex_face_offset: Buffer<u32>,
     pub neighbor_edge_face_index: Buffer<u32>,
     pub neighbor_edge_face_offset: Buffer<u32>,
+    covered_point_edges: bool,
     /// Allow Existing Intersections' vertex link table, staged once like the
     /// adjacencies above and for the same reason: `builder.rs` builds it at
     /// scene build and nothing rewrites it. A scene that linked nothing stages
@@ -2116,6 +2118,7 @@ impl SolverState {
             edge_face_index: adjacency_handle(&self.neighbor_edge_face_index),
             edge_face_offset: adjacency_handle(&self.neighbor_edge_face_offset),
             has_edge_face: u32::from(self.neighbor_edge_face_offset.len() != 0),
+            covered_point_edges: self.covered_point_edges,
             start_link: super::contact::StartLinkRefs {
                 index: adjacency_handle(&self.start_link_index),
                 offset: adjacency_handle(&self.start_link_offset),
@@ -2246,6 +2249,19 @@ impl SolverState {
                             &mut self.neighbor_vertex_face_offset, "neighbor.vertex_face")?;
             stage_adjacency(device, &n.edge.face, &mut self.neighbor_edge_face_index,
                             &mut self.neighbor_edge_face_offset, "neighbor.edge_face")?;
+            use super::contact::covered_point_edge;
+            let certify_covered_edges = device.info().backend == "host" && covered_point_edge::requested();
+            self.covered_point_edges = certify_covered_edges
+                && crate::connected_collision::slices(&n.edge.face).ok().is_some_and(|(indices, offsets)| {
+                    indices.len() == self.neighbor_edge_face_index.len()
+                        && offsets.len() == self.neighbor_edge_face_offset.len()
+                        && covered_point_edge::covers_every_edge(
+                            self.mesh_edge.host(), self.mesh_face.host(), vertices, indices, offsets)
+                });
+            if certify_covered_edges && covered_point_edge::trace() {
+                eprintln!("PPF_CCD_COVERED_POINT_EDGE certified={} edges={} faces={}",
+                    self.covered_point_edges, edges, faces);
+            }
             // Allow Existing Intersections' table, on the same terms: a
             // scene that linked nothing leaves it unsized and reads absent.
             if std::env::var_os("PPF_START_LINK_CODEC").as_deref() != Some(std::ffi::OsStr::new("1")) {

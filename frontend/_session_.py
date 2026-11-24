@@ -343,6 +343,12 @@ class FixedSession:
             "stitch": False,
         }
         if self.fixed_scene is not None:
+            if preserve_output and os.name == "nt" and any(frame > 0 for frame in self.get.saved()):
+                from ._bone_trial_options import validate_preserved_mode
+                validate_preserved_mode(
+                    os.path.join(self.info.path, "command.bat"),
+                    getattr(self.fixed_scene, "_solver_mode", "strict"),
+                )
             self.delete(preserve_output=preserve_output)
             self.fixed_scene.export_fixed(
                 self.info.path, True, preserve_output=preserve_output
@@ -767,6 +773,12 @@ class FixedSession:
             verify_session(self.fixed_scene, self.info.path)
             log_path, err_path = _rust.stdout_error_log_paths(self.info.path)
             which = Utils.platform_which()
+            if load != 0 and platform.system() == "Windows":
+                from pathlib import Path
+                launcher = Path(self._cmd_path).read_text(encoding="utf-8")
+                if "_r14_solver_launcher.py" in launcher and " --sealed-solver-mode=" not in launcher:
+                    from ._bone_trial_options import check_legacy_r14_animation_resume
+                    check_legacy_r14_animation_resume(log_path)
             command = _rust.solver_subprocess_command(self._cmd_path, load, which)
             if target_frame is not None:command += f" --target-frame={int(target_frame)}"
             with open(log_path, "w") as stdout_file, open(err_path, "w") as stderr_file:

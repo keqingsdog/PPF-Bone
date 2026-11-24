@@ -45,8 +45,12 @@ def _batch_literal(value):
     return value.replace('%', '%%')
 
 
-def write_launcher(profile, session_path, output_path):
+def write_launcher(profile, session_path, output_path, solver_mode=None):
     """Write the final launcher before session seal; never patch sealed files."""
+    if solver_mode == 'animation' and (
+        profile.platform != 'win32' or not profile.local_source or profile.backend not in ('cpu', 'cuda')
+    ):
+        raise ValueError('R14_SOLVER_MODE_UNSUPPORTED')
     verify_binaries(profile)
     scene = Path(session_path).resolve()
     output = Path(output_path).resolve()
@@ -83,32 +87,35 @@ def write_launcher(profile, session_path, output_path):
         from ._r14_product_profile import local_source_module
         local=local_source_module();doc=local.load(profile.product_root)
         if doc['schema']==local.RELATIVE_SCHEMA:frozen_backend=doc['backend']
-    content = render_windows_launcher(interpreter, helper, profile.product_root, scene, output, profile.runtime_dir, frozen_backend)
+    content = render_windows_launcher(interpreter, helper, profile.product_root, scene, output, profile.runtime_dir, frozen_backend, solver_mode)
     command_path = scene / 'command.bat'
     command_path.write_bytes(content)
     return str(command_path)
 
 
-def render_windows_launcher(interpreter, helper, product_root, scene, output, runtime_dir, frozen_backend=None):
+def render_windows_launcher(interpreter, helper, product_root, scene, output, runtime_dir, frozen_backend=None, solver_mode=None):
     """Render the canonical batch file without executing or writing it."""
     if frozen_backend is not None and frozen_backend not in ('cpu', 'cuda', 'metal', 'rocm'):
         raise ValueError('R14_LAUNCHER_BACKEND_INVALID')
+    if solver_mode is not None and solver_mode not in ('strict', 'animation'):
+        raise ValueError('R14_SOLVER_MODE_INVALID')
     values = [_batch_literal(p) for p in (interpreter, helper, product_root, scene, output, runtime_dir)]
     python, launcher, root, scene_arg, output_arg, runtime = values
     lines = [
         '@echo off',
+        *(['@rem PPF_SESSION_SOLVER_MODE=' + solver_mode] if solver_mode else []),
         'setlocal DisableDelayedExpansion',
         'chcp 65001 >nul',
         *(['set "PPF_BACKEND='+frozen_backend+'"'] if frozen_backend else []),
         f'cd /d "{runtime}"',
         'if errorlevel 1 exit /b %errorlevel%',
-        f'"{python}" -I "{launcher}" "{root}" --path "{scene_arg}" --output "{output_arg}" -- %*',
+        f'"{python}" -I "{launcher}"' + (f' --sealed-solver-mode={solver_mode}' if solver_mode else '') + f' "{root}" --path "{scene_arg}" --output "{output_arg}" -- %*',
         'exit /b %errorlevel%',
     ]
     return ('\r\n'.join(lines) + '\r\n').encode('utf-8')
 
 
-def verify_windows_launcher_bytes(actual, interpreter, helper, product_root, scene, output, runtime_dir, frozen_backend=None):
+def verify_windows_launcher_bytes(actual, interpreter, helper, product_root, scene, output, runtime_dir, frozen_backend=None, solver_mode=None):
     """Accept only the generated launcher with known capability switches.
 
     Project command bytes are inspected, never run. Existing build hooks append
@@ -116,7 +123,7 @@ def verify_windows_launcher_bytes(actual, interpreter, helper, product_root, sce
     """
     if not isinstance(actual, bytes):
         return False
-    canonical = render_windows_launcher(interpreter, helper, product_root, scene, output, runtime_dir, frozen_backend)
+    canonical = render_windows_launcher(interpreter, helper, product_root, scene, output, runtime_dir, frozen_backend, solver_mode)
     normalize = lambda value: value.replace(b'\r\n', b'\n')
     actual, canonical = normalize(actual), normalize(canonical)
     if b'\r' in actual:

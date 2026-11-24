@@ -182,6 +182,7 @@ pub unsafe fn curve_gate<D:Device>(device:&mut D,data:&crate::data::DataSet,stat
     upload(device,&mut curve.margin,&margins,"roots.curve.margin")?;
     let mut shadow=mesh;shadow.vertex_prop=curve.vertex_prop.handle();shadow.face_prop=curve.face_prop.handle();shadow.edge_prop=curve.edge_prop.handle();
     shadow.vertex_param=curve.vertex_param.handle();shadow.face_param=curve.face_param.handle();shadow.edge_param=curve.edge_param.handle();
+    shadow.covered_point_edges = false;
     let mut curve_param=std::ptr::read(param);curve_param.line_search_max_t=1.0;
     if !(*param).disable_contact {
         let contact=state.contact.as_mut().ok_or_else(||super::scene::Fatal::invariant("ROOT_MOTION_NATIVE_CAPABILITY: curve contact layer absent"))?;

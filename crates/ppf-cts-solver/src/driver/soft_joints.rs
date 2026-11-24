@@ -263,6 +263,19 @@ pub struct View {
     pub limits:Handle,pub drives:Handle,pub keys:Handle,pub extension_count:u32,pub drive_count:u32,pub sample_time_s:f32,
 }
 impl View {
+    pub(super) fn with_preview_buffers(
+        mut self,
+        map: &mut impl FnMut(Handle, bool) -> Result<Handle, Fault>,
+    ) -> Result<Self, Fault> {
+        self.fault = map(self.fault, true)?;
+        if let Some(view) = self.frozen_restoring.as_mut() {
+            view.fault = map(view.fault, true)?;
+            view.ext_fault = map(view.ext_fault, true)?;
+        }
+        self.curves = self.curves.map(|view| view.with_preview_buffers(map)).transpose()?;
+        Ok(self)
+    }
+
     pub(super) fn reduced_capture_frozen(&self)->Option<(bool,Handle,u32,Handle,Handle)>{
         self.frozen_restoring.map(|f|(f.legacy,f.epoch_buffer,f.epoch,f.h,f.idx))
     }

@@ -369,7 +369,6 @@ impl Analytic {
             count: self.surface_vertices as u32,
             seam_arena_count: 0,
         };
-        device.launch("collider.toi.fill", &seed, self.surface_vertices as u32)?;
         let args = VertexConstraintSweepArgs {
             x0: x0,
             x1: x1,
@@ -388,8 +387,16 @@ impl Analytic {
             seam_arena_count: 0,
         };
         let span = self.surface_vertices;
+        let count = span as u32;
+        self.fold.prepare(device, count)?;
         device
-            .run("collider.sweep", |encoder| encoder.elements(&args, span as u32))
+            .run("collider.sweep", |encoder| {
+                encoder.elements(&seed, count)?;
+                encoder.elements(&args, count)?;
+                // Only scratch is written. The invariant check below still
+                // runs before the host consumes either part of the verdict.
+                self.fold.encode_min(encoder, self.toi.handle(), count)
+            })
             .map_err(|fault| match fault {
                 Fault::Device { diag, .. } => Fatal::device_assert(format!(
                     "solver driver: the analytic collider sweep tripped an invariant {} time(s){}. \
@@ -409,11 +416,7 @@ impl Analytic {
         // the download is the whole answer rather than a merge.
         self.infeasible.download(device)?;
         Ok(Sweep {
-            time_of_impact: {
-                let values = self.toi.handle();
-                // Safety: the buffer outlives the call and names `span` floats.
-                unsafe { self.fold.min(device, "collider.toi", values, span as u32, max_t) }?
-            },
+            time_of_impact: self.fold.read_min(device, count, max_t)?,
             // FIRST BY INDEX, not by whichever thread arrived first, so two runs
             // of one scene name the same vertex.
             infeasible_pin: self.infeasible.host()[..span]
@@ -1085,6 +1088,35 @@ mod tests {
         // collider sweep, so the step is refused rather than shortened.
         assert_eq!(sweep.time_of_impact, 1.0);
     }
+    #[test]
+    fn host_b32_compare_covers_later_chunks_and_propagates_bad_windows() {
+        let scene = diagonal_scene(1);
+        let mut device = host_device();
+        let mut analytic = unsafe { Analytic::allocate(&mut device, &scene.data).unwrap() };
+        // The last coordinate is in the second host read chunk.
+        let vertices = 513;
+        let coordinates = 3 * vertices;
+        let zeros = vec![0_u8; coordinates * std::mem::size_of::<f32>()];
+        analytic.accept_candidate.size(&mut device, coordinates, AllocLabel("test.b32.candidate")).unwrap();
+        analytic.accept_proposal.size(&mut device, coordinates, AllocLabel("test.b32.proposal")).unwrap();
+        let candidate = analytic.accept_candidate.handle();
+        let proposal = analytic.accept_proposal.handle();
+        for handle in [candidate, proposal] {
+            device.write(handle, 0, &zeros).unwrap();
+        }
+        assert!(unsafe { analytic.compare_candidate_bits(&mut device, vertices).unwrap() });
+        let last = zeros.len() - std::mem::size_of::<f32>();
+        device.write(candidate, last, &(-0.0_f32).to_ne_bytes()).unwrap();
+        assert!(!unsafe { analytic.compare_candidate_bits(&mut device, vertices).unwrap() });
+        for handle in [candidate, proposal] {
+            device.write(handle, last, &f32::INFINITY.to_ne_bytes()).unwrap();
+        }
+        assert!(!unsafe { analytic.compare_candidate_bits(&mut device, vertices).unwrap() });
+        analytic.accept_proposal.free(&mut device).unwrap();
+        let error = unsafe { analytic.compare_candidate_bits(&mut device, vertices).unwrap_err() };
+        assert!(matches!(error, Fault::Platform { .. }));
+    }
+
     // Exercise the production function and its actual PositionAccept and plane
     // entries. The second vertex measures alpha but is controlled, so its
     // motion cannot satisfy the original eligible-free progress predicate.
@@ -1310,6 +1342,27 @@ impl Analytic {
     /// result. Input buffer handles describe f32 elements; the byte aliases
     /// explicitly convert lengths and are rejected if u32 indexing overflows.
     unsafe fn compare_candidate_bits<D: Device>(&mut self,device:&mut D,vertices:usize)->Result<bool,Fault> {
+        if device.info().backend == "host" {
+            // Host windows are copied into bounded stack storage. The optional
+            // certificate needs no device allocation, dispatch, or staging buffer.
+            let Some(bytes) = vertices.checked_mul(3 * std::mem::size_of::<f32>()) else {
+                return Ok(false);
+            };
+            const CHUNK_BYTES: usize = 4096;
+            let mut candidate = [0_u8; CHUNK_BYTES];
+            let mut proposal = [0_u8; CHUNK_BYTES];
+            for offset in (0..bytes).step_by(CHUNK_BYTES) {
+                let len = (bytes - offset).min(CHUNK_BYTES);
+                let candidate = &mut candidate[..len];
+                let proposal = &mut proposal[..len];
+                device.read(self.accept_candidate.handle(), offset, candidate)?;
+                device.read(self.accept_proposal.handle(), offset, proposal)?;
+                if !super::step::b32_shadow::same_finite_coordinates(candidate, proposal) {
+                    return Ok(false);
+                }
+            }
+            return Ok(true);
+        }
         let count=vertices.checked_mul(3).and_then(|n|u32::try_from(n).ok())
             .filter(|n|*n<=u32::MAX/4)
             .ok_or_else(||Fault::Platform{call:"B32 bit comparison",detail:"coordinate extent overflow".into()})?;

@@ -274,6 +274,8 @@ __device__ inline unsigned popcount(unsigned long long value) {
 
 namespace compute {
 
+constexpr bool has_contact_query_witness = false;
+
 // A CUDA warp is 32 lanes on every architecture this solver ships cubins for.
 constexpr unsigned simd_width = 32u;
 
