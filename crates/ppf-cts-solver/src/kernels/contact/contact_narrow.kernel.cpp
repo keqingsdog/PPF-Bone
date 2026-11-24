@@ -66,7 +66,7 @@
 #include "contact_statistics.kernel.cpp"
 
 // Only the CPU scratch launch can use the reserved witness capacity.
-[[seam::device_fn]] bool contact_query_witness_mode(unsigned dyn_capacity) {
+[[seam::device_fn]] inline bool contact_query_witness_mode(unsigned dyn_capacity) {
     return compute::has_contact_query_witness && dyn_capacity == 0xffffffffu;
 }
 
