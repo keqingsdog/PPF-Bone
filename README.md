@@ -23,7 +23,7 @@ PPF-Bone 是由 keqingsdog 维护的独立骨骼物理分支与发行版。它�
 - [Blender 插件 1.0.68](https://github.com/keqingsdog/PPF-Bone/releases/tag/v1.0.68)：新增动画模式开关、独立骨骼动作捕获和清除；骨骼、Static 和 Pin 可共用时间轴采样，传输可复用有效捕获。蒙皮权重拟合新增「厚度偏移」，可给拟合代理增厚。
 - [Windows 求解器 2026.11.24](https://github.com/keqingsdog/PPF-Bone/releases/tag/solver-2026.11.24)：优化骨骼关节求解和碰撞检测。严格模式仍是默认；动画模式在下一次传输后生效，续算沿用会话模式。动画模式的轨迹和耗时可能随场景变化。
 
-[下载 2026.11.24 求解器源码](https://github.com/keqingsdog/PPF-Bone/releases/download/solver-2026.11.24/PPF-Bone-solver-2026.11.24.zip)。Windows 运行包内的 CUDA 后端针对 SM89；其他架构可用 CPU，或从源码构建对应的 CUDA 后端。
+[下载 2026.11.24 求解器源码](https://github.com/keqingsdog/PPF-Bone/archive/refs/tags/solver-2026.11.24.zip)。
 
 ## English
 
@@ -46,7 +46,7 @@ Prebuilt solver releases from this fork support Windows x64 only. No prebuilt Li
 - [Blender add-on 1.0.68](https://github.com/keqingsdog/PPF-Bone/releases/tag/v1.0.68): Added an Animation Mode toggle and independent bone-motion capture and clearing. Bones, static meshes, and pins can share a timeline pass, and Transfer can reuse valid captures. Skin-weight fitting now includes a Thickness Offset to thicken fitted proxies.
 - [Windows solver 2026.11.24](https://github.com/keqingsdog/PPF-Bone/releases/tag/solver-2026.11.24): Optimized bone-joint solving and collision detection. Strict remains the default. Animation Mode takes effect on the next transfer, and resume keeps the session's mode. Animation Mode can change trajectories and runtime depending on the scene.
 
-[Download the 2026.11.24 solver source](https://github.com/keqingsdog/PPF-Bone/releases/download/solver-2026.11.24/PPF-Bone-solver-2026.11.24.zip). The bundled Windows CUDA backend targets SM89. On other architectures, use the CPU backend or build the corresponding CUDA backend from source.
+[Download the 2026.11.24 solver source](https://github.com/keqingsdog/PPF-Bone/archive/refs/tags/solver-2026.11.24.zip).
 
 ## License and attribution / 许可与署名
 
